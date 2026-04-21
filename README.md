@@ -4,7 +4,7 @@
 
 <h1 align="center">CleanMic</h1>
 
-<p align="center">Noise-free virtual microphone for Linux. Select your mic, enable CleanMic, and every app hears clean audio.</p>
+<p align="center">Noise-free virtual microphone for Linux. It's dead simple: select your mic, enable CleanMic, and every app on your system hears clean audio. Enable it and forget about it.</p>
 
 <p align="center">
   <img src="assets/screenshot.png" alt="CleanMic main window">
@@ -12,17 +12,14 @@
 
 ## Features
 
-- **Three noise suppression engines, pre-tuned out of the box** - pick the one you like; no fiddling with DSP parameters:
-  - **DeepFilterNet** (default) - modern neural model, high-quality output with no robotic artefacts
+- **Three noise suppression engines** with pre-tuned defaults:
+  - **DeepFilterNet** (default) - modern neural model, high-quality output
   - **RNNoise** - lightweight classic RNN denoiser, low CPU
-  - **Khip** - adaptive model (user-supplied library), locks onto your noise profile over 1–2 s
-- **A Low / Medium / High strength slider that actually means something** - tuned per-engine against real noise (fan, keyboard, mouse); each step is a distinct audible change on all three engines, not just a cosmetic label
-- **Automatic update check** - quiet in-app banner, desktop notification, and tray indicator when a new release ships; fails silently if offline
-- **Stereo monitor** - route processed mic to both ears when you want to hear what the app hears
+  - **Khip** - adaptive model (user-supplied library)
+- **Light / Balanced / Strong strength dropdown** - tuned per-engine against real noise (fan, keyboard, mouse); each step is a distinct audible change on all three engines
 - Works with any app through a PipeWire virtual microphone source (Teams, Meet, Discord, Zoom)
 - System tray integration with quick enable / disable
-- French translation included
-- Feels like a system utility - enable it and forget about it
+- Monitor - route processed mic back to your headphones when you want to hear what the app hears
 
 ## Download
 
@@ -30,10 +27,10 @@
 2. Download `CleanMic-x86_64.AppImage`
 3. Make it executable and run:
 
-```bash
-chmod +x CleanMic-x86_64.AppImage
-./CleanMic-x86_64.AppImage
-```
+    ```bash
+    chmod +x CleanMic-x86_64.AppImage
+    ./CleanMic-x86_64.AppImage
+    ```
 
 > Thanks for trying CleanMic. If it's useful to you, you can [sponsor on GitHub](https://github.com/sponsors/claude-gagne) or [buy a coffee](https://buymeacoffee.com/claudegagne).
 
@@ -63,12 +60,10 @@ make appimage
 
 ## Support
 
-CleanMic is built in the hours around a day job. If it saves you time on calls, you can help keep it maintained:
+CleanMic is built in the hours around a day job. If it helps you out, you can help keep it maintained:
 
-- **[GitHub Sponsors](https://github.com/sponsors/claude-gagne)** - monthly or one-time, $3 / $10 / $25 tiers
-- **[Buy Me a Coffee](https://buymeacoffee.com/claudegagne)** - one-time $3 per coffee
-
-What the money covers: AppImage build infrastructure, investigating bug reports, testing against new mic hardware, and ongoing maintenance between day-job hours.
+- [GitHub Sponsors](https://github.com/sponsors/claude-gagne)
+- [Buy Me a Coffee](https://buymeacoffee.com/claudegagne)
 
 No paywalled features. No ads. No nagware in the app. Ever.
 
