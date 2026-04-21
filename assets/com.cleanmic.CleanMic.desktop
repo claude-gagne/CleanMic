@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=CleanMic
+Comment=Noise-free virtual microphone with switchable noise suppression
+Exec=cleanmic
+Icon=com.cleanmic.CleanMic
+Categories=Audio;AudioVideo;
+StartupNotify=false
+StartupWMClass=com.cleanmic.CleanMic
+Terminal=false

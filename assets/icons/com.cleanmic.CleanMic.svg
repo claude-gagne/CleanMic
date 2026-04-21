@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 128 128"
+     width="128" height="128">
+  <!--
+    com.cleanmic.CleanMic.svg — Full-colour application icon.
+    Spec: 128x128 viewBox, GNOME rounded-square silhouette,
+    GNOME blue (#3584e4) background, white mic.
+  -->
+
+  <!-- ── Rounded-square background ── -->
+  <rect x="0" y="0" width="128" height="128" rx="28" ry="28"
+        fill="#3584e4"/>
+
+  <!-- Subtle inner shadow/gradient to give depth (GNOME icon style) -->
+  <defs>
+    <linearGradient id="bg-shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="white" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="black" stop-opacity="0.12"/>
+    </linearGradient>
+
+    <!-- Soft drop-shadow filter for the mic shape -->
+    <filter id="mic-shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3"
+                    flood-color="black" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- Gloss overlay on background -->
+  <rect x="0" y="0" width="128" height="128" rx="28" ry="28"
+        fill="url(#bg-shine)"/>
+
+  <!-- ── Microphone body ── -->
+  <!-- Capsule: centred horizontally, upper two-thirds of canvas -->
+  <rect x="43" y="14" width="42" height="60" rx="21"
+        fill="white"
+        filter="url(#mic-shadow)"/>
+
+  <!-- Grille lines on capsule (decorative, subtle) -->
+  <line x1="43" y1="42" x2="85" y2="42"
+        stroke="#3584e4" stroke-width="2" opacity="0.25"/>
+  <line x1="43" y1="52" x2="85" y2="52"
+        stroke="#3584e4" stroke-width="2" opacity="0.25"/>
+
+  <!-- ── Mic stand ── -->
+  <!-- Curved arm arc -->
+  <path d="M24,58 Q24,92 64,92 Q104,92 104,58"
+        fill="none" stroke="white" stroke-width="7"
+        stroke-linecap="round"
+        filter="url(#mic-shadow)"/>
+
+  <!-- Vertical post -->
+  <line x1="64" y1="92" x2="64" y2="108"
+        stroke="white" stroke-width="7"
+        stroke-linecap="round"
+        filter="url(#mic-shadow)"/>
+
+  <!-- Base foot -->
+  <line x1="42" y1="108" x2="86" y2="108"
+        stroke="white" stroke-width="7"
+        stroke-linecap="round"
+        filter="url(#mic-shadow)"/>
+</svg>

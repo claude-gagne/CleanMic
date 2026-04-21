@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libpipewire-0.3-dev \
+            libdbus-1-dev \
+            pkg-config \
+            gettext \
+            curl
+
+      - name: Run tests
+        run: cargo test --all-features
+
+      - name: Fetch vendor binaries
+        run: bash scripts/fetch-vendors.sh
+
+      - name: Compile locale files
+        run: make mo
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: bash scripts/build-appimage.sh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: build/CleanMic-x86_64.AppImage

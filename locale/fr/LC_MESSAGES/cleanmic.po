@@ -1,0 +1,191 @@
+# French translations for CleanMic.
+# Copyright (C) 2026 CleanMic contributors
+# This file is distributed under the MIT license.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: cleanmic 0.1.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-03-29 00:00+0000\n"
+"PO-Revision-Date: 2026-03-31 00:00+0000\n"
+"Last-Translator: \n"
+"Language-Team: French\n"
+"Language: fr\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+# ── Window title ──────────────────────────────────────────────────────────────
+msgid "CleanMic"
+msgstr "CleanMic"
+
+# ── Status subtitle ───────────────────────────────────────────────────────────
+msgid "Active"
+msgstr "Actif"
+
+msgid "Inactive"
+msgstr "Inactif"
+
+# ── Input group ───────────────────────────────────────────────────────────────
+msgid "Input"
+msgstr "Entrée"
+
+msgid "Microphone"
+msgstr "Microphone"
+
+msgid "Physical input device to clean"
+msgstr "Périphérique d'entrée physique à filtrer"
+
+msgid "Default"
+msgstr "Par défaut"
+
+msgid "Enable"
+msgstr "Activer"
+
+msgid "Filter noise from the microphone signal"
+msgstr "Filtrer le bruit du signal du microphone"
+
+# ── Engine group ──────────────────────────────────────────────────────────────
+msgid "Engine"
+msgstr "Moteur"
+
+msgid "Model"
+msgstr "Modèle"
+
+msgid "The algorithm used to filter noise"
+msgstr "L'algorithme utilisé pour filtrer le bruit"
+
+msgid "Khip (not installed)"
+msgstr "Khip (non installé)"
+
+msgid "Noise suppression"
+msgstr "Suppression du bruit"
+
+msgid "How aggressively noise is removed"
+msgstr "Agressivité de la suppression du bruit"
+
+msgid "Low"
+msgstr "Faible"
+
+msgid "Medium"
+msgstr "Moyen"
+
+msgid "High"
+msgstr "Élevé"
+
+# ── Strength picker ───────────────────────────────────────────────────────────
+msgid "Strength"
+msgstr "Intensité"
+
+msgid "Light"
+msgstr "Légère"
+
+msgid "Balanced"
+msgstr "Équilibrée"
+
+msgid "Strong"
+msgstr "Forte"
+
+# ── Levels group ──────────────────────────────────────────────────────────────
+msgid "Levels"
+msgstr "Niveaux"
+
+msgid "Output"
+msgstr "Sortie"
+
+# ── Settings group ────────────────────────────────────────────────────────────
+msgid "Settings"
+msgstr "Paramètres"
+
+msgid "Start on login"
+msgstr "Démarrer à la connexion"
+
+msgid "Launch CleanMic automatically when you log in"
+msgstr "Lancer CleanMic automatiquement lors de la connexion"
+
+msgid "Listen to processed mic"
+msgstr "Écouter le micro filtré"
+
+msgid "Route processed audio to your headphones"
+msgstr "Acheminer le son filtré vers vos écouteurs"
+
+# ── Tray notification ─────────────────────────────────────────────────────────
+msgid "CleanMic is still running"
+msgstr "CleanMic tourne toujours en arrière-plan"
+
+msgid "The window was closed but CleanMic continues processing your microphone in the background. Look for the tray icon to reopen or quit."
+msgstr "La fenêtre est fermée mais CleanMic continue de traiter votre microphone en arrière-plan. Cherchez l'icône dans la barre système pour rouvrir ou quitter."
+
+# ── Tray menu ─────────────────────────────────────────────────────────────────
+msgid "CleanMic active"
+msgstr "CleanMic actif"
+
+msgid "CleanMic (unavailable)"
+msgstr "CleanMic (indisponible)"
+
+msgid "Monitor"
+msgstr "Moniteur"
+
+msgid "Open CleanMic"
+msgstr "Ouvrir CleanMic"
+
+msgid "Quit"
+msgstr "Quitter"
+
+# ── No tray notification ──────────────────────────────────────────────────────
+msgid "No system tray detected"
+msgstr "Aucune zone de notification détectée"
+
+msgid "Install the AppIndicator extension to minimize CleanMic to tray. Closing the window will quit the application."
+msgstr "Installez l'extension AppIndicator pour réduire CleanMic dans la zone de notification. Fermer la fenêtre quittera l'application."
+
+# ── About dialog ──────────────────────────────────────────────────────────────
+msgid "About CleanMic"
+msgstr "À propos de CleanMic"
+
+# ── Support / donation ────────────────────────────────────────────────────────
+msgid "Support CleanMic"
+msgstr "Soutenir CleanMic"
+
+# ── PipeWire notifications ────────────────────────────────────────────────────
+msgid "PipeWire disconnected"
+msgstr "PipeWire déconnecté"
+
+msgid "The audio daemon disconnected. Attempting to reconnect…"
+msgstr "Le daemon audio s'est déconnecté. Tentative de reconnexion…"
+
+msgid "PipeWire reconnected"
+msgstr "PipeWire reconnecté"
+
+msgid "Audio processing has been restored."
+msgstr "Le traitement audio a été rétabli."
+
+msgid "PipeWire reconnect failed"
+msgstr "Reconnexion PipeWire échouée"
+
+msgid "Could not reconnect to the audio daemon. Audio processing is unavailable. Please restart CleanMic or check that PipeWire is running."
+msgstr "Impossible de se reconnecter au daemon audio. Le traitement audio est indisponible. Veuillez redémarrer CleanMic ou vérifier que PipeWire est en cours d'exécution."
+
+# ── Audio thread health notifications ────────────────────────────────────────
+msgid "Audio processing stopped"
+msgstr "Traitement audio arrêté"
+
+msgid "The audio thread has stopped. Attempting to restart..."
+msgstr "Le fil audio s'est arrêté. Tentative de redémarrage..."
+
+msgid "Audio processing unavailable"
+msgstr "Traitement audio indisponible"
+
+msgid "Could not restart audio processing. Please restart CleanMic."
+msgstr "Impossible de redémarrer le traitement audio. Veuillez redémarrer CleanMic."
+
+# ── v1.1 additions (Phase 7.1) ────────────────────────────────────────────────
+msgid "Noise Processing"
+msgstr "Suppression du bruit"
+
+msgid "Check for updates"
+msgstr "Rechercher des mises à jour"
+
+msgid "Download"
+msgstr "Télécharger"
