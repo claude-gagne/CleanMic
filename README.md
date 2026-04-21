@@ -32,8 +32,6 @@
     ./CleanMic-x86_64.AppImage
     ```
 
-> Thanks for trying CleanMic. If it's useful to you, you can [buy me a coffee](https://buymeacoffee.com/claudegagne).
-
 ## System Requirements
 
 - Linux x86_64 with **PipeWire** (Ubuntu 22.04+, Fedora 34+)
