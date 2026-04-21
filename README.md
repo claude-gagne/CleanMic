@@ -32,7 +32,7 @@
     ./CleanMic-x86_64.AppImage
     ```
 
-> Thanks for trying CleanMic. If it's useful to you, you can [sponsor on GitHub](https://github.com/sponsors/claude-gagne) or [buy a coffee](https://buymeacoffee.com/claudegagne).
+> Thanks for trying CleanMic. If it's useful to you, you can [buy me a coffee](https://buymeacoffee.com/claudegagne).
 
 ## System Requirements
 
@@ -60,10 +60,7 @@ make appimage
 
 ## Support
 
-CleanMic is built in the hours around a day job. If it helps you out, you can help keep it maintained:
-
-- [GitHub Sponsors](https://github.com/sponsors/claude-gagne)
-- [Buy Me a Coffee](https://buymeacoffee.com/claudegagne)
+CleanMic is built in the hours around a day job. If it helps you out, you can [buy me a coffee](https://buymeacoffee.com/claudegagne) to help keep it maintained.
 
 No paywalled features. No ads. No nagware in the app. Ever.
 
