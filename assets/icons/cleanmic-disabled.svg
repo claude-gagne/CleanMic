@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 16 16"
+     width="16" height="16">
+  <!--
+    cleanmic-disabled.svg — Tray icon, disabled/muted state.
+    Same mic geometry as the active icon, with a diagonal strike-through
+    line overlaid.  Uses currentColor throughout.
+  -->
+
+  <!-- Microphone capsule body (slightly transparent to signal off state) -->
+  <rect x="5" y="1" width="6" height="8" rx="3"
+        fill="currentColor" opacity="0.45"/>
+
+  <!-- Mic stand arms -->
+  <path d="M3,8 Q3,12 8,12 Q13,12 13,8"
+        fill="none" stroke="currentColor" stroke-width="1.5"
+        stroke-linecap="round" opacity="0.45"/>
+
+  <!-- Mic stand vertical post -->
+  <line x1="8" y1="12" x2="8" y2="14.5"
+        stroke="currentColor" stroke-width="1.5"
+        stroke-linecap="round" opacity="0.45"/>
+
+  <!-- Base foot -->
+  <line x1="5.5" y1="14.5" x2="10.5" y2="14.5"
+        stroke="currentColor" stroke-width="1.5"
+        stroke-linecap="round" opacity="0.45"/>
+
+  <!--
+    Strike-through slash at full opacity so it reads clearly.
+    Diagonal from top-right to bottom-left, with a white outline stroke
+    to stay legible on both light and dark backgrounds.
+  -->
+  <line x1="13" y1="2" x2="2" y2="14"
+        stroke="white" stroke-width="2.8"
+        stroke-linecap="round"
+        opacity="0.7"/>
+  <line x1="13" y1="2" x2="2" y2="14"
+        stroke="currentColor" stroke-width="1.6"
+        stroke-linecap="round"/>
+</svg>
