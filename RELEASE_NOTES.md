@@ -26,4 +26,4 @@ CleanMic is a small desktop app for Ubuntu, Fedora, and other modern Linux distr
 
 ## Support
 
-If CleanMic is useful to you, you can [sponsor on GitHub](https://github.com/sponsors/claude-gagne) or [buy a coffee](https://buymeacoffee.com/claudegagne).
+If CleanMic is useful to you, you can [buy me a coffee](https://buymeacoffee.com/claudegagne).
