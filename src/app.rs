@@ -849,7 +849,7 @@ fn run_with_gui(
             dialog.set_issue_url("https://github.com/claude-gagne/CleanMic/issues");
             dialog.set_license_type(gtk4::License::MitX11);
             dialog.set_application_icon("com.cleanmic.CleanMic");
-            dialog.add_link(&crate::tr!("Support CleanMic"), "https://github.com/sponsors/claude-gagne");
+            dialog.add_link(&crate::tr!("Support CleanMic"), "https://buymeacoffee.com/claudegagne");
             dialog.set_debug_info(&build_debug_info());
             dialog.set_debug_info_filename("cleanmic-debug.txt");
             if let Some(win) = window_weak.upgrade() {
