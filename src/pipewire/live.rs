@@ -52,8 +52,8 @@ enum PipeWireCommand {
         output_reader: RingBufReader,
         /// PipeWire node name to pin the capture stream to (PW_KEY_TARGET_OBJECT).
         /// When `None`, the capture stream uses AUTOCONNECT and follows the
-        /// system default source — which causes a self-loop if CleanMic is
-        /// set as the default. Always pass `Some(name)` in production.
+        /// system default source. Always pass `Some(name)` in production so
+        /// WirePlumber's default-source policy cannot re-route the stream.
         capture_target: Option<String>,
     },
     DestroyStream,
@@ -836,10 +836,9 @@ impl LivePipeWireManager {
     /// Create the "CleanMic" virtual source node via PipeWire.
     ///
     /// `capture_target` pins the capture stream's source to a specific
-    /// PipeWire node name (set via `PW_KEY_TARGET_OBJECT`). Pass `None` only
-    /// when no physical mic is available yet; otherwise always pin it, because
-    /// an unpinned capture stream follows the system default source and will
-    /// self-loop if CleanMic is set as the default input.
+    /// PipeWire node name (set via `PW_KEY_TARGET_OBJECT`). Always pin it so
+    /// WirePlumber's default-source policy cannot re-route the capture stream.
+    /// Pass `None` only when no physical mic is available on the system.
     pub fn create_virtual_mic(
         &mut self,
         capture_writer: RingBufWriter,
@@ -1051,6 +1050,41 @@ fn configured_default_sink() -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // pw-metadata prints lines like:
     //   update: id:0 key:'default.configured.audio.sink' value:'{"name":"<sink>"}' type:'Spa:String:JSON'
+    // Parse out the JSON value and extract "name".
+    for line in stdout.lines() {
+        let Some(start) = line.find("value:'") else { continue };
+        let rest = &line[start + 7..];
+        let Some(end) = rest.find('\'') else { continue };
+        let json_str = &rest[..end];
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
+        if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Read the user's configured default audio source from PipeWire metadata.
+///
+/// Returns the node name listed in `default.configured.audio.source` — this is
+/// the source the user selected in GNOME Sound Settings (or equivalent). It
+/// differs from `default.audio.source`, which reflects whatever source the
+/// PipeWire graph currently routes to, and which can silently drift to a
+/// fallback device when the configured source is temporarily unavailable.
+///
+/// Returns `None` if pw-metadata is unreachable or the key is unset.
+pub(crate) fn configured_default_source() -> Option<String> {
+    let output = std::process::Command::new("pw-metadata")
+        .arg("0")
+        .arg("default.configured.audio.source")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // pw-metadata prints lines like:
+    //   update: id:0 key:'default.configured.audio.source' value:'{"name":"<source>"}' type:'Spa:String:JSON'
     // Parse out the JSON value and extract "name".
     for line in stdout.lines() {
         let Some(start) = line.find("value:'") else { continue };
