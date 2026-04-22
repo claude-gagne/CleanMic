@@ -34,8 +34,19 @@
 
 ## System Requirements
 
-- Linux x86_64 with **PipeWire** (Ubuntu 22.04+, Fedora 34+)
-- **GTK4 + libadwaita** (installed by default on GNOME desktops)
+- x86_64 Linux with **PipeWire** and **glibc ≥ 2.39**
+- **GTK4 + libadwaita** (standard on GNOME)
+
+**Tested on:** Ubuntu 24.04 LTS (GNOME 46, PipeWire 1.0.5).
+
+**Should also work on** (same deps, not directly tested):
+
+- **Ubuntu-family (24.04+):** Kubuntu, Xubuntu, Pop!_OS, Linux Mint 22, elementary OS 8, KDE Neon
+- **Fedora-family (40+):** Fedora Workstation, Silverblue / Kinoite, Bazzite, Nobara
+- **Debian 13 "Trixie"**
+- **Rolling:** Arch, Manjaro, EndeavourOS, CachyOS, openSUSE Tumbleweed
+
+**Won't run on** glibc < 2.39 — including Ubuntu 22.04, Mint 21.x, Pop!_OS 22.04, Fedora ≤ 39, Debian 12, and RHEL / Alma / Rocky 9.
 
 ## Known Limitations
 
