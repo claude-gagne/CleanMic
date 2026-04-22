@@ -16,9 +16,9 @@ CleanMic is a small desktop app for Ubuntu, Fedora, and other modern Linux distr
 ## System Requirements
 
 - x86_64 Linux with PipeWire and glibc ≥ 2.39
-- GTK4 + libadwaita (standard on GNOME)
+- GTK4 + libadwaita (standard on GNOME; install `libadwaita-1-0` on KDE / XFCE / Cinnamon desktops)
 
-Tested on Ubuntu 24.04 LTS (GNOME 46, PipeWire 1.0.5). Should also work on current Ubuntu/Fedora-family distros (Pop!_OS, Linux Mint 22, elementary OS 8, Bazzite, Nobara, Silverblue), Debian 13, and rolling distros (Arch, Manjaro, openSUSE Tumbleweed). Won't run on glibc < 2.39 — including Ubuntu 22.04, Mint 21.x, Fedora ≤ 39, Debian 12, and RHEL/Alma/Rocky 9.
+Tested on Ubuntu 24.04 LTS. Should also work on Ubuntu 24.04+ flavors (Kubuntu, Xubuntu, Pop!_OS, Linux Mint 22, elementary OS 8, KDE Neon). Other modern distros with glibc ≥ 2.39, PipeWire, and GTK4/libadwaita (Fedora 40+, Debian 13, Bazzite, Arch, openSUSE Tumbleweed) should also work — untested, feedback welcome. Won't run on glibc < 2.39 — including Ubuntu 22.04, Mint 21.x, Fedora ≤ 39, Debian 12, and RHEL/Alma/Rocky 9.
 
 ## Known Limitations
 

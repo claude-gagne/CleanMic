@@ -35,16 +35,13 @@
 ## System Requirements
 
 - x86_64 Linux with **PipeWire** and **glibc ≥ 2.39**
-- **GTK4 + libadwaita** (standard on GNOME)
+- **GTK4 + libadwaita** (standard on GNOME; install `libadwaita-1-0` on KDE / XFCE / Cinnamon desktops)
 
-**Tested on:** Ubuntu 24.04 LTS (GNOME 46, PipeWire 1.0.5).
+**Tested on:** Ubuntu 24.04 LTS.
 
-**Should also work on** (same deps, not directly tested):
+**Should also work on Ubuntu 24.04+ flavors** (same base, not directly tested): Kubuntu, Xubuntu, Ubuntu MATE, Pop!_OS, Linux Mint 22, elementary OS 8, KDE Neon.
 
-- **Ubuntu-family (24.04+):** Kubuntu, Xubuntu, Pop!_OS, Linux Mint 22, elementary OS 8, KDE Neon
-- **Fedora-family (40+):** Fedora Workstation, Silverblue / Kinoite, Bazzite, Nobara
-- **Debian 13 "Trixie"**
-- **Rolling:** Arch, Manjaro, EndeavourOS, CachyOS, openSUSE Tumbleweed
+Other modern Linux distros (Fedora 40+, Debian 13, Bazzite, Arch, openSUSE Tumbleweed, etc.) with glibc ≥ 2.39, PipeWire, GTK4 and libadwaita should also work — untested from my end. Feedback welcome.
 
 **Won't run on** glibc < 2.39 — including Ubuntu 22.04, Mint 21.x, Pop!_OS 22.04, Fedora ≤ 39, Debian 12, and RHEL / Alma / Rocky 9.
 
