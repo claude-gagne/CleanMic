@@ -130,10 +130,11 @@ impl PipeWireManager {
     /// The node is created with media.class = "Audio/Source", mono, 48 kHz, f32.
     ///
     /// `capture_target` is the PipeWire node name of the physical mic to pin
-    /// the capture stream to (set via `PW_KEY_TARGET_OBJECT`). Pass `None`
-    /// only when no device is selected yet; otherwise always pin, because an
-    /// unpinned capture follows the system default source and self-loops if
-    /// CleanMic is set as the default input.
+    /// the capture stream to (set via `PW_KEY_TARGET_OBJECT`). Always pin so
+    /// WirePlumber's default-source policy cannot re-route the capture stream
+    /// to whatever source the user has selected in GNOME Sound Settings. Pass
+    /// `None` only when no physical mic is available on the system (the picker
+    /// will surface the "No input device available" state).
     pub fn create_virtual_mic(
         &mut self,
         capture_target: Option<String>,
@@ -279,6 +280,24 @@ impl PipeWireManager {
     /// pipeline.
     pub fn take_capture_reader(&mut self) -> Option<RingBufReader> {
         self.capture_reader.take()
+    }
+
+    /// Query the user's configured default audio source from PipeWire metadata.
+    ///
+    /// Returns the PipeWire node name listed in `default.configured.audio.source`
+    /// — the source the user selected in GNOME Sound Settings. Returns `None`
+    /// if pw-metadata is unreachable, the key is unset, or the `pipewire`
+    /// feature is disabled.
+    pub fn configured_default_source(&self) -> Option<String> {
+        #[cfg(feature = "pipewire")]
+        {
+            crate::pipewire::live::configured_default_source()
+        }
+
+        #[cfg(not(feature = "pipewire"))]
+        {
+            None
+        }
     }
 
     /// Retarget the CleanMic capture stream to a different physical mic.
