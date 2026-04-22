@@ -42,6 +42,12 @@ pub enum UiEvent {
     /// The user selected a different input device (PipeWire node name).
     DeviceChanged(String),
 
+    /// The user selected the "Default" entry in the picker, meaning "follow
+    /// whatever the OS has set as the default input source". Distinct from
+    /// `DeviceChanged` because it must clear `config.input_device` to `None`
+    /// rather than pin to a specific name. Per D-06.
+    DeviceChangedToDefault,
+
     /// The user toggled the enable/disable switch.
     EnableToggled(bool),
 
@@ -115,6 +121,14 @@ pub struct UiState {
     /// Does not include "CleanMic" itself.
     pub available_devices: Vec<DeviceInfo>,
 
+    /// PipeWire node name of the OS-level default input source, if any and
+    /// if it is a real mic (not CleanMic). `None` means either (a) the OS
+    /// default is CleanMic itself, or (b) the default could not be resolved
+    /// from pw-metadata. The picker uses this signal to decide whether to
+    /// render the "Default (MicName)" entry or hide it entirely. Per D-01,
+    /// D-08.
+    pub system_default_name: Option<String>,
+
     /// Whether the Khip library was detected on this system.
     /// When `false`, the Khip engine option is grayed out.
     pub khip_available: bool,
@@ -137,6 +151,7 @@ impl Default for UiState {
             input_level: 0.0,
             output_level: 0.0,
             available_devices: Vec::new(),
+            system_default_name: None,
             khip_available: false,
             update_available: None,
         }
@@ -185,6 +200,7 @@ mod tests {
         assert!((state.input_level - 0.0).abs() < f32::EPSILON);
         assert!((state.output_level - 0.0).abs() < f32::EPSILON);
         assert!(state.available_devices.is_empty());
+        assert_eq!(state.system_default_name, None);
         assert!(!state.khip_available);
     }
 

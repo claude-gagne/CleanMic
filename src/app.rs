@@ -340,6 +340,17 @@ fn handle_ui_event(
             }
             config.input_device = Some(device);
         }
+        UiEvent::DeviceChangedToDefault => {
+            // Placeholder: full handler lands in plan 08.2-03 (app orchestration).
+            // When the user picks "Default" in the mic picker, config.input_device
+            // must clear to None (= "follow OS default"), then the capture target
+            // resolves to whatever `PipeWireManager::configured_default_source()`
+            // returns. Plan 01 only introduces the event variant; plan 03 wires
+            // the resolver call and the capture-stream retarget. Per D-06.
+            log::debug!(
+                "DeviceChangedToDefault received — full handler lands in plan 08.2-03"
+            );
+        }
         UiEvent::EnableToggled(enabled) => {
             if enabled {
                 pipeline.start();
