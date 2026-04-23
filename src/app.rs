@@ -364,12 +364,20 @@ pub fn shutdown(
 /// `DeviceChanged` handler fires (real-mic pick) and when
 /// `DeviceChangedToDefault` records the previous pick before clearing.
 /// Never written by the auto-switch path in the polling timer (D-06).
+///
+/// `current_capture_target` records the PipeWire node name the capture stream
+/// is currently pinned to. Updated by both `DeviceChanged` and
+/// `DeviceChangedToDefault` immediately after their own `set_capture_target`
+/// calls so the 1500ms polling timer's diff-based retarget branch
+/// (gap-closure 08.2-05 Task 2) does not double-fire on the very next tick.
+/// Never affects config persistence (D-06).
 fn handle_ui_event(
     event: UiEvent,
     pipeline: &AudioPipeline,
     config: &mut Config,
     pw_manager: &mut PipeWireManager,
     last_explicit: &RefCell<Option<String>>,
+    current_capture_target: &RefCell<Option<String>>,
 ) {
     match event {
         UiEvent::EngineChanged(engine_type) => {
@@ -398,6 +406,10 @@ fn handle_ui_event(
                 Ok(new_reader) => {
                     pipeline.replace_capture_reader(new_reader);
                     log::info!("Capture target retargeted to {}", device);
+                    // Keep the app-layer capture-target tracker in sync so the
+                    // 1500ms timer's diff-based retarget branch does not
+                    // double-fire on the next tick (G-03/G-04, 08.2-05 Task 2).
+                    *current_capture_target.borrow_mut() = Some(device.clone());
                 }
                 Err(e) => {
                     log::error!("Failed to retarget capture stream to {}: {e}", device);
@@ -442,6 +454,10 @@ fn handle_ui_event(
                         Ok(new_reader) => {
                             pipeline.replace_capture_reader(new_reader);
                             log::info!("Follow-default: capture target resolved to {name}");
+                            // Keep the app-layer capture-target tracker in sync so the
+                            // 1500ms timer's diff-based retarget branch does not
+                            // double-fire on the next tick (G-03/G-04, 08.2-05 Task 2).
+                            *current_capture_target.borrow_mut() = Some(name.clone());
                         }
                         Err(e) => {
                             log::error!(
@@ -454,6 +470,10 @@ fn handle_ui_event(
                     // No real mic available. D-10 state will be surfaced by the
                     // polling timer on its next tick.
                     log::warn!("Follow-default: no physical input device available");
+                    // Keep the app-layer capture-target tracker in sync: no target
+                    // is pinned. The 1500ms timer's retarget branch will promote
+                    // a mic once one becomes enumerable.
+                    *current_capture_target.borrow_mut() = None;
                 }
             }
             // Persist config.input_device = None immediately so the intent
@@ -524,6 +544,10 @@ fn handle_ui_event(
 /// `last_explicit` is forwarded to the underlying [`handle_ui_event`] calls so
 /// tray-driven device changes participate in the same auto-switch fallback
 /// semantics as UI-driven ones (D-03).
+///
+/// `current_capture_target` is forwarded so that tray-driven device changes
+/// (if ever wired up — currently the tray does not expose a device picker)
+/// keep the polling-timer's app-state tracker in sync (08.2-05 Task 2).
 #[allow(dead_code)]
 fn handle_tray_command(
     cmd: TrayCommand,
@@ -531,18 +555,19 @@ fn handle_tray_command(
     config: &mut Config,
     pw_manager: &mut PipeWireManager,
     last_explicit: &RefCell<Option<String>>,
+    current_capture_target: &RefCell<Option<String>>,
 ) {
     match cmd {
         TrayCommand::Toggle => {
             let new_state = !config.enabled;
-            handle_ui_event(UiEvent::EnableToggled(new_state), pipeline, config, pw_manager, last_explicit);
+            handle_ui_event(UiEvent::EnableToggled(new_state), pipeline, config, pw_manager, last_explicit, current_capture_target);
         }
         TrayCommand::SetEngine(engine_type) => {
-            handle_ui_event(UiEvent::EngineChanged(engine_type), pipeline, config, pw_manager, last_explicit);
+            handle_ui_event(UiEvent::EngineChanged(engine_type), pipeline, config, pw_manager, last_explicit, current_capture_target);
         }
         TrayCommand::ToggleMonitor => {
             let new_state = !config.monitor_enabled;
-            handle_ui_event(UiEvent::MonitorToggled(new_state), pipeline, config, pw_manager, last_explicit);
+            handle_ui_event(UiEvent::MonitorToggled(new_state), pipeline, config, pw_manager, last_explicit, current_capture_target);
         }
         TrayCommand::OpenWindow => {
             log::info!("Open main window requested (not yet implemented in headless mode)");
@@ -783,14 +808,20 @@ fn run_headless(
     // satisfied without affecting behavior. Per D-03 / D-07.
     let last_explicit_headless: RefCell<Option<String>> = RefCell::new(None);
 
+    // Headless mode has no polling timer and therefore no diff-based retarget,
+    // so this scratch RefCell is write-only from the handlers' perspective —
+    // it keeps the handler signature satisfied without affecting behavior
+    // (08.2-05 Task 2).
+    let current_capture_target_headless: RefCell<Option<String>> = RefCell::new(None);
+
     log::info!("CleanMic running headless — waiting for shutdown signal");
 
     while !is_shutdown_requested() {
         while let Ok(event) = ui_rx.try_recv() {
-            handle_ui_event(event, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless);
+            handle_ui_event(event, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless, &current_capture_target_headless);
         }
         while let Ok(cmd) = tray_rx.try_recv() {
-            handle_tray_command(cmd, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless);
+            handle_tray_command(cmd, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless, &current_capture_target_headless);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -910,6 +941,29 @@ fn run_with_gui(
     let last_explicit_input_device: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(
         config.borrow().input_device.clone(),
     ));
+
+    // App-layer record of the PipeWire node name the capture stream is
+    // currently pinned to. Used by the 1500ms polling timer (Task 2 of
+    // gap-closure plan 08.2-05) to detect when the pinned target has
+    // diverged from the resolver's current preferred target, and to drive a
+    // silent retarget when (a) the pinned target has become unenumerable
+    // (G-03: hot-unplug of an explicitly-picked mic), or (b) the resolver's
+    // preferred target has changed because last_explicit came back online
+    // (G-04: hot-replug recovery). Seeded by re-running the resolver once
+    // against live enumeration so the first timer tick is a no-op when the
+    // virtual mic was created pinned to the same target. Written ONLY by
+    // the timer's diff branch and by the UiEvent::DeviceChanged /
+    // DeviceChangedToDefault handlers immediately after their own
+    // set_capture_target calls (so the next tick does not redundantly
+    // retarget). Never affects config persistence (D-06).
+    let current_capture_target_app_state: Rc<RefCell<Option<String>>> = {
+        let initial_target_for_tracker = {
+            let pw = pw_manager.borrow();
+            let cfg = config.borrow();
+            resolve_initial_capture_target(&pw, &cfg)
+        };
+        Rc::new(RefCell::new(initial_target_for_tracker))
+    };
 
     // Pending debounced config save (for rapid-fire events: strength, engine, device).
     let pending_save: Rc<std::cell::Cell<Option<glib::SourceId>>> = Rc::new(std::cell::Cell::new(None));
@@ -1111,6 +1165,7 @@ fn run_with_gui(
         let pw_timer = pw_manager_clone.clone();
         let pending_save_timer = pending_save.clone();
         let last_explicit_timer = last_explicit_input_device.clone();
+        let current_capture_target_timer = current_capture_target_app_state.clone();
         let app_weak = app.downgrade();
         let notification_throttle_timer = notification_throttle.clone();
         let pw_reconnect_attempted_timer = pw_reconnect_attempted.clone();
@@ -1258,7 +1313,7 @@ fn run_with_gui(
                     event,
                     UiEvent::EnableToggled(_) | UiEvent::MonitorToggled(_) | UiEvent::AutostartToggled(_)
                 );
-                handle_ui_event(event, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer);
+                handle_ui_event(event, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer, &current_capture_target_timer);
                 if needs_debounce {
                     schedule_debounced_save(&config_timer, &pending_save_timer);
                 } else if needs_immediate_save && let Err(e) = config_timer.borrow().save() {
@@ -1318,7 +1373,7 @@ fn run_with_gui(
                         // Result arrives via channel on next timer tick; skip handle_tray_command
                         continue;
                     }
-                    handle_tray_command(cmd, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer);
+                    handle_tray_command(cmd, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer, &current_capture_target_timer);
                     if tray_needs_debounce {
                         schedule_debounced_save(&config_timer, &pending_save_timer);
                     } else if tray_needs_immediate_save && let Err(e) = config_timer.borrow().save() {
@@ -1467,6 +1522,7 @@ fn run_with_gui(
             let pipeline_timer_slow = pipeline_clone.clone();
             let config_timer_slow = config_clone.clone();
             let last_explicit_slow = last_explicit_input_device.clone();
+            let current_capture_target_slow = current_capture_target_app_state.clone();
             // Track the last system_default_name we pushed to the UI so we
             // only refresh on actual change. Outer Option = "never pushed
             // yet" sentinel; inner Option = actual pushed value (which may
@@ -1572,12 +1628,83 @@ fn run_with_gui(
                     *last_pushed_devices.borrow_mut() = current_devices_as_opt;
                 }
 
-                // NOTE: The previous narrow default-transition auto-switch
-                // branch (gated on "OS default went from Some to None" AND
-                // "user was following default") has been replaced by the
-                // unified diff-based retarget branch added in gap-closure
-                // Task 2 of 08.2-05. Do not re-introduce the narrow branch —
-                // it would double-fire with the diff-based retarget.
+                // G-03 / G-04: diff-based capture retarget.
+                //
+                // Run the resolver every tick against live enumeration +
+                // live last_explicit + live config state. Compare the
+                // resolver's preferred target against the app-state record
+                // of what is currently pinned. When they differ, call
+                // set_capture_target to retarget.
+                //
+                // This subsumes the previous narrow default-transition
+                // auto-switch branch (which was gated on "OS default went
+                // from Some to None" AND "user was following default" and
+                // was deleted in Task 1 of gap-closure plan 08.2-05). The
+                // unified branch handles:
+                //   - G-03: user's explicit pick became unenumerable (the
+                //           resolver falls through to the next priority
+                //           level; current_capture_target holds the stale
+                //           dead-node name until we retarget).
+                //   - G-04: user's explicit pick became enumerable again
+                //           (the resolver promotes it back via the priority
+                //           chain; current_capture_target still holds the
+                //           fallback name until we retarget).
+                //   - the original OS-default → CleanMic flip (now
+                //     expressed as system_default_name going to None,
+                //     which collapses the third priority level and falls
+                //     through to the next).
+                //
+                // D-06: config.input_device is NEVER written by this branch.
+                // The user's declared intent stays authoritative for when
+                // their chosen mic comes back online.
+                let (config_input_device_snapshot, last_explicit_snapshot) = {
+                    let cfg = config_timer_slow.borrow();
+                    let last = last_explicit_slow.borrow().clone();
+                    (cfg.input_device.clone(), last)
+                };
+
+                let desired_target = resolve_runtime_capture_target(
+                    &devices,
+                    config_input_device_snapshot.as_deref(),
+                    last_explicit_snapshot.as_deref(),
+                    system_default_name.as_deref(),
+                );
+
+                let current_target_snapshot = current_capture_target_slow.borrow().clone();
+                if desired_target != current_target_snapshot {
+                    match &desired_target {
+                        Some(name) => {
+                            let result = {
+                                let mut pw_mut = pw_timer_slow.borrow_mut();
+                                pw_mut.set_capture_target(Some(name.clone()))
+                            };
+                            match result {
+                                Ok(new_reader) => {
+                                    pipeline_timer_slow.set_input_device(name.clone());
+                                    pipeline_timer_slow.replace_capture_reader(new_reader);
+                                    *current_capture_target_slow.borrow_mut() =
+                                        Some(name.clone());
+                                    log::info!(
+                                        "Auto-retarget: capture stream retargeted to {name} (silent per D-04; config.input_device unchanged per D-06)"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Auto-retarget: failed to set capture target to {name}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            // No enumerable mic anywhere. The D-10 block above
+                            // has already stopped the pipeline and grayed out
+                            // the toggle. Just record the absence so we
+                            // retarget on the next tick when a mic becomes
+                            // available.
+                            *current_capture_target_slow.borrow_mut() = None;
+                        }
+                    }
+                }
 
                 glib::ControlFlow::Continue
             });
@@ -1884,6 +2011,7 @@ mod tests {
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
         handle_ui_event(
             UiEvent::EngineChanged(EngineType::RNNoise),
@@ -1891,6 +2019,7 @@ mod tests {
             &mut config,
             &mut pw,
             &last_explicit_test,
+            &current_capture_target_test,
         );
         assert_eq!(config.engine, EngineType::RNNoise);
 
@@ -1904,11 +2033,12 @@ mod tests {
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_ui_event(UiEvent::EnableToggled(false), &pipeline, &mut config, &mut pw, &last_explicit_test);
+        handle_ui_event(UiEvent::EnableToggled(false), &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(!config.enabled);
 
-        handle_ui_event(UiEvent::EnableToggled(true), &pipeline, &mut config, &mut pw, &last_explicit_test);
+        handle_ui_event(UiEvent::EnableToggled(true), &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(config.enabled);
 
         drop(pipeline);
@@ -1927,6 +2057,7 @@ mod tests {
         config.engine = EngineType::DeepFilterNet;
         let mut pw = PipeWireManager::connect().unwrap();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
         handle_ui_event(
             UiEvent::EngineChanged(EngineType::Khip),
@@ -1934,6 +2065,7 @@ mod tests {
             &mut config,
             &mut pw,
             &last_explicit_test,
+            &current_capture_target_test,
         );
         // Khip unavailable — fallback chain assigns best available engine (D-02).
         // Config should have been updated to the actual engine used.
@@ -1950,11 +2082,12 @@ mod tests {
         config.enabled = true;
         let mut pw = PipeWireManager::connect().unwrap();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test);
+        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(!config.enabled);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test);
+        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(config.enabled);
 
         drop(pipeline);
@@ -1969,8 +2102,9 @@ mod tests {
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Quit, &pipeline, &mut config, &mut pw, &last_explicit_test);
+        handle_tray_command(TrayCommand::Quit, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(is_shutdown_requested());
 
         // Cleanup.
