@@ -235,7 +235,7 @@ fn enumerate_real_devices() -> Result<Vec<InputDevice>, String> {
         }
     }
 
-    log::info!(
+    log::debug!(
         "enumerate_real_devices: found {} audio source(s) via pw-dump",
         devices.len()
     );
