@@ -380,41 +380,103 @@ pub fn build_main_window(
 
 // ── Helper builders ───────────────────────────────────────────────────────────
 
+/// Result of computing the picker's string model and current selection.
+///
+/// `strings` is the list shown in the dropdown.
+/// `selected_idx` is the index the combo row should mark as active.
+/// `default_present` indicates whether index 0 is the synthetic "Default (Mic)"
+/// entry (true) or the first real device (false). The selection closure uses
+/// this to decide which UiEvent variant to emit when index 0 is picked.
+/// `no_input` indicates the D-10 "No input device available" state.
+struct DevicePickerModel {
+    strings: Vec<String>,
+    selected_idx: u32,
+    default_present: bool,
+    no_input: bool,
+}
+
+/// Compute the picker's string list and selection state from the current
+/// device list, the OS default name, and the user's persisted input_device.
+///
+/// Rules (per D-01, D-02, D-10):
+/// - `system_default_name = Some(name)` + `name` resolves to a real device in `devices`
+///   → prepend `"Default (description)"` as index 0; real devices follow at index 1..N.
+/// - `system_default_name = None` OR the default name is not in `devices`
+///   → no Default entry; real devices start at index 0.
+/// - `devices` empty AND `system_default_name` is None
+///   → single entry `"No input device available"` (D-10). `no_input = true`.
+fn build_device_model(
+    devices: &[DeviceInfo],
+    system_default_name: Option<&str>,
+    current_device: Option<&str>,
+) -> DevicePickerModel {
+    // D-10 no-input branch.
+    if devices.is_empty() && system_default_name.is_none() {
+        return DevicePickerModel {
+            strings: vec![tr!("No input device available")],
+            selected_idx: 0,
+            default_present: false,
+            no_input: true,
+        };
+    }
+
+    // Resolve the default's description, if present and in the device list.
+    let default_description: Option<String> = system_default_name
+        .and_then(|name| devices.iter().find(|d| d.name == name))
+        .map(|d| d.description.clone());
+
+    let mut strings: Vec<String> = Vec::with_capacity(devices.len() + 1);
+    let default_present = if let Some(ref desc) = default_description {
+        // D-02 label format: tr!("Default") + " (" + description + ")"
+        strings.push(format!("{} ({})", tr!("Default"), desc));
+        true
+    } else {
+        false
+    };
+    for d in devices {
+        strings.push(d.description.clone());
+    }
+
+    // Compute selected_idx:
+    // - If current_device is None AND Default is present → index 0 (following OS default).
+    // - If current_device is Some(name) AND name matches a real device → its position + (1 if default_present else 0).
+    // - Else → 0 (fall back to first entry, which is either Default or the first real mic).
+    let offset: u32 = if default_present { 1 } else { 0 };
+    let selected_idx = match current_device {
+        None if default_present => 0,
+        Some(name) => devices
+            .iter()
+            .position(|d| d.name == name)
+            .map(|i| i as u32 + offset)
+            .unwrap_or(0),
+        None => 0,
+    };
+
+    DevicePickerModel {
+        strings,
+        selected_idx,
+        default_present,
+        no_input: false,
+    }
+}
+
 /// Build the microphone picker `ComboRow`.
 fn build_device_row(state: &UiState) -> ComboRow {
     let row = ComboRow::new();
     row.set_title(&tr!("Microphone"));
 
-    // Build string model: first entry is "Default"
-    let strings: Vec<String> = std::iter::once(tr!("Default"))
-        .chain(
-            state
-                .available_devices
-                .iter()
-                .map(|d| d.description.clone()),
-        )
-        .collect();
+    let model = build_device_model(
+        &state.available_devices,
+        state.system_default_name.as_deref(),
+        state.input_device.as_deref(),
+    );
 
-    // We use a StringList as the model so each entry carries its description.
-    // The actual PipeWire node name is looked up by matching the description
-    // against available_devices when the selection changes.
-    // (In a real app you'd use a custom GListModel; this keeps the stub simple.)
-    let model = gtk4::StringList::new(&strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    row.set_model(Some(&model));
-
-    // Select the current device (or "Default" at index 0)
-    let selected_idx = state
-        .input_device
-        .as_deref()
-        .and_then(|node| {
-            state
-                .available_devices
-                .iter()
-                .position(|d| d.name == node)
-                .map(|i| (i + 1) as u32) // +1 because index 0 is "Default"
-        })
-        .unwrap_or(0);
-    row.set_selected(selected_idx);
+    let list = gtk4::StringList::new(
+        &model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+    row.set_model(Some(&list));
+    row.set_selected(model.selected_idx);
+    row.set_sensitive(!model.no_input);
 
     row
 }
