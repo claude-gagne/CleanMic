@@ -1484,6 +1484,20 @@ fn run_with_gui(
             // otherwise a startup_no_input = true run would re-fire the
             // transition handler on the first tick.
             let in_no_input_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(startup_no_input));
+            // Track the device-name list last pushed to the UI so we only
+            // refresh the picker model when the enumeration actually changed.
+            // Seed with the initial push's list so the first tick is a no-op
+            // when nothing has changed. Per G-02 (08.2-HUMAN-UAT.md): without
+            // this, the picker never refreshes on plug/unplug when the OS
+            // default stays the same (common hot-unplug path with webcam mic
+            // still enumerable).
+            let last_pushed_devices: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(Some(
+                initial_state
+                    .available_devices
+                    .iter()
+                    .map(|d| d.name.clone())
+                    .collect(),
+            )));
             glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
                 let devices = {
                     let pw_ref = pw_timer_slow.borrow();
@@ -1502,6 +1516,10 @@ fn run_with_gui(
                         description: d.description.clone(),
                     })
                     .collect();
+
+                // Snapshot the enumerated device names for G-02 change detection.
+                let current_device_names: Vec<String> =
+                    devices.iter().map(|d| d.name.clone()).collect();
 
                 // Detect D-10 "no input device available" state transitions.
                 let is_no_input = devices.is_empty() && system_default_name.is_none();
@@ -1523,12 +1541,24 @@ fn run_with_gui(
                     }
                 }
 
-                // Check if system_default_name changed since last push.
-                let last_pushed = last_pushed_default.borrow().clone();
-                let current_as_opt_opt: Option<Option<String>> = Some(system_default_name.clone());
-                if last_pushed != current_as_opt_opt {
-                    // Push refreshed device list + default to the picker using
-                    // the cloned WindowHandles (Option B scaffolding from Plan 02).
+                // G-02: refresh the picker when either the OS default name
+                // changed OR the device enumeration changed (plug/unplug while
+                // default stays the same is the common hot-unplug path and must
+                // still refresh). Before G-02 (Plan 03) the gate was default-only
+                // and the picker would keep displaying an unplugged mic.
+                let last_pushed_default_snapshot = last_pushed_default.borrow().clone();
+                let current_default_as_opt_opt: Option<Option<String>> =
+                    Some(system_default_name.clone());
+                let last_pushed_devices_snapshot = last_pushed_devices.borrow().clone();
+                let current_devices_as_opt: Option<Vec<String>> =
+                    Some(current_device_names.clone());
+
+                let default_changed =
+                    last_pushed_default_snapshot != current_default_as_opt_opt;
+                let devices_changed =
+                    last_pushed_devices_snapshot != current_devices_as_opt;
+
+                if default_changed || devices_changed {
                     let current_device = {
                         let cfg = config_timer_slow.borrow();
                         cfg.input_device.clone()
@@ -1538,51 +1568,16 @@ fn run_with_gui(
                         current_device.as_deref(),
                         system_default_name.as_deref(),
                     );
-                    *last_pushed_default.borrow_mut() = current_as_opt_opt;
-
-                    // Auto-switch detection: if (a) default name just
-                    // transitioned from Some(x) → None (OS default became
-                    // CleanMic), and (b) the user is following OS default
-                    // (config.input_device is None), retarget capture to
-                    // a safe fallback. Per D-03, D-04, D-06.
-                    let previous_default = last_pushed.and_then(|x| x);
-                    let just_went_none =
-                        previous_default.is_some() && system_default_name.is_none();
-                    let user_following_default = {
-                        let cfg = config_timer_slow.borrow();
-                        cfg.input_device.is_none()
-                    };
-                    if just_went_none && user_following_default && !is_no_input {
-                        let fallback = resolve_runtime_capture_target(
-                            &devices,
-                            None,
-                            last_explicit_slow.borrow().as_deref(),
-                            None, // system default is now None
-                        );
-                        if let Some(ref name) = fallback {
-                            let result = {
-                                let mut pw_mut = pw_timer_slow.borrow_mut();
-                                pw_mut.set_capture_target(Some(name.clone()))
-                            };
-                            match result {
-                                Ok(new_reader) => {
-                                    pipeline_timer_slow.set_input_device(name.clone());
-                                    pipeline_timer_slow.replace_capture_reader(new_reader);
-                                    log::info!(
-                                        "Auto-switch: OS default flipped to CleanMic; capture retargeted to {name} (silent per D-04)"
-                                    );
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "Auto-switch: failed to retarget to {name}: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        // Crucially: config.input_device stays None (D-06).
-                        // No config.save() here.
-                    }
+                    *last_pushed_default.borrow_mut() = current_default_as_opt_opt;
+                    *last_pushed_devices.borrow_mut() = current_devices_as_opt;
                 }
+
+                // NOTE: The previous narrow default-transition auto-switch
+                // branch (gated on "OS default went from Some to None" AND
+                // "user was following default") has been replaced by the
+                // unified diff-based retarget branch added in gap-closure
+                // Task 2 of 08.2-05. Do not re-introduce the narrow branch —
+                // it would double-fire with the diff-based retarget.
 
                 glib::ControlFlow::Continue
             });
