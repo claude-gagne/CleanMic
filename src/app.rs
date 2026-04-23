@@ -408,15 +408,59 @@ fn handle_ui_event(
             config.input_device = Some(device);
         }
         UiEvent::DeviceChangedToDefault => {
-            // Placeholder: full handler lands in plan 08.2-03 (app orchestration).
-            // When the user picks "Default" in the mic picker, config.input_device
-            // must clear to None (= "follow OS default"), then the capture target
-            // resolves to whatever `PipeWireManager::configured_default_source()`
-            // returns. Plan 01 only introduces the event variant; plan 03 wires
-            // the resolver call and the capture-stream retarget. Per D-06.
-            log::debug!(
-                "DeviceChangedToDefault received — full handler lands in plan 08.2-03"
+            // The user picked the "Default (MicName)" entry — means "follow
+            // OS default". Per D-06: clear config.input_device to None
+            // (semantic: follow default). Per D-03: record the previous
+            // explicit pick (if any) as last_explicit before clearing, so
+            // if the OS default later flips to CleanMic we can auto-switch
+            // to the user's prior named choice.
+            let prev = config.input_device.take(); // take clears to None
+            if let Some(ref p) = prev {
+                *last_explicit.borrow_mut() = Some(p.clone());
+            }
+
+            // Resolve the actual capture target. Even though config says
+            // "follow default", the capture stream still needs a concrete
+            // pin to avoid the self-loop risk. resolve_runtime_capture_target
+            // handles this: when system_default_name is Some(real_mic), we
+            // pin to it. When system_default is CleanMic (system_default_name
+            // = None), we fall through to last_explicit, then first
+            // enumerated non-CleanMic mic.
+            let devices = pw_manager.device_enumerator().list_input_devices();
+            let system_default_name = current_system_default_name(pw_manager, &devices);
+            let last_explicit_snapshot = last_explicit.borrow().clone();
+            let target = resolve_runtime_capture_target(
+                &devices,
+                None, // config.input_device was just cleared
+                last_explicit_snapshot.as_deref(),
+                system_default_name.as_deref(),
             );
+            match target {
+                Some(ref name) => {
+                    pipeline.set_input_device(name.clone());
+                    match pw_manager.set_capture_target(Some(name.clone())) {
+                        Ok(new_reader) => {
+                            pipeline.replace_capture_reader(new_reader);
+                            log::info!("Follow-default: capture target resolved to {name}");
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Follow-default: failed to retarget capture stream to {name}: {e}"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // No real mic available. D-10 state will be surfaced by the
+                    // polling timer on its next tick.
+                    log::warn!("Follow-default: no physical input device available");
+                }
+            }
+            // Persist config.input_device = None immediately so the intent
+            // survives a crash or reboot.
+            if let Err(e) = config.save() {
+                log::warn!("Failed to save config after DeviceChangedToDefault: {e}");
+            }
         }
         UiEvent::EnableToggled(enabled) => {
             if enabled {
