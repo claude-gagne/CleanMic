@@ -960,6 +960,16 @@ fn run_with_gui(
         );
         handles.window.present();
 
+        // Clone the full WindowHandles BEFORE any field moves (MeterRows
+        // get moved into Rcs below, which would make a struct-level clone
+        // after that impossible). All fields are GObject-refcounted widgets,
+        // so this clone is cheap — it bumps refcounts rather than deep-copying.
+        // The 1500ms default-source polling timer (Option B scaffolding —
+        // see Plan 02 which added #[derive(Clone)] to WindowHandles and
+        // MeterRow) captures this clone into its closure to call
+        // update_device_list and set_input_available directly.
+        let handles_timer_slow: crate::ui::window::WindowHandles = handles.clone();
+
         // -- Background update check on launch (per D-01, D-03: fire-and-forget) --
         #[cfg(feature = "updater")]
         {
@@ -1408,6 +1418,132 @@ fn run_with_gui(
 
             glib::ControlFlow::Continue
         });
+
+        // ── Slow-cadence polling (1500ms) for OS default-source changes ────
+        // Re-queries pw-metadata every 1.5s to detect when the user changes
+        // the OS default input in GNOME Sound Settings. On flip, refreshes
+        // the picker (label + conditional Default entry) and fires the
+        // silent auto-switch when the user is following default and the
+        // OS default just became CleanMic. Also enforces D-10: when no
+        // physical mic is available, gray out the enable toggle and stop
+        // the pipeline. Per D-03, D-04, D-06, D-08, D-10.
+        {
+            let pw_timer_slow = pw_manager_clone.clone();
+            let pipeline_timer_slow = pipeline_clone.clone();
+            let config_timer_slow = config_clone.clone();
+            let last_explicit_slow = last_explicit_input_device.clone();
+            // Track the last system_default_name we pushed to the UI so we
+            // only refresh on actual change. Outer Option = "never pushed
+            // yet" sentinel; inner Option = actual pushed value (which may
+            // itself be None if the OS default was CleanMic at that time).
+            let last_pushed_default: Rc<RefCell<Option<Option<String>>>> =
+                Rc::new(RefCell::new(None));
+            // Track whether we're currently in D-10 "no input" state so we
+            // only fire set_input_available / pipeline.stop on transitions.
+            let in_no_input_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+            glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
+                let devices = {
+                    let pw_ref = pw_timer_slow.borrow();
+                    pw_ref.device_enumerator().list_input_devices()
+                };
+                let system_default_name = {
+                    let pw_ref = pw_timer_slow.borrow();
+                    current_system_default_name(&pw_ref, &devices)
+                };
+
+                // Convert InputDevice → DeviceInfo for the UI layer.
+                let ui_devices: Vec<crate::ui::DeviceInfo> = devices
+                    .iter()
+                    .map(|d| crate::ui::DeviceInfo {
+                        name: d.name.clone(),
+                        description: d.description.clone(),
+                    })
+                    .collect();
+
+                // Detect D-10 "no input device available" state transitions.
+                let is_no_input = devices.is_empty() && system_default_name.is_none();
+                let was_no_input = *in_no_input_state.borrow();
+                if is_no_input != was_no_input {
+                    *in_no_input_state.borrow_mut() = is_no_input;
+                    handles_timer_slow.set_input_available(!is_no_input);
+                    if is_no_input {
+                        // Stop the pipeline so it doesn't spin on an absent source.
+                        pipeline_timer_slow.stop();
+                        log::info!(
+                            "D-10: no input device available — pipeline stopped, enable toggle disabled"
+                        );
+                    } else {
+                        log::info!(
+                            "D-10 cleared: input device available again — enable toggle re-enabled"
+                        );
+                        // Do NOT auto-start the pipeline — the user must re-enable.
+                    }
+                }
+
+                // Check if system_default_name changed since last push.
+                let last_pushed = last_pushed_default.borrow().clone();
+                let current_as_opt_opt: Option<Option<String>> = Some(system_default_name.clone());
+                if last_pushed != current_as_opt_opt {
+                    // Push refreshed device list + default to the picker using
+                    // the cloned WindowHandles (Option B scaffolding from Plan 02).
+                    let current_device = {
+                        let cfg = config_timer_slow.borrow();
+                        cfg.input_device.clone()
+                    };
+                    handles_timer_slow.update_device_list(
+                        &ui_devices,
+                        current_device.as_deref(),
+                        system_default_name.as_deref(),
+                    );
+                    *last_pushed_default.borrow_mut() = current_as_opt_opt;
+
+                    // Auto-switch detection: if (a) default name just
+                    // transitioned from Some(x) → None (OS default became
+                    // CleanMic), and (b) the user is following OS default
+                    // (config.input_device is None), retarget capture to
+                    // a safe fallback. Per D-03, D-04, D-06.
+                    let previous_default = last_pushed.and_then(|x| x);
+                    let just_went_none =
+                        previous_default.is_some() && system_default_name.is_none();
+                    let user_following_default = {
+                        let cfg = config_timer_slow.borrow();
+                        cfg.input_device.is_none()
+                    };
+                    if just_went_none && user_following_default && !is_no_input {
+                        let fallback = resolve_runtime_capture_target(
+                            &devices,
+                            None,
+                            last_explicit_slow.borrow().as_deref(),
+                            None, // system default is now None
+                        );
+                        if let Some(ref name) = fallback {
+                            let result = {
+                                let mut pw_mut = pw_timer_slow.borrow_mut();
+                                pw_mut.set_capture_target(Some(name.clone()))
+                            };
+                            match result {
+                                Ok(new_reader) => {
+                                    pipeline_timer_slow.set_input_device(name.clone());
+                                    pipeline_timer_slow.replace_capture_reader(new_reader);
+                                    log::info!(
+                                        "Auto-switch: OS default flipped to CleanMic; capture retargeted to {name} (silent per D-04)"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Auto-switch: failed to retarget to {name}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        // Crucially: config.input_device stays None (D-06).
+                        // No config.save() here.
+                    }
+                }
+
+                glib::ControlFlow::Continue
+            });
+        }
 
         // ── Health check timer (D-17, D-18, D-15, D-16) ──────────────────
         // Fires every 2 seconds. Compares heartbeat counter values to detect
