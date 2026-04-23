@@ -40,6 +40,14 @@ use crate::ui::meters::widget::MeterRow;
 
 /// Handles returned from [`build_main_window`] so the caller can drive the
 /// level meter widgets and synchronize UI state from the GLib timer loop.
+///
+/// Derives `Clone` because Plan 03's 1500ms default-source polling timer
+/// clones the entire `handles` struct into its closure (Option B scaffolding
+/// choice — avoids wrapping in `Rc<RefCell<...>>`). Every field is a
+/// GObject-refcounted widget; cloning bumps a refcount rather than
+/// deep-copying, so the clones share the same underlying widgets as the
+/// originals (standard gtk4 widget-sharing semantics).
+#[derive(Clone)]
 pub struct WindowHandles {
     /// The constructed application window.
     pub window: ApplicationWindow,
@@ -672,6 +680,29 @@ impl WindowHandles {
         self.device_row.set_model(Some(&list));
         self.device_row.set_selected(model.selected_idx);
         self.device_row.set_sensitive(!model.no_input);
+    }
+
+    /// Control the "input available" UI state for D-10.
+    ///
+    /// When `available = false`: disables the enable toggle (sensitive = false)
+    /// and forces the switch off so the pipeline doesn't try to capture.
+    /// When `available = true`: re-enables the toggle (sensitive = true); the
+    /// caller is responsible for restoring the toggle's active state from
+    /// config if desired.
+    ///
+    /// Called by the app layer when the device list + system default resolution
+    /// confirms no usable physical mic is available (or becomes usable again
+    /// after a hot-plug or OS default flip). Per D-10.
+    pub fn set_input_available(&self, available: bool) {
+        self.enable_row.set_sensitive(available);
+        if !available {
+            // Force the switch off so AudioPipeline::start isn't re-entered.
+            // The app layer is responsible for calling pipeline.stop() as
+            // well to match this UI state (see Plan 03 handler).
+            if self.enable_row.is_active() {
+                self.enable_row.set_active(false);
+            }
+        }
     }
 }
 

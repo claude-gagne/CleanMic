@@ -162,6 +162,13 @@ pub mod widget {
     use super::LevelMeter;
 
     /// An `AdwActionRow` with a `gtk4::ProgressBar` suffix for level display.
+    ///
+    /// Derives `Clone` because Plan 03 clones the parent `WindowHandles`
+    /// (which owns two `MeterRow` fields) into a parallel 1500ms GLib timer
+    /// closure. `ActionRow` and `gtk4::ProgressBar` are GObject-refcounted:
+    /// cloning bumps a refcount rather than deep-copying, so both clones
+    /// refer to the same underlying widget.
+    #[derive(Clone)]
     pub struct MeterRow {
         /// The underlying row (add to a `PreferencesGroup`).
         pub row: ActionRow,
