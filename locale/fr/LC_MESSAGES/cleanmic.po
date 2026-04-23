@@ -40,6 +40,9 @@ msgstr "Périphérique d'entrée physique à filtrer"
 msgid "Default"
 msgstr "Par défaut"
 
+msgid "No input device available"
+msgstr "Aucun microphone disponible"
+
 msgid "Enable"
 msgstr "Activer"
 
