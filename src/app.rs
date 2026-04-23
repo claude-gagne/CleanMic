@@ -4,6 +4,7 @@
 //! In v0.1 everything runs in a single process: the GUI on the main thread,
 //! the audio service on a dedicated background thread.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -16,29 +17,86 @@ use crate::config::Config;
 use crate::engine::{self, EngineType};
 use crate::instance_lock;
 use crate::pipewire::PipeWireManager;
+use crate::pipewire::devices::InputDevice;
 use crate::tray::TrayCommand;
 use crate::ui::UiEvent;
 use crate::ui::welcome;
 
-/// Resolve the PipeWire node name to use as the initial capture target.
+/// Resolve the PipeWire node name to use as the current capture target.
 ///
-/// Prefers the device persisted in config; otherwise picks the system-default
-/// input device if the enumerator reports one; otherwise falls back to the
-/// first enumerated non-CleanMic source. Returns `None` only when no physical
-/// input devices are visible — in that case the capture stream starts
-/// unpinned, and the app logs a warning.
+/// Priority order (per D-03, D-05):
+/// 1. `config.input_device` if it resolves to an enumerable non-CleanMic device.
+/// 2. `last_explicit` if it resolves to an enumerable non-CleanMic device.
+///    (This is the user's most recent explicit named-mic pick from any prior
+///    session, held in memory across window-level sessions only.)
+/// 3. `system_default_name` if it resolves to an enumerable non-CleanMic device.
+///    When the OS default is CleanMic itself, this is `None` so we skip it.
+/// 4. The first enumerable non-CleanMic device.
+/// 5. `None` → D-10 "no input device available" state.
+///
+/// `list_input_devices()` already filters CleanMic out, so any name appearing
+/// in `devices` is guaranteed non-CleanMic — we cannot accidentally pin the
+/// capture stream to CleanMic itself. This function is pure; side effects
+/// (retargeting capture, updating UI) happen at call sites.
+fn resolve_runtime_capture_target(
+    devices: &[InputDevice],
+    config_input_device: Option<&str>,
+    last_explicit: Option<&str>,
+    system_default_name: Option<&str>,
+) -> Option<String> {
+    let name_is_enumerable = |name: &str| devices.iter().any(|d| d.name == name);
+
+    if let Some(name) = config_input_device
+        && name_is_enumerable(name)
+    {
+        return Some(name.to_string());
+    }
+    if let Some(name) = last_explicit
+        && name_is_enumerable(name)
+    {
+        return Some(name.to_string());
+    }
+    if let Some(name) = system_default_name
+        && name_is_enumerable(name)
+    {
+        return Some(name.to_string());
+    }
+    devices.first().map(|d| d.name.clone())
+}
+
+/// Query the OS default source name, filtering it to `None` when the default
+/// is CleanMic itself (not in the filtered device list) or unresolvable.
+///
+/// Used by both the runtime resolver wrapper and the 1500ms polling timer.
+fn current_system_default_name(
+    pw: &PipeWireManager,
+    devices: &[InputDevice],
+) -> Option<String> {
+    pw.configured_default_source()
+        .filter(|name| devices.iter().any(|d| d.name == *name))
+}
+
+/// Resolve the initial capture target at startup or reconnect.
+///
+/// Thin wrapper over [`resolve_runtime_capture_target`] that reads live state
+/// from the PipeWire manager and the loaded config. Replaces the prior
+/// implementation which didn't guard against a CleanMic self-loop when
+/// CleanMic happened to be the OS default (the phase 08.2 fix). Because
+/// `list_input_devices()` filters CleanMic out of the enumerable set, the
+/// returned name — if any — is guaranteed to be a real physical mic.
 fn resolve_initial_capture_target(
     pw: &PipeWireManager,
     config: &Config,
 ) -> Option<String> {
-    if let Some(ref name) = config.input_device {
-        return Some(name.clone());
-    }
     let devices = pw.device_enumerator().list_input_devices();
-    if let Some(default_dev) = devices.iter().find(|d| d.is_default) {
-        return Some(default_dev.name.clone());
-    }
-    devices.first().map(|d| d.name.clone())
+    let system_default_name = current_system_default_name(pw, &devices);
+
+    resolve_runtime_capture_target(
+        &devices,
+        config.input_device.as_deref(),
+        None, // no prior-session last_explicit available at startup
+        system_default_name.as_deref(),
+    )
 }
 
 /// Rate-limits GNOME desktop notifications to at most one per ID per 60 seconds (per D-03).
@@ -300,11 +358,18 @@ pub fn shutdown(
 }
 
 /// Dispatch a [`UiEvent`] to the audio pipeline and update config accordingly.
+///
+/// `last_explicit` tracks the user's most recent explicit named-mic pick
+/// (priority 2 for auto-switch fallback per D-03). Updated only when the
+/// `DeviceChanged` handler fires (real-mic pick) and when
+/// `DeviceChangedToDefault` records the previous pick before clearing.
+/// Never written by the auto-switch path in the polling timer (D-06).
 fn handle_ui_event(
     event: UiEvent,
     pipeline: &AudioPipeline,
     config: &mut Config,
     pw_manager: &mut PipeWireManager,
+    last_explicit: &RefCell<Option<String>>,
 ) {
     match event {
         UiEvent::EngineChanged(engine_type) => {
@@ -338,6 +403,8 @@ fn handle_ui_event(
                     log::error!("Failed to retarget capture stream to {}: {e}", device);
                 }
             }
+            // Record the new explicit pick for D-03 priority-2 auto-switch fallback.
+            *last_explicit.borrow_mut() = Some(device.clone());
             config.input_device = Some(device);
         }
         UiEvent::DeviceChangedToDefault => {
@@ -409,24 +476,29 @@ fn handle_ui_event(
 }
 
 /// Dispatch a [`TrayCommand`] to the audio pipeline and update config.
+///
+/// `last_explicit` is forwarded to the underlying [`handle_ui_event`] calls so
+/// tray-driven device changes participate in the same auto-switch fallback
+/// semantics as UI-driven ones (D-03).
 #[allow(dead_code)]
 fn handle_tray_command(
     cmd: TrayCommand,
     pipeline: &AudioPipeline,
     config: &mut Config,
     pw_manager: &mut PipeWireManager,
+    last_explicit: &RefCell<Option<String>>,
 ) {
     match cmd {
         TrayCommand::Toggle => {
             let new_state = !config.enabled;
-            handle_ui_event(UiEvent::EnableToggled(new_state), pipeline, config, pw_manager);
+            handle_ui_event(UiEvent::EnableToggled(new_state), pipeline, config, pw_manager, last_explicit);
         }
         TrayCommand::SetEngine(engine_type) => {
-            handle_ui_event(UiEvent::EngineChanged(engine_type), pipeline, config, pw_manager);
+            handle_ui_event(UiEvent::EngineChanged(engine_type), pipeline, config, pw_manager, last_explicit);
         }
         TrayCommand::ToggleMonitor => {
             let new_state = !config.monitor_enabled;
-            handle_ui_event(UiEvent::MonitorToggled(new_state), pipeline, config, pw_manager);
+            handle_ui_event(UiEvent::MonitorToggled(new_state), pipeline, config, pw_manager, last_explicit);
         }
         TrayCommand::OpenWindow => {
             log::info!("Open main window requested (not yet implemented in headless mode)");
@@ -510,22 +582,21 @@ pub fn run() -> Result<()> {
     }
 
     // -- Resolve the initial capture target --
-    // The capture stream must be pinned to a specific physical mic via
-    // PW_KEY_TARGET_OBJECT; otherwise WirePlumber routes it to the system
-    // default source, and if the user sets CleanMic as the default input
-    // the stream self-loops. Prefer the user's saved choice, then the first
-    // enumerated non-CleanMic source.
+    // The capture stream is pinned to a specific physical mic via
+    // PW_KEY_TARGET_OBJECT. Pinning prevents WirePlumber's default-source
+    // policy from re-routing the capture stream at runtime. The resolver
+    // (`resolve_runtime_capture_target`) never returns CleanMic itself
+    // because `list_input_devices()` filters it out — so we cannot
+    // accidentally pin the capture to CleanMic even when the user has
+    // selected CleanMic as the OS default input. Per D-06, the resolver
+    // result is NOT persisted to `config.input_device`; only explicit picks
+    // via the picker write there.
     let initial_capture_target = resolve_initial_capture_target(&pw_manager, &config);
     if initial_capture_target.is_none() {
         log::warn!(
-            "No physical input devices found — capture stream will start unpinned. \
-             The app will self-loop if CleanMic is selected as the system default input."
+            "No physical input devices found — capture will start unpinned; \
+             enable toggle will be grayed out until a mic becomes available."
         );
-    }
-    if config.input_device.is_none()
-        && let Some(ref name) = initial_capture_target
-    {
-        config.input_device = Some(name.clone());
     }
 
     // -- Create the virtual mic --
@@ -643,14 +714,19 @@ fn run_headless(
     let (_ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
     let (_tray_tx, tray_rx) = mpsc::channel::<TrayCommand>();
 
+    // Headless mode has no UI picker, so there is no meaningful cross-session
+    // "last explicit pick" to track. A scratch RefCell keeps the signature
+    // satisfied without affecting behavior. Per D-03 / D-07.
+    let last_explicit_headless: RefCell<Option<String>> = RefCell::new(None);
+
     log::info!("CleanMic running headless — waiting for shutdown signal");
 
     while !is_shutdown_requested() {
         while let Ok(event) = ui_rx.try_recv() {
-            handle_ui_event(event, &pipeline, &mut config, &mut pw_manager);
+            handle_ui_event(event, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless);
         }
         while let Ok(cmd) = tray_rx.try_recv() {
-            handle_tray_command(cmd, &pipeline, &mut config, &mut pw_manager);
+            handle_tray_command(cmd, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -759,6 +835,16 @@ fn run_with_gui(
     let config = Rc::new(RefCell::new(config));
     let pipeline = Rc::new(pipeline);
     let pw_manager = Rc::new(RefCell::new(pw_manager));
+
+    // In-memory "last explicit pick" tracker for D-03 priority-2 auto-switch
+    // fallback. Seeded from the persisted config pick so the user's declared
+    // choice is remembered even after they switch to Default. Written only by
+    // explicit UI picks (DeviceChanged / DeviceChangedToDefault) — auto-switch
+    // never writes. Wrapped in Rc so both the 33ms timer and the 1500ms timer
+    // can clone it into their closures. Per D-03, D-06, D-07.
+    let last_explicit_input_device: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(
+        config.borrow().input_device.clone(),
+    ));
 
     // Pending debounced config save (for rapid-fire events: strength, engine, device).
     let pending_save: Rc<std::cell::Cell<Option<glib::SourceId>>> = Rc::new(std::cell::Cell::new(None));
@@ -935,6 +1021,7 @@ fn run_with_gui(
         let config_timer = config_clone.clone();
         let pw_timer = pw_manager_clone.clone();
         let pending_save_timer = pending_save.clone();
+        let last_explicit_timer = last_explicit_input_device.clone();
         let app_weak = app.downgrade();
         let notification_throttle_timer = notification_throttle.clone();
         let pw_reconnect_attempted_timer = pw_reconnect_attempted.clone();
@@ -1082,7 +1169,7 @@ fn run_with_gui(
                     event,
                     UiEvent::EnableToggled(_) | UiEvent::MonitorToggled(_) | UiEvent::AutostartToggled(_)
                 );
-                handle_ui_event(event, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut());
+                handle_ui_event(event, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer);
                 if needs_debounce {
                     schedule_debounced_save(&config_timer, &pending_save_timer);
                 } else if needs_immediate_save && let Err(e) = config_timer.borrow().save() {
@@ -1142,7 +1229,7 @@ fn run_with_gui(
                         // Result arrives via channel on next timer tick; skip handle_tray_command
                         continue;
                     }
-                    handle_tray_command(cmd, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut());
+                    handle_tray_command(cmd, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer);
                     if tray_needs_debounce {
                         schedule_debounced_save(&config_timer, &pending_save_timer);
                     } else if tray_needs_immediate_save && let Err(e) = config_timer.borrow().save() {
@@ -1578,12 +1665,14 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
 
         handle_ui_event(
             UiEvent::EngineChanged(EngineType::RNNoise),
             &pipeline,
             &mut config,
             &mut pw,
+            &last_explicit_test,
         );
         assert_eq!(config.engine, EngineType::RNNoise);
 
@@ -1596,11 +1685,12 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_ui_event(UiEvent::EnableToggled(false), &pipeline, &mut config, &mut pw);
+        handle_ui_event(UiEvent::EnableToggled(false), &pipeline, &mut config, &mut pw, &last_explicit_test);
         assert!(!config.enabled);
 
-        handle_ui_event(UiEvent::EnableToggled(true), &pipeline, &mut config, &mut pw);
+        handle_ui_event(UiEvent::EnableToggled(true), &pipeline, &mut config, &mut pw, &last_explicit_test);
         assert!(config.enabled);
 
         drop(pipeline);
@@ -1618,12 +1708,14 @@ mod tests {
         let mut config = Config::default();
         config.engine = EngineType::DeepFilterNet;
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
 
         handle_ui_event(
             UiEvent::EngineChanged(EngineType::Khip),
             &pipeline,
             &mut config,
             &mut pw,
+            &last_explicit_test,
         );
         // Khip unavailable — fallback chain assigns best available engine (D-02).
         // Config should have been updated to the actual engine used.
@@ -1639,11 +1731,12 @@ mod tests {
         let mut config = Config::default();
         config.enabled = true;
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw);
+        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test);
         assert!(!config.enabled);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw);
+        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test);
         assert!(config.enabled);
 
         drop(pipeline);
@@ -1657,8 +1750,9 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Quit, &pipeline, &mut config, &mut pw);
+        handle_tray_command(TrayCommand::Quit, &pipeline, &mut config, &mut pw, &last_explicit_test);
         assert!(is_shutdown_requested());
 
         // Cleanup.
