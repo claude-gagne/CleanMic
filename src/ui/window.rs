@@ -198,29 +198,59 @@ pub fn build_main_window(
     let device_row = build_device_row(state);
     {
         let tx = event_tx.clone();
-        // The row model stores DESCRIPTIONS for display, but downstream code
-        // (PipeWire target.object) needs node.name. Clone the (description →
-        // node.name) mapping into the callback so we translate on change.
+        // Clone the (description → node.name) mapping for real devices.
+        // Used to translate a real-device pick back to a PipeWire node name.
         let devices_for_cb: Vec<(String, String)> = state
             .available_devices
             .iter()
             .map(|d| (d.description.clone(), d.name.clone()))
             .collect();
-        // "Default" at index 0 resolves to the first enumerated device's
-        // node.name so PipeWire pins an actual mic rather than following the
-        // system default (which could be CleanMic itself and self-loop).
-        let default_fallback = devices_for_cb.first().map(|(_, n)| n.clone());
+        // Precompute the "Default " prefix so we can detect synthetic Default entries
+        // in the current model at selection time. Format matches build_device_model:
+        // tr!("Default") + " (" + desc + ")".
+        let default_prefix = format!("{} (", tr!("Default"));
         device_row.connect_selected_item_notify(move |row| {
             let idx = row.selected() as usize;
-            let name: Option<String> = if idx == 0 {
-                default_fallback.clone()
-            } else {
-                devices_for_cb.get(idx - 1).map(|(_, n)| n.clone())
-            };
+            // Read the string at the selected index AND at index 0 in one model access.
+            let model = row
+                .model()
+                .and_then(|m| m.downcast::<gtk4::StringList>().ok());
+            let item_text: Option<String> = model
+                .as_ref()
+                .and_then(|sl| sl.string(idx as u32).map(|s| s.to_string()));
+            // Direct model[0] read for "is Default present?" — simpler than the
+            // nested item_text.as_ref().map(...) pattern (planner revision w7).
+            let has_default = model
+                .as_ref()
+                .and_then(|sl| sl.string(0))
+                .map(|first| first.to_string().starts_with(&default_prefix))
+                .unwrap_or(false);
+
+            // D-10: "No input device available" is the only string — picker is
+            // insensitive, but guard anyway.
+            if let Some(ref text) = item_text
+                && text == &tr!("No input device available")
+            {
+                return;
+            }
+
+            // D-01/D-06: index 0 is the Default entry when it starts with
+            // "Default (" — emit DeviceChangedToDefault. Otherwise it's a
+            // real device (Default is hidden).
+            if idx == 0 && has_default {
+                if tx.send(UiEvent::DeviceChangedToDefault).is_err() {
+                    log::warn!("UI event channel closed - DeviceChangedToDefault dropped");
+                }
+                return;
+            }
+
+            // Real-device pick. Figure out the offset: if index 0 was the
+            // Default entry, real devices start at index 1. Otherwise at 0.
+            let real_idx = if has_default { idx.saturating_sub(1) } else { idx };
+            let name: Option<String> = devices_for_cb.get(real_idx).map(|(_, n)| n.clone());
             let Some(name) = name else {
                 log::warn!(
-                    "Device picker: no device available for selected index {} — ignoring",
-                    idx,
+                    "Device picker: no device available for selected index {idx} (real_idx {real_idx}) — ignoring"
                 );
                 return;
             };
@@ -391,6 +421,11 @@ pub fn build_main_window(
 struct DevicePickerModel {
     strings: Vec<String>,
     selected_idx: u32,
+    /// Retained as part of the helper's contract even though the selection
+    /// closure inspects the StringList directly (via `has_default` prefix
+    /// match). Plan 03 or future consumers that render the picker from the
+    /// computed model without re-reading the widget can read this flag.
+    #[allow(dead_code)]
     default_present: bool,
     no_input: bool,
 }
@@ -619,24 +654,24 @@ impl WindowHandles {
     /// Repopulate the device picker with a fresh device list.
     ///
     /// Preserves the current selection if the device is still available.
-    pub fn update_device_list(&self, devices: &[DeviceInfo], current_device: Option<&str>) {
-        let strings: Vec<String> = std::iter::once(tr!("Default"))
-            .chain(devices.iter().map(|d| d.description.clone()))
-            .collect();
-
-        let model = gtk4::StringList::new(&strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-        self.device_row.set_model(Some(&model));
-
-        // Select the current device (or "Default" at index 0)
-        let selected_idx = current_device
-            .and_then(|node| {
-                devices
-                    .iter()
-                    .position(|d| d.name == node)
-                    .map(|i| (i + 1) as u32)
-            })
-            .unwrap_or(0);
-        self.device_row.set_selected(selected_idx);
+    /// When `system_default_name` is `Some` and resolves to a device in
+    /// `devices`, a "Default (MicName)" entry is prepended. When `None`,
+    /// no Default entry is shown. When `devices` is empty AND the default
+    /// is unresolvable, shows "No input device available" and marks the
+    /// picker insensitive. Per D-01, D-02, D-10.
+    pub fn update_device_list(
+        &self,
+        devices: &[DeviceInfo],
+        current_device: Option<&str>,
+        system_default_name: Option<&str>,
+    ) {
+        let model = build_device_model(devices, system_default_name, current_device);
+        let list = gtk4::StringList::new(
+            &model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        );
+        self.device_row.set_model(Some(&list));
+        self.device_row.set_selected(model.selected_idx);
+        self.device_row.set_sensitive(!model.no_input);
     }
 }
 
