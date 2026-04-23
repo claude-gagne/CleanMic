@@ -938,6 +938,12 @@ fn run_with_gui(
         {
             let pw = pw_manager_clone.borrow();
             let devices = pw.device_enumerator().list_input_devices();
+            // Seed the system default so the picker renders `Default (MicName)`
+            // on the very first paint rather than waiting up to 1500ms for the
+            // polling timer's first tick. Without this, users who follow the
+            // OS default see a visible picker flash as the entry appears late
+            // and the selection jumps. Per WR-01.
+            initial_state.system_default_name = current_system_default_name(&pw, &devices);
             initial_state.available_devices = devices
                 .iter()
                 .map(|d| crate::ui::DeviceInfo {
@@ -1436,8 +1442,12 @@ fn run_with_gui(
             // only refresh on actual change. Outer Option = "never pushed
             // yet" sentinel; inner Option = actual pushed value (which may
             // itself be None if the OS default was CleanMic at that time).
+            // Seed with the value we passed into the initial UiState (WR-01)
+            // so the first tick is a no-op when the OS default has not
+            // changed since window construction — avoids an unnecessary
+            // picker re-model on the first tick.
             let last_pushed_default: Rc<RefCell<Option<Option<String>>>> =
-                Rc::new(RefCell::new(None));
+                Rc::new(RefCell::new(Some(initial_state.system_default_name.clone())));
             // Track whether we're currently in D-10 "no input" state so we
             // only fire set_input_available / pipeline.stop on transitions.
             let in_no_input_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
