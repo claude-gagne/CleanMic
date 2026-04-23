@@ -726,6 +726,26 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Evaluate D-10 "no input device available" once at startup so the
+    // pipeline does not auto-start on an absent source and the enable toggle
+    // does not render as sensitive/on for up to 1500ms before the polling
+    // timer's first tick corrects it. Per WR-02.
+    let startup_no_input = {
+        let devices = pw_manager.device_enumerator().list_input_devices();
+        let system_default_name = current_system_default_name(&pw_manager, &devices);
+        devices.is_empty() && system_default_name.is_none()
+    };
+    if startup_no_input {
+        log::warn!(
+            "D-10 at startup: no input device available — pipeline will not auto-start"
+        );
+        // Prevent the enable toggle from rendering as on against an absent
+        // source. Matches the transition-into-D-10 behaviour from the 1500ms
+        // timer (set_input_available(false) forces the toggle off which
+        // cascades to config.enabled = false).
+        config.enabled = false;
+    }
+
     // Auto-start pipeline if enabled (including first run with default enabled=true).
     if config.enabled {
         pipeline.start();
@@ -737,7 +757,7 @@ pub fn run() -> Result<()> {
     // -- Run with GUI or headless --
     #[cfg(feature = "gui")]
     {
-        run_with_gui(config, pipeline, pw_manager, first_run)?;
+        run_with_gui(config, pipeline, pw_manager, first_run, startup_no_input)?;
     }
 
     #[cfg(not(feature = "gui"))]
@@ -787,6 +807,7 @@ fn run_with_gui(
     pipeline: AudioPipeline,
     pw_manager: PipeWireManager,
     first_run: bool,
+    startup_no_input: bool,
 ) -> Result<()> {
     use gtk4::glib;
     use gtk4::prelude::*;
@@ -965,6 +986,14 @@ fn run_with_gui(
             tray_available,
         );
         handles.window.present();
+
+        // Enforce D-10 from startup: if the pre-window check found no usable
+        // input, gray out the enable toggle immediately so it never renders
+        // as sensitive for the ~1500ms before the polling timer's first tick.
+        // Per WR-02.
+        if startup_no_input {
+            handles.set_input_available(false);
+        }
 
         // Clone the full WindowHandles BEFORE any field moves (MeterRows
         // get moved into Rcs below, which would make a struct-level clone
@@ -1450,7 +1479,11 @@ fn run_with_gui(
                 Rc::new(RefCell::new(Some(initial_state.system_default_name.clone())));
             // Track whether we're currently in D-10 "no input" state so we
             // only fire set_input_available / pipeline.stop on transitions.
-            let in_no_input_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+            // Seed from the startup evaluation (WR-02) so the first tick is a
+            // no-op when the startup state already matches live state —
+            // otherwise a startup_no_input = true run would re-fire the
+            // transition handler on the first tick.
+            let in_no_input_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(startup_no_input));
             glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
                 let devices = {
                     let pw_ref = pw_timer_slow.borrow();
