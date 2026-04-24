@@ -1214,8 +1214,9 @@ fn run_with_gui(
                     update_banner_timer.set_title(&banner_title);
                     update_banner_timer.set_revealed(true);
 
-                    if is_new {
-                        // Per D-05: send desktop notification on first detection of this version
+                    if is_new || is_manual {
+                        // Per 08.3 D-03: manual checks always notify (bypass v1.1 D-06 throttle).
+                        // Automatic (is_manual=false) checks still gated by is_new to avoid pestering.
                         if let Some(app_ref) = app_weak.upgrade() {
                             use gtk4::prelude::ApplicationExt;
                             let notif = gtk4::gio::Notification::new(
@@ -1229,8 +1230,8 @@ fn run_with_gui(
                             app_ref.send_notification(Some("cleanmic-update"), &notif);
                         }
 
-                        // Per D-06: persist so we don't notify again for this version
-                        {
+                        if is_new {
+                            // Per D-06: persist only on first detection so we don't notify again for auto checks.
                             let mut cfg = config_timer.borrow_mut();
                             cfg.last_seen_update_version = Some(new_version.clone());
                             if let Err(e) = cfg.save() {
