@@ -1,6 +1,9 @@
 /target
 /build
 
+# Repo-root convenience symlink to the freshly-built AppImage in build/
+/CleanMic.AppImage
+
 # Pre-built third-party binaries (download via scripts/fetch-vendors.sh)
 /vendor/
 
