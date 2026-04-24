@@ -192,3 +192,37 @@ msgstr "Rechercher des mises à jour"
 
 msgid "Download"
 msgstr "Télécharger"
+
+# ── v1.0.2 additions (Phase 08.3) ─────────────────────────────────────────────
+
+# D-02: Notification title for update available (already wrapped in src, missing msgstr)
+msgid "Update available"
+msgstr "Mise à jour disponible"
+
+# D-02: Notification title for manual check when already up to date
+msgid "CleanMic is up to date"
+msgstr "CleanMic est à jour"
+
+# D-02: Notification body prefix for manual check when already up to date
+msgid "You're running the latest version:"
+msgstr "Vous utilisez la dernière version :"
+
+# D-01: Banner title — %s is replaced with the new version tag (e.g. "v1.0.2")
+msgid "CleanMic %s available"
+msgstr "CleanMic %s disponible"
+
+# D-01: Notification body — %s is replaced with the new version tag
+msgid "CleanMic %s is available. Click Download to get it."
+msgstr "CleanMic %s est disponible. Cliquez sur Télécharger pour l'obtenir."
+
+# D-01: Engine subtitle — DeepFilterNet
+msgid "High quality (default)"
+msgstr "Haute qualité (par défaut)"
+
+# D-01: Engine subtitle — RNNoise
+msgid "Lightweight, low CPU"
+msgstr "Léger, faible consommation CPU"
+
+# D-01: Engine subtitle — Khip
+msgid "User-supplied, adaptive"
+msgstr "Fourni par l'utilisateur, adaptatif"
