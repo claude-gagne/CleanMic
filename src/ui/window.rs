@@ -102,11 +102,12 @@ fn engine_label(engine: EngineType) -> &'static str {
 ///
 /// Kept short — the combo row's selected-value column (on the right) gets
 /// squeezed when the subtitle wraps, truncating the engine name.
-fn engine_subtitle(engine: EngineType) -> &'static str {
+fn engine_subtitle(engine: EngineType) -> String {
+    // Per 08.3 D-01: wrap engine subtitles in tr!() for i18n coverage.
     match engine {
-        EngineType::RNNoise => "Lightweight, low CPU",
-        EngineType::DeepFilterNet => "High quality (default)",
-        EngineType::Khip => "User-supplied, adaptive",
+        EngineType::RNNoise => tr!("Lightweight, low CPU"),
+        EngineType::DeepFilterNet => tr!("High quality (default)"),
+        EngineType::Khip => tr!("User-supplied, adaptive"),
     }
 }
 
@@ -314,7 +315,7 @@ pub fn build_main_window(
             let idx = row.selected();
             if let Some(engine) = index_to_engine(idx) {
                 // Update subtitle to describe the selected engine.
-                row.set_subtitle(engine_subtitle(engine));
+                row.set_subtitle(&engine_subtitle(engine));
                 if engine == EngineType::Khip && !khip_available {
                     return;
                 }
@@ -545,7 +546,7 @@ fn build_device_row(state: &UiState) -> ComboRow {
 fn build_engine_row(state: &UiState) -> ComboRow {
     let row = ComboRow::new();
     row.set_title(&tr!("Engine"));
-    row.set_subtitle(engine_subtitle(state.engine));
+    row.set_subtitle(&engine_subtitle(state.engine));
 
     // Always include all engines in the model so users can see what exists.
     // The factory below grays out and disables unavailable entries.
