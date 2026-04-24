@@ -1208,8 +1208,9 @@ fn run_with_gui(
                     let is_new = config_timer.borrow().last_seen_update_version.as_deref()
                         != Some(new_version.as_str());
 
-                    // Always reveal banner (persistent indicator per D-05)
-                    let banner_title = format!("CleanMic {} available", new_version);
+                    // Always reveal banner (persistent indicator per D-05). Per 08.3 D-01:
+                    // translator-facing msgid "CleanMic %s available" — version substituted after gettext lookup.
+                    let banner_title = gettextrs::gettext("CleanMic %s available").replace("%s", new_version);
                     update_banner_timer.set_title(&banner_title);
                     update_banner_timer.set_revealed(true);
 
@@ -1220,10 +1221,11 @@ fn run_with_gui(
                             let notif = gtk4::gio::Notification::new(
                                 &gettextrs::gettext("Update available"),
                             );
-                            notif.set_body(Some(&format!(
-                                "CleanMic {} is available. Click Download to get it.",
-                                new_version
-                            )));
+                            // Per 08.3 D-01: wrap body in gettext + %s substitution.
+                            notif.set_body(Some(
+                                &gettextrs::gettext("CleanMic %s is available. Click Download to get it.")
+                                    .replace("%s", new_version),
+                            ));
                             app_ref.send_notification(Some("cleanmic-update"), &notif);
                         }
 
