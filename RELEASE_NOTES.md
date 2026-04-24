@@ -1,26 +1,33 @@
-CleanMic v1.0.0 - a noise-free virtual microphone for Linux.
+CleanMic v1.0.1 - polish + safety bundle.
 
-CleanMic is a small desktop app for Ubuntu, Fedora, and other modern Linux distributions. It's dead simple: select your physical microphone, enable CleanMic, and every app on your system (Teams, Meet, Discord, Zoom, OBS) hears clean audio through a single PipeWire virtual source. Enable it and forget about it.
+A small follow-up to v1.0.0 focused on making the mic picker behave correctly around system-default changes and hot-plug events. No new features; this release tightens the edges of the v1.0.0 core.
 
-## What's in v1.0.0
+## What's new in v1.0.1
 
-- **Three noise suppression engines** with pre-tuned defaults:
-  - **DeepFilterNet** (default) - modern neural model, high-quality output
-  - **RNNoise** - lightweight classic RNN denoiser, low CPU
-  - **Khip** - adaptive model (user-supplied library)
-- **Light / Balanced / Strong strength dropdown** - tuned per-engine against real noise (fan, keyboard, mouse); each step is a distinct audible change on all three engines
-- Works with any app through a PipeWire virtual microphone source
-- System tray integration with quick enable / disable
-- Monitor - route processed mic back to your headphones when you want to hear what the app hears
+### Mic picker + self-loop prevention
+
+- **"Default (MicName)" label** - when your OS default mic is a real physical device, CleanMic surfaces it at the top of the picker as `Default (Razer Seiren X)` or similar, so you can tell which mic "follow system default" resolves to without leaving the app.
+- **Self-loop prevention** - when CleanMic itself is set as the OS default input, the "Default" entry is hidden from the picker entirely. The app silently falls back to a real physical microphone for capture, so CleanMic never ends up trying to capture from its own virtual source.
+- **Hot-unplug handling** - unplug your selected mic mid-session and CleanMic switches cleanly to the next available physical mic without freezing the input meter or breaking audio to the app that's consuming the virtual source. The picker refreshes live.
+- **Hot-replug return** - when you plug your originally-selected mic back in, CleanMic auto-switches capture back to it. Your explicit picks are persisted and honored; auto-switches never silently overwrite them.
+- **"No input device available" state** - when no physical mic is enumerable, the picker collapses to a single clearly-labeled entry and the Enable toggle grays out instead of silently spinning the pipeline on no input.
+
+### Under the hood
+
+- Quieter logging - the per-tick device enumeration log is now at debug level rather than info, so running CleanMic from a terminal no longer floods stdout with routine polling output.
+- `config.input_device` is now strictly write-through-explicit-user-clicks only; transient auto-switches between mics never rewrite your stored preference.
+
+## Upgrading from v1.0.0
+
+- Your existing config at `~/.config/cleanmic/config.toml` loads unchanged. No fields were added, removed, or renamed. Only the behavior around your stored mic preference tightens slightly (see "Under the hood" above).
+- On first launch of v1.0.1, the in-app update banner on older installs will point you here.
 
 ## System Requirements
 
-- x86_64 Linux with PipeWire and glibc ≥ 2.39
-- GTK4 + libadwaita (standard on GNOME; install `libadwaita-1-0` on KDE / XFCE / Cinnamon desktops)
+- Linux x86_64 with PipeWire (Ubuntu 22.04+, Fedora 34+)
+- GTK4 + libadwaita (standard on GNOME desktops)
 
-Tested on Ubuntu 24.04 LTS. Should also work on Ubuntu 24.04+ flavors (Kubuntu, Xubuntu, Pop!_OS, Linux Mint 22, elementary OS 8, KDE Neon). Other modern distros with glibc ≥ 2.39, PipeWire, and GTK4/libadwaita (Fedora 40+, Debian 13, Bazzite, Arch, openSUSE Tumbleweed) should also work — untested, feedback welcome. Won't run on glibc < 2.39 — including Ubuntu 22.04, Mint 21.x, Fedora ≤ 39, Debian 12, and RHEL/Alma/Rocky 9.
-
-## Known Limitations
+## Known Limitations (unchanged from v1.0.0)
 
 - PipeWire only - PulseAudio is not supported
 - Linux x86_64 only

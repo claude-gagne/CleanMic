@@ -25,6 +25,8 @@
 
 #![cfg(feature = "gui")]
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::mpsc;
 
 use gtk4::gio;
@@ -40,6 +42,14 @@ use crate::ui::meters::widget::MeterRow;
 
 /// Handles returned from [`build_main_window`] so the caller can drive the
 /// level meter widgets and synchronize UI state from the GLib timer loop.
+///
+/// Derives `Clone` because Plan 03's 1500ms default-source polling timer
+/// clones the entire `handles` struct into its closure (Option B scaffolding
+/// choice — avoids wrapping in `Rc<RefCell<...>>`). Every field is a
+/// GObject-refcounted widget; cloning bumps a refcount rather than
+/// deep-copying, so the clones share the same underlying widgets as the
+/// originals (standard gtk4 widget-sharing semantics).
+#[derive(Clone)]
 pub struct WindowHandles {
     /// The constructed application window.
     pub window: ApplicationWindow,
@@ -59,6 +69,12 @@ pub struct WindowHandles {
     pub win_title: libadwaita::WindowTitle,
     /// The device picker combo row — updated when device list changes.
     pub device_row: ComboRow,
+    /// Flag set while [`update_device_list`] is mutating the picker model so
+    /// the selected-item-notify handler can skip spurious events emitted by
+    /// `set_model` / `set_selected`. Without this guard, every programmatic
+    /// refresh would fire `UiEvent::DeviceChanged`, overwriting the user's
+    /// explicit pick in `config.input_device` and breaking D-06 + D-03.
+    pub device_updating: Rc<Cell<bool>>,
     /// The update notification banner at the top of the window.
     /// Revealed when a new version is available (per D-05, D-08).
     pub update_banner: Banner,
@@ -196,31 +212,69 @@ pub fn build_main_window(
 
     // Device picker
     let device_row = build_device_row(state);
+    let device_updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     {
         let tx = event_tx.clone();
-        // The row model stores DESCRIPTIONS for display, but downstream code
-        // (PipeWire target.object) needs node.name. Clone the (description →
-        // node.name) mapping into the callback so we translate on change.
+        let device_updating_cb = device_updating.clone();
+        // Clone the (description → node.name) mapping for real devices.
+        // Used to translate a real-device pick back to a PipeWire node name.
         let devices_for_cb: Vec<(String, String)> = state
             .available_devices
             .iter()
             .map(|d| (d.description.clone(), d.name.clone()))
             .collect();
-        // "Default" at index 0 resolves to the first enumerated device's
-        // node.name so PipeWire pins an actual mic rather than following the
-        // system default (which could be CleanMic itself and self-loop).
-        let default_fallback = devices_for_cb.first().map(|(_, n)| n.clone());
+        // Precompute the "Default " prefix so we can detect synthetic Default entries
+        // in the current model at selection time. Format matches build_device_model:
+        // tr!("Default") + " (" + desc + ")".
+        let default_prefix = format!("{} (", tr!("Default"));
         device_row.connect_selected_item_notify(move |row| {
+            // G-05 guard: skip events fired by programmatic model refreshes
+            // in update_device_list. Only real user clicks should emit
+            // UiEvent::DeviceChanged / DeviceChangedToDefault.
+            if device_updating_cb.get() {
+                return;
+            }
             let idx = row.selected() as usize;
-            let name: Option<String> = if idx == 0 {
-                default_fallback.clone()
-            } else {
-                devices_for_cb.get(idx - 1).map(|(_, n)| n.clone())
-            };
+            // Read the string at the selected index AND at index 0 in one model access.
+            let model = row
+                .model()
+                .and_then(|m| m.downcast::<gtk4::StringList>().ok());
+            let item_text: Option<String> = model
+                .as_ref()
+                .and_then(|sl| sl.string(idx as u32).map(|s| s.to_string()));
+            // Direct model[0] read for "is Default present?" — simpler than the
+            // nested item_text.as_ref().map(...) pattern (planner revision w7).
+            let has_default = model
+                .as_ref()
+                .and_then(|sl| sl.string(0))
+                .map(|first| first.to_string().starts_with(&default_prefix))
+                .unwrap_or(false);
+
+            // D-10: "No input device available" is the only string — picker is
+            // insensitive, but guard anyway.
+            if let Some(ref text) = item_text
+                && text == &tr!("No input device available")
+            {
+                return;
+            }
+
+            // D-01/D-06: index 0 is the Default entry when it starts with
+            // "Default (" — emit DeviceChangedToDefault. Otherwise it's a
+            // real device (Default is hidden).
+            if idx == 0 && has_default {
+                if tx.send(UiEvent::DeviceChangedToDefault).is_err() {
+                    log::warn!("UI event channel closed - DeviceChangedToDefault dropped");
+                }
+                return;
+            }
+
+            // Real-device pick. Figure out the offset: if index 0 was the
+            // Default entry, real devices start at index 1. Otherwise at 0.
+            let real_idx = if has_default { idx.saturating_sub(1) } else { idx };
+            let name: Option<String> = devices_for_cb.get(real_idx).map(|(_, n)| n.clone());
             let Some(name) = name else {
                 log::warn!(
-                    "Device picker: no device available for selected index {} — ignoring",
-                    idx,
+                    "Device picker: no device available for selected index {idx} (real_idx {real_idx}) — ignoring"
                 );
                 return;
             };
@@ -374,47 +428,115 @@ pub fn build_main_window(
         monitor_row,
         win_title,
         device_row,
+        device_updating,
         update_banner,
     }
 }
 
 // ── Helper builders ───────────────────────────────────────────────────────────
 
+/// Result of computing the picker's string model and current selection.
+///
+/// `strings` is the list shown in the dropdown.
+/// `selected_idx` is the index the combo row should mark as active.
+/// `default_present` indicates whether index 0 is the synthetic "Default (Mic)"
+/// entry (true) or the first real device (false). The selection closure uses
+/// this to decide which UiEvent variant to emit when index 0 is picked.
+/// `no_input` indicates the D-10 "No input device available" state.
+struct DevicePickerModel {
+    strings: Vec<String>,
+    selected_idx: u32,
+    /// Retained as part of the helper's contract even though the selection
+    /// closure inspects the StringList directly (via `has_default` prefix
+    /// match). Plan 03 or future consumers that render the picker from the
+    /// computed model without re-reading the widget can read this flag.
+    #[allow(dead_code)]
+    default_present: bool,
+    no_input: bool,
+}
+
+/// Compute the picker's string list and selection state from the current
+/// device list, the OS default name, and the user's persisted input_device.
+///
+/// Rules (per D-01, D-02, D-10):
+/// - `system_default_name = Some(name)` + `name` resolves to a real device in `devices`
+///   → prepend `"Default (description)"` as index 0; real devices follow at index 1..N.
+/// - `system_default_name = None` OR the default name is not in `devices`
+///   → no Default entry; real devices start at index 0.
+/// - `devices` empty AND `system_default_name` is None
+///   → single entry `"No input device available"` (D-10). `no_input = true`.
+fn build_device_model(
+    devices: &[DeviceInfo],
+    system_default_name: Option<&str>,
+    current_device: Option<&str>,
+) -> DevicePickerModel {
+    // D-10 no-input branch.
+    if devices.is_empty() && system_default_name.is_none() {
+        return DevicePickerModel {
+            strings: vec![tr!("No input device available")],
+            selected_idx: 0,
+            default_present: false,
+            no_input: true,
+        };
+    }
+
+    // Resolve the default's description, if present and in the device list.
+    let default_description: Option<String> = system_default_name
+        .and_then(|name| devices.iter().find(|d| d.name == name))
+        .map(|d| d.description.clone());
+
+    let mut strings: Vec<String> = Vec::with_capacity(devices.len() + 1);
+    let default_present = if let Some(ref desc) = default_description {
+        // D-02 label format: tr!("Default") + " (" + description + ")"
+        strings.push(format!("{} ({})", tr!("Default"), desc));
+        true
+    } else {
+        false
+    };
+    for d in devices {
+        strings.push(d.description.clone());
+    }
+
+    // Compute selected_idx:
+    // - If current_device is None AND Default is present → index 0 (following OS default).
+    // - If current_device is Some(name) AND name matches a real device → its position + (1 if default_present else 0).
+    // - Else → 0 (fall back to first entry, which is either Default or the first real mic).
+    let offset: u32 = if default_present { 1 } else { 0 };
+    let selected_idx = match current_device {
+        None if default_present => 0,
+        Some(name) => devices
+            .iter()
+            .position(|d| d.name == name)
+            .map(|i| i as u32 + offset)
+            .unwrap_or(0),
+        None => 0,
+    };
+
+    DevicePickerModel {
+        strings,
+        selected_idx,
+        default_present,
+        no_input: false,
+    }
+}
+
 /// Build the microphone picker `ComboRow`.
 fn build_device_row(state: &UiState) -> ComboRow {
     let row = ComboRow::new();
     row.set_title(&tr!("Microphone"));
 
-    // Build string model: first entry is "Default"
-    let strings: Vec<String> = std::iter::once(tr!("Default"))
-        .chain(
-            state
-                .available_devices
-                .iter()
-                .map(|d| d.description.clone()),
-        )
-        .collect();
+    let model = build_device_model(
+        &state.available_devices,
+        state.system_default_name.as_deref(),
+        state.input_device.as_deref(),
+    );
 
-    // We use a StringList as the model so each entry carries its description.
-    // The actual PipeWire node name is looked up by matching the description
-    // against available_devices when the selection changes.
-    // (In a real app you'd use a custom GListModel; this keeps the stub simple.)
-    let model = gtk4::StringList::new(&strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    row.set_model(Some(&model));
-
-    // Select the current device (or "Default" at index 0)
-    let selected_idx = state
-        .input_device
-        .as_deref()
-        .and_then(|node| {
-            state
-                .available_devices
-                .iter()
-                .position(|d| d.name == node)
-                .map(|i| (i + 1) as u32) // +1 because index 0 is "Default"
-        })
-        .unwrap_or(0);
-    row.set_selected(selected_idx);
+    let list = gtk4::StringList::new(
+        &model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+    row.set_model(Some(&list));
+    row.set_selected(model.selected_idx);
+    row.set_sensitive(!model.no_input);
 
     row
 }
@@ -557,24 +679,53 @@ impl WindowHandles {
     /// Repopulate the device picker with a fresh device list.
     ///
     /// Preserves the current selection if the device is still available.
-    pub fn update_device_list(&self, devices: &[DeviceInfo], current_device: Option<&str>) {
-        let strings: Vec<String> = std::iter::once(tr!("Default"))
-            .chain(devices.iter().map(|d| d.description.clone()))
-            .collect();
+    /// When `system_default_name` is `Some` and resolves to a device in
+    /// `devices`, a "Default (MicName)" entry is prepended. When `None`,
+    /// no Default entry is shown. When `devices` is empty AND the default
+    /// is unresolvable, shows "No input device available" and marks the
+    /// picker insensitive. Per D-01, D-02, D-10.
+    pub fn update_device_list(
+        &self,
+        devices: &[DeviceInfo],
+        current_device: Option<&str>,
+        system_default_name: Option<&str>,
+    ) {
+        let model = build_device_model(devices, system_default_name, current_device);
+        let list = gtk4::StringList::new(
+            &model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        );
+        // G-05: guard the selected-item-notify handler so the programmatic
+        // set_model / set_selected calls below don't emit a spurious
+        // UiEvent::DeviceChanged. Resetting to false after both calls complete
+        // ensures user clicks captured after this update still fire normally.
+        self.device_updating.set(true);
+        self.device_row.set_model(Some(&list));
+        self.device_row.set_selected(model.selected_idx);
+        self.device_updating.set(false);
+        self.device_row.set_sensitive(!model.no_input);
+    }
 
-        let model = gtk4::StringList::new(&strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-        self.device_row.set_model(Some(&model));
-
-        // Select the current device (or "Default" at index 0)
-        let selected_idx = current_device
-            .and_then(|node| {
-                devices
-                    .iter()
-                    .position(|d| d.name == node)
-                    .map(|i| (i + 1) as u32)
-            })
-            .unwrap_or(0);
-        self.device_row.set_selected(selected_idx);
+    /// Control the "input available" UI state for D-10.
+    ///
+    /// When `available = false`: disables the enable toggle (sensitive = false)
+    /// and forces the switch off so the pipeline doesn't try to capture.
+    /// When `available = true`: re-enables the toggle (sensitive = true); the
+    /// caller is responsible for restoring the toggle's active state from
+    /// config if desired.
+    ///
+    /// Called by the app layer when the device list + system default resolution
+    /// confirms no usable physical mic is available (or becomes usable again
+    /// after a hot-plug or OS default flip). Per D-10.
+    pub fn set_input_available(&self, available: bool) {
+        self.enable_row.set_sensitive(available);
+        if !available {
+            // Force the switch off so AudioPipeline::start isn't re-entered.
+            // The app layer is responsible for calling pipeline.stop() as
+            // well to match this UI state (see Plan 03 handler).
+            if self.enable_row.is_active() {
+                self.enable_row.set_active(false);
+            }
+        }
     }
 }
 

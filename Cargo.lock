@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "cleanmic"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "env_logger",

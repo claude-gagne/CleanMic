@@ -4,6 +4,7 @@
 //! In v0.1 everything runs in a single process: the GUI on the main thread,
 //! the audio service on a dedicated background thread.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -16,29 +17,86 @@ use crate::config::Config;
 use crate::engine::{self, EngineType};
 use crate::instance_lock;
 use crate::pipewire::PipeWireManager;
+use crate::pipewire::devices::InputDevice;
 use crate::tray::TrayCommand;
 use crate::ui::UiEvent;
 use crate::ui::welcome;
 
-/// Resolve the PipeWire node name to use as the initial capture target.
+/// Resolve the PipeWire node name to use as the current capture target.
 ///
-/// Prefers the device persisted in config; otherwise picks the system-default
-/// input device if the enumerator reports one; otherwise falls back to the
-/// first enumerated non-CleanMic source. Returns `None` only when no physical
-/// input devices are visible — in that case the capture stream starts
-/// unpinned, and the app logs a warning.
+/// Priority order (per D-03, D-05):
+/// 1. `config.input_device` if it resolves to an enumerable non-CleanMic device.
+/// 2. `last_explicit` if it resolves to an enumerable non-CleanMic device.
+///    (This is the user's most recent explicit named-mic pick from any prior
+///    session, held in memory across window-level sessions only.)
+/// 3. `system_default_name` if it resolves to an enumerable non-CleanMic device.
+///    When the OS default is CleanMic itself, this is `None` so we skip it.
+/// 4. The first enumerable non-CleanMic device.
+/// 5. `None` → D-10 "no input device available" state.
+///
+/// `list_input_devices()` already filters CleanMic out, so any name appearing
+/// in `devices` is guaranteed non-CleanMic — we cannot accidentally pin the
+/// capture stream to CleanMic itself. This function is pure; side effects
+/// (retargeting capture, updating UI) happen at call sites.
+fn resolve_runtime_capture_target(
+    devices: &[InputDevice],
+    config_input_device: Option<&str>,
+    last_explicit: Option<&str>,
+    system_default_name: Option<&str>,
+) -> Option<String> {
+    let name_is_enumerable = |name: &str| devices.iter().any(|d| d.name == name);
+
+    if let Some(name) = config_input_device
+        && name_is_enumerable(name)
+    {
+        return Some(name.to_string());
+    }
+    if let Some(name) = last_explicit
+        && name_is_enumerable(name)
+    {
+        return Some(name.to_string());
+    }
+    if let Some(name) = system_default_name
+        && name_is_enumerable(name)
+    {
+        return Some(name.to_string());
+    }
+    devices.first().map(|d| d.name.clone())
+}
+
+/// Query the OS default source name, filtering it to `None` when the default
+/// is CleanMic itself (not in the filtered device list) or unresolvable.
+///
+/// Used by both the runtime resolver wrapper and the 1500ms polling timer.
+fn current_system_default_name(
+    pw: &PipeWireManager,
+    devices: &[InputDevice],
+) -> Option<String> {
+    pw.configured_default_source()
+        .filter(|name| devices.iter().any(|d| d.name == *name))
+}
+
+/// Resolve the initial capture target at startup or reconnect.
+///
+/// Thin wrapper over [`resolve_runtime_capture_target`] that reads live state
+/// from the PipeWire manager and the loaded config. Replaces the prior
+/// implementation which didn't guard against a CleanMic self-loop when
+/// CleanMic happened to be the OS default (the phase 08.2 fix). Because
+/// `list_input_devices()` filters CleanMic out of the enumerable set, the
+/// returned name — if any — is guaranteed to be a real physical mic.
 fn resolve_initial_capture_target(
     pw: &PipeWireManager,
     config: &Config,
 ) -> Option<String> {
-    if let Some(ref name) = config.input_device {
-        return Some(name.clone());
-    }
     let devices = pw.device_enumerator().list_input_devices();
-    if let Some(default_dev) = devices.iter().find(|d| d.is_default) {
-        return Some(default_dev.name.clone());
-    }
-    devices.first().map(|d| d.name.clone())
+    let system_default_name = current_system_default_name(pw, &devices);
+
+    resolve_runtime_capture_target(
+        &devices,
+        config.input_device.as_deref(),
+        None, // no prior-session last_explicit available at startup
+        system_default_name.as_deref(),
+    )
 }
 
 /// Rate-limits GNOME desktop notifications to at most one per ID per 60 seconds (per D-03).
@@ -300,11 +358,26 @@ pub fn shutdown(
 }
 
 /// Dispatch a [`UiEvent`] to the audio pipeline and update config accordingly.
+///
+/// `last_explicit` tracks the user's most recent explicit named-mic pick
+/// (priority 2 for auto-switch fallback per D-03). Updated only when the
+/// `DeviceChanged` handler fires (real-mic pick) and when
+/// `DeviceChangedToDefault` records the previous pick before clearing.
+/// Never written by the auto-switch path in the polling timer (D-06).
+///
+/// `current_capture_target` records the PipeWire node name the capture stream
+/// is currently pinned to. Updated by both `DeviceChanged` and
+/// `DeviceChangedToDefault` immediately after their own `set_capture_target`
+/// calls so the 1500ms polling timer's diff-based retarget branch
+/// (gap-closure 08.2-05 Task 2) does not double-fire on the very next tick.
+/// Never affects config persistence (D-06).
 fn handle_ui_event(
     event: UiEvent,
     pipeline: &AudioPipeline,
     config: &mut Config,
     pw_manager: &mut PipeWireManager,
+    last_explicit: &RefCell<Option<String>>,
+    current_capture_target: &RefCell<Option<String>>,
 ) {
     match event {
         UiEvent::EngineChanged(engine_type) => {
@@ -333,12 +406,81 @@ fn handle_ui_event(
                 Ok(new_reader) => {
                     pipeline.replace_capture_reader(new_reader);
                     log::info!("Capture target retargeted to {}", device);
+                    // Keep the app-layer capture-target tracker in sync so the
+                    // 1500ms timer's diff-based retarget branch does not
+                    // double-fire on the next tick (G-03/G-04, 08.2-05 Task 2).
+                    *current_capture_target.borrow_mut() = Some(device.clone());
                 }
                 Err(e) => {
                     log::error!("Failed to retarget capture stream to {}: {e}", device);
                 }
             }
+            // Record the new explicit pick for D-03 priority-2 auto-switch fallback.
+            *last_explicit.borrow_mut() = Some(device.clone());
             config.input_device = Some(device);
+        }
+        UiEvent::DeviceChangedToDefault => {
+            // The user picked the "Default (MicName)" entry — means "follow
+            // OS default". Per D-06: clear config.input_device to None
+            // (semantic: follow default). Per D-03: record the previous
+            // explicit pick (if any) as last_explicit before clearing, so
+            // if the OS default later flips to CleanMic we can auto-switch
+            // to the user's prior named choice.
+            let prev = config.input_device.take(); // take clears to None
+            if let Some(ref p) = prev {
+                *last_explicit.borrow_mut() = Some(p.clone());
+            }
+
+            // Resolve the actual capture target. Even though config says
+            // "follow default", the capture stream still needs a concrete
+            // pin to avoid the self-loop risk. resolve_runtime_capture_target
+            // handles this: when system_default_name is Some(real_mic), we
+            // pin to it. When system_default is CleanMic (system_default_name
+            // = None), we fall through to last_explicit, then first
+            // enumerated non-CleanMic mic.
+            let devices = pw_manager.device_enumerator().list_input_devices();
+            let system_default_name = current_system_default_name(pw_manager, &devices);
+            let last_explicit_snapshot = last_explicit.borrow().clone();
+            let target = resolve_runtime_capture_target(
+                &devices,
+                None, // config.input_device was just cleared
+                last_explicit_snapshot.as_deref(),
+                system_default_name.as_deref(),
+            );
+            match target {
+                Some(ref name) => {
+                    pipeline.set_input_device(name.clone());
+                    match pw_manager.set_capture_target(Some(name.clone())) {
+                        Ok(new_reader) => {
+                            pipeline.replace_capture_reader(new_reader);
+                            log::info!("Follow-default: capture target resolved to {name}");
+                            // Keep the app-layer capture-target tracker in sync so the
+                            // 1500ms timer's diff-based retarget branch does not
+                            // double-fire on the next tick (G-03/G-04, 08.2-05 Task 2).
+                            *current_capture_target.borrow_mut() = Some(name.clone());
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Follow-default: failed to retarget capture stream to {name}: {e}"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // No real mic available. D-10 state will be surfaced by the
+                    // polling timer on its next tick.
+                    log::warn!("Follow-default: no physical input device available");
+                    // Keep the app-layer capture-target tracker in sync: no target
+                    // is pinned. The 1500ms timer's retarget branch will promote
+                    // a mic once one becomes enumerable.
+                    *current_capture_target.borrow_mut() = None;
+                }
+            }
+            // Persist config.input_device = None immediately so the intent
+            // survives a crash or reboot.
+            if let Err(e) = config.save() {
+                log::warn!("Failed to save config after DeviceChangedToDefault: {e}");
+            }
         }
         UiEvent::EnableToggled(enabled) => {
             if enabled {
@@ -398,24 +540,34 @@ fn handle_ui_event(
 }
 
 /// Dispatch a [`TrayCommand`] to the audio pipeline and update config.
+///
+/// `last_explicit` is forwarded to the underlying [`handle_ui_event`] calls so
+/// tray-driven device changes participate in the same auto-switch fallback
+/// semantics as UI-driven ones (D-03).
+///
+/// `current_capture_target` is forwarded so that tray-driven device changes
+/// (if ever wired up — currently the tray does not expose a device picker)
+/// keep the polling-timer's app-state tracker in sync (08.2-05 Task 2).
 #[allow(dead_code)]
 fn handle_tray_command(
     cmd: TrayCommand,
     pipeline: &AudioPipeline,
     config: &mut Config,
     pw_manager: &mut PipeWireManager,
+    last_explicit: &RefCell<Option<String>>,
+    current_capture_target: &RefCell<Option<String>>,
 ) {
     match cmd {
         TrayCommand::Toggle => {
             let new_state = !config.enabled;
-            handle_ui_event(UiEvent::EnableToggled(new_state), pipeline, config, pw_manager);
+            handle_ui_event(UiEvent::EnableToggled(new_state), pipeline, config, pw_manager, last_explicit, current_capture_target);
         }
         TrayCommand::SetEngine(engine_type) => {
-            handle_ui_event(UiEvent::EngineChanged(engine_type), pipeline, config, pw_manager);
+            handle_ui_event(UiEvent::EngineChanged(engine_type), pipeline, config, pw_manager, last_explicit, current_capture_target);
         }
         TrayCommand::ToggleMonitor => {
             let new_state = !config.monitor_enabled;
-            handle_ui_event(UiEvent::MonitorToggled(new_state), pipeline, config, pw_manager);
+            handle_ui_event(UiEvent::MonitorToggled(new_state), pipeline, config, pw_manager, last_explicit, current_capture_target);
         }
         TrayCommand::OpenWindow => {
             log::info!("Open main window requested (not yet implemented in headless mode)");
@@ -499,22 +651,21 @@ pub fn run() -> Result<()> {
     }
 
     // -- Resolve the initial capture target --
-    // The capture stream must be pinned to a specific physical mic via
-    // PW_KEY_TARGET_OBJECT; otherwise WirePlumber routes it to the system
-    // default source, and if the user sets CleanMic as the default input
-    // the stream self-loops. Prefer the user's saved choice, then the first
-    // enumerated non-CleanMic source.
+    // The capture stream is pinned to a specific physical mic via
+    // PW_KEY_TARGET_OBJECT. Pinning prevents WirePlumber's default-source
+    // policy from re-routing the capture stream at runtime. The resolver
+    // (`resolve_runtime_capture_target`) never returns CleanMic itself
+    // because `list_input_devices()` filters it out — so we cannot
+    // accidentally pin the capture to CleanMic even when the user has
+    // selected CleanMic as the OS default input. Per D-06, the resolver
+    // result is NOT persisted to `config.input_device`; only explicit picks
+    // via the picker write there.
     let initial_capture_target = resolve_initial_capture_target(&pw_manager, &config);
     if initial_capture_target.is_none() {
         log::warn!(
-            "No physical input devices found — capture stream will start unpinned. \
-             The app will self-loop if CleanMic is selected as the system default input."
+            "No physical input devices found — capture will start unpinned; \
+             enable toggle will be grayed out until a mic becomes available."
         );
-    }
-    if config.input_device.is_none()
-        && let Some(ref name) = initial_capture_target
-    {
-        config.input_device = Some(name.clone());
     }
 
     // -- Create the virtual mic --
@@ -600,6 +751,26 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Evaluate D-10 "no input device available" once at startup so the
+    // pipeline does not auto-start on an absent source and the enable toggle
+    // does not render as sensitive/on for up to 1500ms before the polling
+    // timer's first tick corrects it. Per WR-02.
+    let startup_no_input = {
+        let devices = pw_manager.device_enumerator().list_input_devices();
+        let system_default_name = current_system_default_name(&pw_manager, &devices);
+        devices.is_empty() && system_default_name.is_none()
+    };
+    if startup_no_input {
+        log::warn!(
+            "D-10 at startup: no input device available — pipeline will not auto-start"
+        );
+        // Prevent the enable toggle from rendering as on against an absent
+        // source. Matches the transition-into-D-10 behaviour from the 1500ms
+        // timer (set_input_available(false) forces the toggle off which
+        // cascades to config.enabled = false).
+        config.enabled = false;
+    }
+
     // Auto-start pipeline if enabled (including first run with default enabled=true).
     if config.enabled {
         pipeline.start();
@@ -611,7 +782,7 @@ pub fn run() -> Result<()> {
     // -- Run with GUI or headless --
     #[cfg(feature = "gui")]
     {
-        run_with_gui(config, pipeline, pw_manager, first_run)?;
+        run_with_gui(config, pipeline, pw_manager, first_run, startup_no_input)?;
     }
 
     #[cfg(not(feature = "gui"))]
@@ -632,14 +803,25 @@ fn run_headless(
     let (_ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
     let (_tray_tx, tray_rx) = mpsc::channel::<TrayCommand>();
 
+    // Headless mode has no UI picker, so there is no meaningful cross-session
+    // "last explicit pick" to track. A scratch RefCell keeps the signature
+    // satisfied without affecting behavior. Per D-03 / D-07.
+    let last_explicit_headless: RefCell<Option<String>> = RefCell::new(None);
+
+    // Headless mode has no polling timer and therefore no diff-based retarget,
+    // so this scratch RefCell is write-only from the handlers' perspective —
+    // it keeps the handler signature satisfied without affecting behavior
+    // (08.2-05 Task 2).
+    let current_capture_target_headless: RefCell<Option<String>> = RefCell::new(None);
+
     log::info!("CleanMic running headless — waiting for shutdown signal");
 
     while !is_shutdown_requested() {
         while let Ok(event) = ui_rx.try_recv() {
-            handle_ui_event(event, &pipeline, &mut config, &mut pw_manager);
+            handle_ui_event(event, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless, &current_capture_target_headless);
         }
         while let Ok(cmd) = tray_rx.try_recv() {
-            handle_tray_command(cmd, &pipeline, &mut config, &mut pw_manager);
+            handle_tray_command(cmd, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless, &current_capture_target_headless);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -656,6 +838,7 @@ fn run_with_gui(
     pipeline: AudioPipeline,
     pw_manager: PipeWireManager,
     first_run: bool,
+    startup_no_input: bool,
 ) -> Result<()> {
     use gtk4::glib;
     use gtk4::prelude::*;
@@ -749,6 +932,39 @@ fn run_with_gui(
     let pipeline = Rc::new(pipeline);
     let pw_manager = Rc::new(RefCell::new(pw_manager));
 
+    // In-memory "last explicit pick" tracker for D-03 priority-2 auto-switch
+    // fallback. Seeded from the persisted config pick so the user's declared
+    // choice is remembered even after they switch to Default. Written only by
+    // explicit UI picks (DeviceChanged / DeviceChangedToDefault) — auto-switch
+    // never writes. Wrapped in Rc so both the 33ms timer and the 1500ms timer
+    // can clone it into their closures. Per D-03, D-06, D-07.
+    let last_explicit_input_device: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(
+        config.borrow().input_device.clone(),
+    ));
+
+    // App-layer record of the PipeWire node name the capture stream is
+    // currently pinned to. Used by the 1500ms polling timer (Task 2 of
+    // gap-closure plan 08.2-05) to detect when the pinned target has
+    // diverged from the resolver's current preferred target, and to drive a
+    // silent retarget when (a) the pinned target has become unenumerable
+    // (G-03: hot-unplug of an explicitly-picked mic), or (b) the resolver's
+    // preferred target has changed because last_explicit came back online
+    // (G-04: hot-replug recovery). Seeded by re-running the resolver once
+    // against live enumeration so the first timer tick is a no-op when the
+    // virtual mic was created pinned to the same target. Written ONLY by
+    // the timer's diff branch and by the UiEvent::DeviceChanged /
+    // DeviceChangedToDefault handlers immediately after their own
+    // set_capture_target calls (so the next tick does not redundantly
+    // retarget). Never affects config persistence (D-06).
+    let current_capture_target_app_state: Rc<RefCell<Option<String>>> = {
+        let initial_target_for_tracker = {
+            let pw = pw_manager.borrow();
+            let cfg = config.borrow();
+            resolve_initial_capture_target(&pw, &cfg)
+        };
+        Rc::new(RefCell::new(initial_target_for_tracker))
+    };
+
     // Pending debounced config save (for rapid-fire events: strength, engine, device).
     let pending_save: Rc<std::cell::Cell<Option<glib::SourceId>>> = Rc::new(std::cell::Cell::new(None));
 
@@ -797,6 +1013,12 @@ fn run_with_gui(
         {
             let pw = pw_manager_clone.borrow();
             let devices = pw.device_enumerator().list_input_devices();
+            // Seed the system default so the picker renders `Default (MicName)`
+            // on the very first paint rather than waiting up to 1500ms for the
+            // polling timer's first tick. Without this, users who follow the
+            // OS default see a visible picker flash as the entry appears late
+            // and the selection jumps. Per WR-01.
+            initial_state.system_default_name = current_system_default_name(&pw, &devices);
             initial_state.available_devices = devices
                 .iter()
                 .map(|d| crate::ui::DeviceInfo {
@@ -818,6 +1040,24 @@ fn run_with_gui(
             tray_available,
         );
         handles.window.present();
+
+        // Enforce D-10 from startup: if the pre-window check found no usable
+        // input, gray out the enable toggle immediately so it never renders
+        // as sensitive for the ~1500ms before the polling timer's first tick.
+        // Per WR-02.
+        if startup_no_input {
+            handles.set_input_available(false);
+        }
+
+        // Clone the full WindowHandles BEFORE any field moves (MeterRows
+        // get moved into Rcs below, which would make a struct-level clone
+        // after that impossible). All fields are GObject-refcounted widgets,
+        // so this clone is cheap — it bumps refcounts rather than deep-copying.
+        // The 1500ms default-source polling timer (Option B scaffolding —
+        // see Plan 02 which added #[derive(Clone)] to WindowHandles and
+        // MeterRow) captures this clone into its closure to call
+        // update_device_list and set_input_available directly.
+        let handles_timer_slow: crate::ui::window::WindowHandles = handles.clone();
 
         // -- Background update check on launch (per D-01, D-03: fire-and-forget) --
         #[cfg(feature = "updater")]
@@ -849,7 +1089,7 @@ fn run_with_gui(
             dialog.set_issue_url("https://github.com/claude-gagne/CleanMic/issues");
             dialog.set_license_type(gtk4::License::MitX11);
             dialog.set_application_icon("com.cleanmic.CleanMic");
-            dialog.add_link(&crate::tr!("Support CleanMic"), "https://github.com/sponsors/claude-gagne");
+            dialog.add_link(&crate::tr!("Support CleanMic"), "https://buymeacoffee.com/claudegagne");
             dialog.set_debug_info(&build_debug_info());
             dialog.set_debug_info_filename("cleanmic-debug.txt");
             if let Some(win) = window_weak.upgrade() {
@@ -924,6 +1164,8 @@ fn run_with_gui(
         let config_timer = config_clone.clone();
         let pw_timer = pw_manager_clone.clone();
         let pending_save_timer = pending_save.clone();
+        let last_explicit_timer = last_explicit_input_device.clone();
+        let current_capture_target_timer = current_capture_target_app_state.clone();
         let app_weak = app.downgrade();
         let notification_throttle_timer = notification_throttle.clone();
         let pw_reconnect_attempted_timer = pw_reconnect_attempted.clone();
@@ -1071,7 +1313,7 @@ fn run_with_gui(
                     event,
                     UiEvent::EnableToggled(_) | UiEvent::MonitorToggled(_) | UiEvent::AutostartToggled(_)
                 );
-                handle_ui_event(event, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut());
+                handle_ui_event(event, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer, &current_capture_target_timer);
                 if needs_debounce {
                     schedule_debounced_save(&config_timer, &pending_save_timer);
                 } else if needs_immediate_save && let Err(e) = config_timer.borrow().save() {
@@ -1131,7 +1373,7 @@ fn run_with_gui(
                         // Result arrives via channel on next timer tick; skip handle_tray_command
                         continue;
                     }
-                    handle_tray_command(cmd, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut());
+                    handle_tray_command(cmd, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer, &current_capture_target_timer);
                     if tray_needs_debounce {
                         schedule_debounced_save(&config_timer, &pending_save_timer);
                     } else if tray_needs_immediate_save && let Err(e) = config_timer.borrow().save() {
@@ -1266,6 +1508,207 @@ fn run_with_gui(
 
             glib::ControlFlow::Continue
         });
+
+        // ── Slow-cadence polling (1500ms) for OS default-source changes ────
+        // Re-queries pw-metadata every 1.5s to detect when the user changes
+        // the OS default input in GNOME Sound Settings. On flip, refreshes
+        // the picker (label + conditional Default entry) and fires the
+        // silent auto-switch when the user is following default and the
+        // OS default just became CleanMic. Also enforces D-10: when no
+        // physical mic is available, gray out the enable toggle and stop
+        // the pipeline. Per D-03, D-04, D-06, D-08, D-10.
+        {
+            let pw_timer_slow = pw_manager_clone.clone();
+            let pipeline_timer_slow = pipeline_clone.clone();
+            let config_timer_slow = config_clone.clone();
+            let last_explicit_slow = last_explicit_input_device.clone();
+            let current_capture_target_slow = current_capture_target_app_state.clone();
+            // Track the last system_default_name we pushed to the UI so we
+            // only refresh on actual change. Outer Option = "never pushed
+            // yet" sentinel; inner Option = actual pushed value (which may
+            // itself be None if the OS default was CleanMic at that time).
+            // Seed with the value we passed into the initial UiState (WR-01)
+            // so the first tick is a no-op when the OS default has not
+            // changed since window construction — avoids an unnecessary
+            // picker re-model on the first tick.
+            let last_pushed_default: Rc<RefCell<Option<Option<String>>>> =
+                Rc::new(RefCell::new(Some(initial_state.system_default_name.clone())));
+            // Track whether we're currently in D-10 "no input" state so we
+            // only fire set_input_available / pipeline.stop on transitions.
+            // Seed from the startup evaluation (WR-02) so the first tick is a
+            // no-op when the startup state already matches live state —
+            // otherwise a startup_no_input = true run would re-fire the
+            // transition handler on the first tick.
+            let in_no_input_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(startup_no_input));
+            // Track the device-name list last pushed to the UI so we only
+            // refresh the picker model when the enumeration actually changed.
+            // Seed with the initial push's list so the first tick is a no-op
+            // when nothing has changed. Per G-02 (08.2-HUMAN-UAT.md): without
+            // this, the picker never refreshes on plug/unplug when the OS
+            // default stays the same (common hot-unplug path with webcam mic
+            // still enumerable).
+            let last_pushed_devices: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(Some(
+                initial_state
+                    .available_devices
+                    .iter()
+                    .map(|d| d.name.clone())
+                    .collect(),
+            )));
+            glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
+                let devices = {
+                    let pw_ref = pw_timer_slow.borrow();
+                    pw_ref.device_enumerator().list_input_devices()
+                };
+                let system_default_name = {
+                    let pw_ref = pw_timer_slow.borrow();
+                    current_system_default_name(&pw_ref, &devices)
+                };
+
+                // Convert InputDevice → DeviceInfo for the UI layer.
+                let ui_devices: Vec<crate::ui::DeviceInfo> = devices
+                    .iter()
+                    .map(|d| crate::ui::DeviceInfo {
+                        name: d.name.clone(),
+                        description: d.description.clone(),
+                    })
+                    .collect();
+
+                // Snapshot the enumerated device names for G-02 change detection.
+                let current_device_names: Vec<String> =
+                    devices.iter().map(|d| d.name.clone()).collect();
+
+                // Detect D-10 "no input device available" state transitions.
+                let is_no_input = devices.is_empty() && system_default_name.is_none();
+                let was_no_input = *in_no_input_state.borrow();
+                if is_no_input != was_no_input {
+                    *in_no_input_state.borrow_mut() = is_no_input;
+                    handles_timer_slow.set_input_available(!is_no_input);
+                    if is_no_input {
+                        // Stop the pipeline so it doesn't spin on an absent source.
+                        pipeline_timer_slow.stop();
+                        log::info!(
+                            "D-10: no input device available — pipeline stopped, enable toggle disabled"
+                        );
+                    } else {
+                        log::info!(
+                            "D-10 cleared: input device available again — enable toggle re-enabled"
+                        );
+                        // Do NOT auto-start the pipeline — the user must re-enable.
+                    }
+                }
+
+                // G-02: refresh the picker when either the OS default name
+                // changed OR the device enumeration changed (plug/unplug while
+                // default stays the same is the common hot-unplug path and must
+                // still refresh). Before G-02 (Plan 03) the gate was default-only
+                // and the picker would keep displaying an unplugged mic.
+                let last_pushed_default_snapshot = last_pushed_default.borrow().clone();
+                let current_default_as_opt_opt: Option<Option<String>> =
+                    Some(system_default_name.clone());
+                let last_pushed_devices_snapshot = last_pushed_devices.borrow().clone();
+                let current_devices_as_opt: Option<Vec<String>> =
+                    Some(current_device_names.clone());
+
+                let default_changed =
+                    last_pushed_default_snapshot != current_default_as_opt_opt;
+                let devices_changed =
+                    last_pushed_devices_snapshot != current_devices_as_opt;
+
+                if default_changed || devices_changed {
+                    let current_device = {
+                        let cfg = config_timer_slow.borrow();
+                        cfg.input_device.clone()
+                    };
+                    handles_timer_slow.update_device_list(
+                        &ui_devices,
+                        current_device.as_deref(),
+                        system_default_name.as_deref(),
+                    );
+                    *last_pushed_default.borrow_mut() = current_default_as_opt_opt;
+                    *last_pushed_devices.borrow_mut() = current_devices_as_opt;
+                }
+
+                // G-03 / G-04: diff-based capture retarget.
+                //
+                // Run the resolver every tick against live enumeration +
+                // live last_explicit + live config state. Compare the
+                // resolver's preferred target against the app-state record
+                // of what is currently pinned. When they differ, call
+                // set_capture_target to retarget.
+                //
+                // This subsumes the previous narrow default-transition
+                // auto-switch branch (which was gated on "OS default went
+                // from Some to None" AND "user was following default" and
+                // was deleted in Task 1 of gap-closure plan 08.2-05). The
+                // unified branch handles:
+                //   - G-03: user's explicit pick became unenumerable (the
+                //           resolver falls through to the next priority
+                //           level; current_capture_target holds the stale
+                //           dead-node name until we retarget).
+                //   - G-04: user's explicit pick became enumerable again
+                //           (the resolver promotes it back via the priority
+                //           chain; current_capture_target still holds the
+                //           fallback name until we retarget).
+                //   - the original OS-default → CleanMic flip (now
+                //     expressed as system_default_name going to None,
+                //     which collapses the third priority level and falls
+                //     through to the next).
+                //
+                // D-06: config.input_device is NEVER written by this branch.
+                // The user's declared intent stays authoritative for when
+                // their chosen mic comes back online.
+                let (config_input_device_snapshot, last_explicit_snapshot) = {
+                    let cfg = config_timer_slow.borrow();
+                    let last = last_explicit_slow.borrow().clone();
+                    (cfg.input_device.clone(), last)
+                };
+
+                let desired_target = resolve_runtime_capture_target(
+                    &devices,
+                    config_input_device_snapshot.as_deref(),
+                    last_explicit_snapshot.as_deref(),
+                    system_default_name.as_deref(),
+                );
+
+                let current_target_snapshot = current_capture_target_slow.borrow().clone();
+                if desired_target != current_target_snapshot {
+                    match &desired_target {
+                        Some(name) => {
+                            let result = {
+                                let mut pw_mut = pw_timer_slow.borrow_mut();
+                                pw_mut.set_capture_target(Some(name.clone()))
+                            };
+                            match result {
+                                Ok(new_reader) => {
+                                    pipeline_timer_slow.set_input_device(name.clone());
+                                    pipeline_timer_slow.replace_capture_reader(new_reader);
+                                    *current_capture_target_slow.borrow_mut() =
+                                        Some(name.clone());
+                                    log::info!(
+                                        "Auto-retarget: capture stream retargeted to {name} (silent per D-04; config.input_device unchanged per D-06)"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Auto-retarget: failed to set capture target to {name}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            // No enumerable mic anywhere. The D-10 block above
+                            // has already stopped the pipeline and grayed out
+                            // the toggle. Just record the absence so we
+                            // retarget on the next tick when a mic becomes
+                            // available.
+                            *current_capture_target_slow.borrow_mut() = None;
+                        }
+                    }
+                }
+
+                glib::ControlFlow::Continue
+            });
+        }
 
         // ── Health check timer (D-17, D-18, D-15, D-16) ──────────────────
         // Fires every 2 seconds. Compares heartbeat counter values to detect
@@ -1567,12 +2010,16 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
         handle_ui_event(
             UiEvent::EngineChanged(EngineType::RNNoise),
             &pipeline,
             &mut config,
             &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
         );
         assert_eq!(config.engine, EngineType::RNNoise);
 
@@ -1585,11 +2032,13 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_ui_event(UiEvent::EnableToggled(false), &pipeline, &mut config, &mut pw);
+        handle_ui_event(UiEvent::EnableToggled(false), &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(!config.enabled);
 
-        handle_ui_event(UiEvent::EnableToggled(true), &pipeline, &mut config, &mut pw);
+        handle_ui_event(UiEvent::EnableToggled(true), &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(config.enabled);
 
         drop(pipeline);
@@ -1607,12 +2056,16 @@ mod tests {
         let mut config = Config::default();
         config.engine = EngineType::DeepFilterNet;
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
         handle_ui_event(
             UiEvent::EngineChanged(EngineType::Khip),
             &pipeline,
             &mut config,
             &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
         );
         // Khip unavailable — fallback chain assigns best available engine (D-02).
         // Config should have been updated to the actual engine used.
@@ -1628,11 +2081,13 @@ mod tests {
         let mut config = Config::default();
         config.enabled = true;
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw);
+        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(!config.enabled);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw);
+        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(config.enabled);
 
         drop(pipeline);
@@ -1646,8 +2101,10 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Quit, &pipeline, &mut config, &mut pw);
+        handle_tray_command(TrayCommand::Quit, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
         assert!(is_shutdown_requested());
 
         // Cleanup.
