@@ -25,6 +25,8 @@
 
 #![cfg(feature = "gui")]
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::mpsc;
 
 use gtk4::gio;
@@ -67,6 +69,12 @@ pub struct WindowHandles {
     pub win_title: libadwaita::WindowTitle,
     /// The device picker combo row — updated when device list changes.
     pub device_row: ComboRow,
+    /// Flag set while [`update_device_list`] is mutating the picker model so
+    /// the selected-item-notify handler can skip spurious events emitted by
+    /// `set_model` / `set_selected`. Without this guard, every programmatic
+    /// refresh would fire `UiEvent::DeviceChanged`, overwriting the user's
+    /// explicit pick in `config.input_device` and breaking D-06 + D-03.
+    pub device_updating: Rc<Cell<bool>>,
     /// The update notification banner at the top of the window.
     /// Revealed when a new version is available (per D-05, D-08).
     pub update_banner: Banner,
@@ -204,8 +212,10 @@ pub fn build_main_window(
 
     // Device picker
     let device_row = build_device_row(state);
+    let device_updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     {
         let tx = event_tx.clone();
+        let device_updating_cb = device_updating.clone();
         // Clone the (description → node.name) mapping for real devices.
         // Used to translate a real-device pick back to a PipeWire node name.
         let devices_for_cb: Vec<(String, String)> = state
@@ -218,6 +228,12 @@ pub fn build_main_window(
         // tr!("Default") + " (" + desc + ")".
         let default_prefix = format!("{} (", tr!("Default"));
         device_row.connect_selected_item_notify(move |row| {
+            // G-05 guard: skip events fired by programmatic model refreshes
+            // in update_device_list. Only real user clicks should emit
+            // UiEvent::DeviceChanged / DeviceChangedToDefault.
+            if device_updating_cb.get() {
+                return;
+            }
             let idx = row.selected() as usize;
             // Read the string at the selected index AND at index 0 in one model access.
             let model = row
@@ -412,6 +428,7 @@ pub fn build_main_window(
         monitor_row,
         win_title,
         device_row,
+        device_updating,
         update_banner,
     }
 }
@@ -677,8 +694,14 @@ impl WindowHandles {
         let list = gtk4::StringList::new(
             &model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         );
+        // G-05: guard the selected-item-notify handler so the programmatic
+        // set_model / set_selected calls below don't emit a spurious
+        // UiEvent::DeviceChanged. Resetting to false after both calls complete
+        // ensures user clicks captured after this update still fire normally.
+        self.device_updating.set(true);
         self.device_row.set_model(Some(&list));
         self.device_row.set_selected(model.selected_idx);
+        self.device_updating.set(false);
         self.device_row.set_sensitive(!model.no_input);
     }
 
