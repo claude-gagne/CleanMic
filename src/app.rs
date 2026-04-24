@@ -579,6 +579,23 @@ fn handle_tray_command(
             // Handled by the update checker in a later phase (D-02, D-04).
             log::info!("Manual update check requested via tray");
         }
+        TrayCommand::OpenReleasesPage => {
+            // Per 08.3 D-04: open GitHub Releases page directly (mirror banner Download button).
+            // Requires both `updater` (for RELEASES_PAGE_URL) and `gui` (for gtk4::gio::AppInfo).
+            #[cfg(all(feature = "updater", feature = "gui"))]
+            {
+                if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
+                    crate::updater::RELEASES_PAGE_URL,
+                    gtk4::gio::AppLaunchContext::NONE,
+                ) {
+                    log::warn!("tray: failed to open browser for releases page: {e}");
+                }
+            }
+            #[cfg(not(all(feature = "updater", feature = "gui")))]
+            {
+                log::warn!("tray: OpenReleasesPage requested but updater/gui features are disabled");
+            }
+        }
     }
 }
 
