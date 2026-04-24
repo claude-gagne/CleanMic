@@ -32,6 +32,8 @@ pub enum TrayCommand {
     Quit,
     /// User clicked "Check for updates" in the tray menu. Per D-02.
     CheckForUpdates,
+    /// Open the GitHub Releases page in the default browser. Per 08.3 D-04.
+    OpenReleasesPage,
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -258,11 +260,11 @@ pub fn build_menu(state: &TrayState) -> Vec<MenuItem> {
 
     let mut items = vec![toggle_item, engine_submenu, monitor_item, open_item];
 
-    // Persistent update indicator (per D-07, D-02).
+    // Persistent update indicator — clicking opens Releases page (per 08.3 D-04).
     if let Some(ref version) = state.update_available {
         items.push(MenuItem::action(
             format!("Update available: {}", version),
-            TrayCommand::CheckForUpdates,
+            TrayCommand::OpenReleasesPage,
         ));
     }
     // Always show "Check for updates" item (per D-02).
@@ -617,12 +619,20 @@ mod tests {
             TrayCommand::ToggleMonitor,
             TrayCommand::OpenWindow,
             TrayCommand::Quit,
+            TrayCommand::OpenReleasesPage,
         ];
         // Just verify they can be constructed and compared.
         assert_eq!(cmds[0], TrayCommand::Toggle);
         assert_eq!(cmds[4], TrayCommand::ToggleMonitor);
         assert_eq!(cmds[5], TrayCommand::OpenWindow);
         assert_eq!(cmds[6], TrayCommand::Quit);
+    }
+
+    #[test]
+    fn tray_command_open_releases_page_constructible() {
+        let cmd = TrayCommand::OpenReleasesPage;
+        assert_eq!(cmd, TrayCommand::OpenReleasesPage);
+        assert_ne!(cmd, TrayCommand::CheckForUpdates);
     }
 
     // ── Menu model ────────────────────────────────────────────────────────────
@@ -805,14 +815,31 @@ mod tests {
         let menu = build_menu(&state);
         // update-indicator + check-for-updates = 2 extra items → total 8.
         assert_eq!(menu.len(), 8);
-        // Verify update indicator label contains "v1.2.0".
+        // Verify update indicator label contains "v1.2.0" and binds to OpenReleasesPage
+        // (per 08.3 D-04 — clicking the indicator opens the Releases page directly,
+        // not re-runs the update check).
         let has_indicator = menu.iter().any(|item| {
-            matches!(item, MenuItem::Action { label, command: TrayCommand::CheckForUpdates, .. }
+            matches!(item, MenuItem::Action { label, command: TrayCommand::OpenReleasesPage, .. }
                 if label.contains("v1.2.0"))
         });
         assert!(
             has_indicator,
             "expected update indicator with version v1.2.0"
+        );
+    }
+
+    #[test]
+    fn menu_update_indicator_binds_to_open_releases_page() {
+        let mut state = TrayState::default();
+        state.set_update_available(Some("v1.2.3".to_owned()));
+        let menu = build_menu(&state);
+        let has_open_releases = menu.iter().any(|item| {
+            matches!(item, MenuItem::Action { command: TrayCommand::OpenReleasesPage, label, .. }
+                if label.contains("v1.2.3"))
+        });
+        assert!(
+            has_open_releases,
+            "update indicator should bind to OpenReleasesPage, not CheckForUpdates"
         );
     }
 
