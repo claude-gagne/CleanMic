@@ -1,33 +1,30 @@
-CleanMic v1.0.1 - polish + safety bundle.
+CleanMic v1.0.2 - update notification polish.
 
-A small follow-up to v1.0.0 focused on making the mic picker behave correctly around system-default changes and hot-plug events. No new features; this release tightens the edges of the v1.0.0 core.
+A small follow-up to v1.0.1 focused on making the in-app update-notification flow friendlier. No new features; this release tightens the UX around how CleanMic tells you a new version is available.
 
-## What's new in v1.0.1
+## What's new in v1.0.2
 
-### Mic picker + self-loop prevention
+### Update notification polish
 
-- **"Default (MicName)" label** - when your OS default mic is a real physical device, CleanMic surfaces it at the top of the picker as `Default (Razer Seiren X)` or similar, so you can tell which mic "follow system default" resolves to without leaving the app.
-- **Self-loop prevention** - when CleanMic itself is set as the OS default input, the "Default" entry is hidden from the picker entirely. The app silently falls back to a real physical microphone for capture, so CleanMic never ends up trying to capture from its own virtual source.
-- **Hot-unplug handling** - unplug your selected mic mid-session and CleanMic switches cleanly to the next available physical mic without freezing the input meter or breaking audio to the app that's consuming the virtual source. The picker refreshes live.
-- **Hot-replug return** - when you plug your originally-selected mic back in, CleanMic auto-switches capture back to it. Your explicit picks are persisted and honored; auto-switches never silently overwrite them.
-- **"No input device available" state** - when no physical mic is enumerable, the picker collapses to a single clearly-labeled entry and the Enable toggle grays out instead of silently spinning the pipeline on no input.
+- **Fully localized update banner and desktop notification** - the banner title and notification body are now translated alongside the rest of the UI. French users see French text end-to-end instead of a localized button sitting next to an English headline.
+- **Manual "Check for updates" always gives feedback** - clicking "Check for updates" from the tray or hamburger menu now always emits a desktop notification, even if you already dismissed the banner for that version. You get a clear confirmation every time instead of wondering whether the check silently did anything.
+- **Tray "Update available" entry opens the download page** - the persistent "Update available: vX.Y.Z" item in the tray menu now opens the GitHub Releases page directly in your browser, mirroring the banner's Download button. Previously it re-ran the update check with no obvious path to actually downloading the new version.
 
 ### Under the hood
 
-- Quieter logging - the per-tick device enumeration log is now at debug level rather than info, so running CleanMic from a terminal no longer floods stdout with routine polling output.
-- `config.input_device` is now strictly write-through-explicit-user-clicks only; transient auto-switches between mics never rewrite your stored preference.
+- Engine selector subtitles ("High quality (default)", "Lightweight, low CPU", "User-supplied, adaptive") are now translatable alongside the rest of the engine picker. Pre-existing gap from v1.0.0, closed here opportunistically.
 
-## Upgrading from v1.0.0
+## Upgrading from v1.0.1
 
-- Your existing config at `~/.config/cleanmic/config.toml` loads unchanged. No fields were added, removed, or renamed. Only the behavior around your stored mic preference tightens slightly (see "Under the hood" above).
-- On first launch of v1.0.1, the in-app update banner on older installs will point you here.
+- Your existing config at `~/.config/cleanmic/config.toml` loads unchanged. No fields were added, removed, or renamed.
+- On launch, v1.0.1 will show an in-app update banner pointing you here.
 
 ## System Requirements
 
 - Linux x86_64 with PipeWire (Ubuntu 22.04+, Fedora 34+)
 - GTK4 + libadwaita (standard on GNOME desktops)
 
-## Known Limitations (unchanged from v1.0.0)
+## Known Limitations (unchanged from v1.0.1)
 
 - PipeWire only - PulseAudio is not supported
 - Linux x86_64 only
