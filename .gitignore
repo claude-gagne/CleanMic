@@ -13,3 +13,12 @@
 # Downloaded packages
 *.deb
 
+# Workflow / planning artifacts — MUST NEVER be committed (private state, leaked
+# previously and forced repo cleanup). Includes the .planning symlink to the
+# sibling private repo at ../CleanMic-planning.
+/.planning
+/.planning/
+/.claude/
+/CLAUDE.md
+/docs/
+/rust_out
