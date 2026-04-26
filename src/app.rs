@@ -1155,7 +1155,7 @@ fn run_with_gui(
         // from the GLib timer. GTK4 widgets are reference-counted (GObject), so
         // cloning is cheap.
         let sync_enable_row = handles.enable_row.clone();
-        let sync_engine_row = handles.engine_row.clone();
+        let sync_engine_selector = handles.engine_selector.clone();
         let sync_strength_row = handles.strength_row.clone();
         let sync_monitor_row = handles.monitor_row.clone();
         let sync_win_title = handles.win_title.clone();
@@ -1190,7 +1190,7 @@ fn run_with_gui(
         let input_meter_timer = input_meter.clone();
         let output_meter_timer = output_meter.clone();
         let sync_enable_timer = sync_enable_row;
-        let sync_engine_timer = sync_engine_row;
+        let sync_engine_selector_timer = sync_engine_selector;
         let sync_strength_timer = sync_strength_row;
         let sync_monitor_timer = sync_monitor_row;
         let sync_win_title_timer = sync_win_title;
@@ -1293,12 +1293,12 @@ fn run_with_gui(
                 let cfg = config_timer.borrow();
                 let mut last = last_synced_timer.borrow_mut();
                 if *cfg != *last {
-                    use crate::ui::window::{engine_to_index, strength_to_level_index};
+                    use crate::ui::window::strength_to_level_index;
 
-                    let engine_idx = engine_to_index(cfg.engine);
-                    if sync_engine_timer.selected() != engine_idx {
-                        sync_engine_timer.set_selected(engine_idx);
-                    }
+                    // EngineSelector::set_engine handles its own "is this already
+                    // the active row?" check and uses an internal guard flag to
+                    // prevent feedback loops.
+                    sync_engine_selector_timer.set_engine(cfg.engine);
 
                     let level_idx = strength_to_level_index(cfg.strength);
                     if sync_strength_timer.selected() != level_idx {
@@ -1738,7 +1738,7 @@ fn run_with_gui(
         let config_health = config_clone.clone();
         let app_health = app.downgrade();
         let sync_enable_health = handles.enable_row.clone();
-        let sync_engine_health = handles.engine_row.clone();
+        let sync_engine_health = handles.engine_selector.clone();
         let sync_strength_health = handles.strength_row.clone();
         #[cfg(feature = "tray")]
         let tray_state_health = tray_state_activate.clone();
@@ -1798,7 +1798,7 @@ fn run_with_gui(
 
                     // D-15: Disable UI audio controls.
                     sync_enable_health.set_sensitive(false);
-                    sync_engine_health.set_sensitive(false);
+                    sync_engine_health.set_all_sensitive(false);
                     sync_strength_health.set_sensitive(false);
 
                     // D-16: Update tray state to reflect audio unavailability.

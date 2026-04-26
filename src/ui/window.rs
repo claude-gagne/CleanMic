@@ -10,9 +10,10 @@
 //!     ├── AdwPreferencesGroup "Input"
 //!     │   ├── AdwComboRow    — microphone picker
 //!     │   └── AdwSwitchRow   — enable / disable
-//!     ├── AdwPreferencesGroup "Engine"
-//!     │   ├── AdwComboRow    — engine selector (Balanced / High Quality / Advanced)
-//!     │   └── custom row     — strength slider
+//!     ├── AdwPreferencesGroup "Noise Processing"
+//!     │   └── AdwActionRow×3 — engine selector (radio-grouped: RNNoise / DeepFilterNet / Khip)
+//!     ├── AdwPreferencesGroup "Strength"
+//!     │   └── AdwComboRow    — strength picker (Light / Balanced / Strong)
 //!     ├── AdwPreferencesGroup "Levels"
 //!     │   ├── MeterRow       — input level meter
 //!     │   └── MeterRow       — output level meter
@@ -32,7 +33,7 @@ use std::sync::mpsc;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Box as GBox, Label, Orientation};
+use gtk4::{Box as GBox, Orientation};
 use libadwaita::prelude::*;
 use libadwaita::{
     ApplicationWindow, Banner, ComboRow, HeaderBar, PreferencesGroup, PreferencesPage, SwitchRow,
@@ -59,8 +60,11 @@ pub struct WindowHandles {
     pub output_meter: MeterRow,
     /// The enable/disable switch row — updated when pipeline state changes.
     pub enable_row: SwitchRow,
-    /// The engine selector combo row — updated on fallback engine changes.
-    pub engine_row: ComboRow,
+    /// The engine selector — a list of radio-grouped rows. Programmatic
+    /// engine changes (e.g., from the tray or audio fallback) must go through
+    /// `EngineSelector::set_engine()`, which uses an internal guard flag to
+    /// prevent feedback loops.
+    pub engine_selector: EngineSelector,
     /// The 3-step strength picker (Light / Balanced / Strong) — same for all engines.
     pub strength_row: ComboRow,
     /// The monitor toggle switch — updated on monitor state changes.
@@ -89,7 +93,7 @@ use crate::tr;
 
 // ── Engine selector helpers ───────────────────────────────────────────────────
 
-/// Label shown in the engine combo row dropdown.
+/// Display name for an engine (used as the row title in the selector).
 fn engine_label(engine: EngineType) -> &'static str {
     match engine {
         EngineType::RNNoise => "RNNoise",
@@ -98,10 +102,9 @@ fn engine_label(engine: EngineType) -> &'static str {
     }
 }
 
-/// Subtitle describing what the engine does, shown below the combo row title.
+/// Subtitle describing what the engine does, shown below the row title.
 ///
-/// Kept short — the combo row's selected-value column (on the right) gets
-/// squeezed when the subtitle wraps, truncating the engine name.
+/// Kept short so it fits in a single AdwActionRow subtitle line.
 fn engine_subtitle(engine: EngineType) -> String {
     // Per 08.3 D-01: wrap engine subtitles in tr!() for i18n coverage.
     match engine {
@@ -111,21 +114,77 @@ fn engine_subtitle(engine: EngineType) -> String {
     }
 }
 
-/// All engine entries in display order.
-const ENGINE_ORDER: [EngineType; 3] = [
-    EngineType::RNNoise,
-    EngineType::DeepFilterNet,
-    EngineType::Khip,
-];
-
-/// Map a combo-row index (0-based) back to an [`EngineType`].
-fn index_to_engine(index: u32) -> Option<EngineType> {
-    ENGINE_ORDER.get(index as usize).copied()
+/// Engine selector built from a list of AdwActionRow + radio-grouped CheckButton
+/// pairs, mirroring the GNOME Sound Settings output-device pattern.
+///
+/// Replaces the previous AdwComboRow which could not enforce row-level
+/// disabling — `set_activatable(false)` on a `gtk4::ListItem` only affects
+/// rendering, not GtkDropDown's selection model, so users could still pick
+/// "Khip (not installed)" with no effect (silent early-return in the handler).
+///
+/// This selector uses `set_sensitive(false)` on the Khip row when
+/// `khip_available=false`, matching the tray's `enabled` flag semantics in
+/// `src/tray.rs:240`.
+#[derive(Clone)]
+pub struct EngineSelector {
+    /// The AdwPreferencesGroup that holds all engine rows. Add this to the page.
+    pub group: PreferencesGroup,
+    /// (engine, row, check_button) tuples in display order. Cloning is cheap
+    /// (GObject refcount bumps, plus an Rc clone via the embedding struct).
+    rows: Vec<(EngineType, libadwaita::ActionRow, gtk4::CheckButton)>,
+    /// Guard flag — set to `true` while `set_engine()` is mutating the active
+    /// row programmatically, so the per-row toggled handler returns early
+    /// instead of emitting a spurious `UiEvent::EngineChanged`. Mirror of the
+    /// existing `device_updating` pattern (window.rs:216-219, 235-237, 702-705).
+    updating: Rc<Cell<bool>>,
 }
 
-/// Map an [`EngineType`] to its combo-row index.
-pub fn engine_to_index(engine: EngineType) -> u32 {
-    ENGINE_ORDER.iter().position(|&e| e == engine).unwrap_or(0) as u32
+impl EngineSelector {
+    /// Programmatically set the active engine without firing UiEvent::EngineChanged.
+    /// Used by the audio→UI sync path (e.g., tray-initiated changes, engine
+    /// fallback). Sets the guard flag, mutates the matching CheckButton's
+    /// `active` state, then clears the guard.
+    pub fn set_engine(&self, engine: EngineType) {
+        self.updating.set(true);
+        for (e, _row, check) in &self.rows {
+            if *e == engine && !check.is_active() {
+                check.set_active(true);
+            }
+        }
+        self.updating.set(false);
+    }
+
+    /// Return the currently active engine (the one whose CheckButton is
+    /// active). Returns `None` only in the impossible state where no row is
+    /// active — callers should treat that as "no change".
+    #[allow(dead_code)]
+    pub fn active_engine(&self) -> Option<EngineType> {
+        self.rows
+            .iter()
+            .find(|(_, _, c)| c.is_active())
+            .map(|(e, _, _)| *e)
+    }
+
+    /// Set sensitivity on every row at once. Used by the health-check path
+    /// (`src/app.rs`) to disable engine selection when the audio thread
+    /// dies (D-15). Per-engine availability (Khip) is set at construction
+    /// time and is **independent** of this — calling `set_all_sensitive(true)`
+    /// after the audio thread is restored does NOT undo Khip's
+    /// per-row disabled state, because we read each CheckButton's current
+    /// sensitivity (the construction-time source of truth) before re-enabling.
+    pub fn set_all_sensitive(&self, sensitive: bool) {
+        for (_engine, row, check) in &self.rows {
+            // Khip row stays disabled if it was disabled at construction time
+            // (khip_available=false). Re-enabling the row here would let the
+            // user pick an engine that cannot init — bug we're fixing.
+            let allow = if sensitive {
+                check.is_sensitive()
+            } else {
+                false
+            };
+            row.set_sensitive(allow);
+        }
+    }
 }
 
 // ── Window construction ───────────────────────────────────────────────────────
@@ -302,33 +361,21 @@ pub fn build_main_window(
     page.add(&input_group);
 
     // ── Engine group ──────────────────────────────────────────────────────────
-    let engine_group = PreferencesGroup::new();
-    engine_group.set_title(&tr!("Noise Processing"));
-
-    let engine_row = build_engine_row(state);
+    // EngineSelector owns its own AdwPreferencesGroup with one ActionRow per
+    // engine plus radio-grouped CheckButtons. Replaces a ComboRow whose
+    // list-factory disabling didn't actually prevent selection (UAT bug #3).
+    let engine_selector = build_engine_selector(state, event_tx.clone());
     let strength_row = build_strength_row(state, event_tx.clone());
 
-    {
-        let tx = event_tx.clone();
-        let khip_available = state.khip_available;
-        engine_row.connect_selected_notify(move |row| {
-            let idx = row.selected();
-            if let Some(engine) = index_to_engine(idx) {
-                // Update subtitle to describe the selected engine.
-                row.set_subtitle(&engine_subtitle(engine));
-                if engine == EngineType::Khip && !khip_available {
-                    return;
-                }
-                if tx.send(UiEvent::EngineChanged(engine)).is_err() {
-                    log::warn!("UI event channel closed - EngineChanged dropped");
-                }
-            }
-        });
-    }
-    engine_group.add(&engine_row);
-    engine_group.add(&strength_row);
+    // The strength row stays in its own group so the radio-row group reads
+    // cleanly as "pick one engine" (matches GNOME Sound Settings output-device
+    // styling — the volume slider is in a separate group from the device list).
+    let strength_group = PreferencesGroup::new();
+    strength_group.set_title(&tr!("Strength"));
+    strength_group.add(&strength_row);
 
-    page.add(&engine_group);
+    page.add(&engine_selector.group);
+    page.add(&strength_group);
 
     // ── Level meters group ────────────────────────────────────────────────────
     let levels_group = PreferencesGroup::new();
@@ -424,7 +471,7 @@ pub fn build_main_window(
         input_meter,
         output_meter,
         enable_row,
-        engine_row,
+        engine_selector,
         strength_row,
         monitor_row,
         win_title,
@@ -542,56 +589,107 @@ fn build_device_row(state: &UiState) -> ComboRow {
     row
 }
 
-/// Build the engine selector `ComboRow`.
-fn build_engine_row(state: &UiState) -> ComboRow {
-    let row = ComboRow::new();
-    row.set_title(&tr!("Engine"));
-    row.set_subtitle(&engine_subtitle(state.engine));
+/// Build the engine selector as an AdwPreferencesGroup containing one
+/// AdwActionRow per engine, each with a radio-grouped CheckButton suffix.
+///
+/// The previous ComboRow-based approach could not enforce row-level disabling:
+/// `set_activatable(false)` on a `gtk4::ListItem` only affects rendering, not
+/// GtkDropDown's selection model, so users could still pick "Khip (not
+/// installed)" with no effect. Mirrors the tray's enabled-flag semantics.
+fn build_engine_selector(
+    state: &UiState,
+    event_tx: mpsc::Sender<UiEvent>,
+) -> EngineSelector {
+    let group = PreferencesGroup::new();
+    group.set_title(&tr!("Noise Processing"));
 
-    // Always include all engines in the model so users can see what exists.
-    // The factory below grays out and disables unavailable entries.
-    let labels: Vec<String> = ENGINE_ORDER
-        .iter()
-        .map(|&e| match e {
-            EngineType::Khip if !state.khip_available => tr!("Khip (not installed)"),
-            _ => engine_label(e).to_owned(),
-        })
-        .collect();
-    let labels_ref: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    let model = gtk4::StringList::new(&labels_ref);
-    row.set_model(Some(&model));
-    row.set_selected(engine_to_index(state.engine));
+    let updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let mut rows: Vec<(EngineType, libadwaita::ActionRow, gtk4::CheckButton)> =
+        Vec::with_capacity(3);
 
-    // Custom list factory: dims and disables items that contain "(not installed)".
-    // set_list_factory controls the popup list; set_factory controls the closed display.
-    let factory = gtk4::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let label = Label::new(None);
-        label.set_halign(gtk4::Align::Start);
-        item.set_child(Some(&label));
-    });
-    factory.connect_bind(|_, item| {
-        let label = item.child().and_downcast::<Label>().unwrap();
-        let text = item
-            .item()
-            .and_downcast::<gtk4::StringObject>()
-            .unwrap()
-            .string();
-        label.set_text(&text);
-        let unavailable = text.contains("not installed");
-        if unavailable {
-            label.add_css_class("dim-label");
-            item.set_activatable(false);
-            item.set_selectable(false);
+    let engines = [
+        EngineType::RNNoise,
+        EngineType::DeepFilterNet,
+        EngineType::Khip,
+    ];
+
+    // Build the radio group: first CheckButton is the group leader; subsequent
+    // ones are joined via set_group(Some(&group_leader)).
+    let mut group_leader: Option<gtk4::CheckButton> = None;
+
+    for engine in engines {
+        let row = libadwaita::ActionRow::new();
+
+        // Title: "Khip (not installed)" when unavailable, else the plain label.
+        // Subtitle: the per-engine description (already i18n-wrapped via tr!()
+        // in engine_subtitle()).
+        let title = if engine == EngineType::Khip && !state.khip_available {
+            tr!("Khip (not installed)")
         } else {
-            label.remove_css_class("dim-label");
-            item.set_activatable(true);
-            item.set_selectable(true);
-        }
-    });
-    row.set_list_factory(Some(&factory));
+            engine_label(engine).to_owned()
+        };
+        row.set_title(&title);
+        row.set_subtitle(&engine_subtitle(engine));
 
-    row
+        let check = gtk4::CheckButton::new();
+        check.set_valign(gtk4::Align::Center);
+        if let Some(ref leader) = group_leader {
+            check.set_group(Some(leader));
+        } else {
+            group_leader = Some(check.clone());
+        }
+
+        // Initial selection: this row's CheckButton is active iff it matches
+        // state.engine.
+        check.set_active(engine == state.engine);
+
+        // Khip row: sensitive=false when not installed. Setting on the row
+        // makes the entire row visually disabled and unclickable; setting on
+        // the CheckButton too is belt-and-suspenders so a programmatic
+        // `set_active(true)` from a future bug also no-ops cleanly.
+        if engine == EngineType::Khip && !state.khip_available {
+            row.set_sensitive(false);
+            check.set_sensitive(false);
+        }
+
+        // Make the whole row clickable to toggle the CheckButton (standard
+        // AdwActionRow + radio pattern). When row.set_sensitive(false), this
+        // does nothing — the row swallows clicks. That's the fix.
+        row.add_prefix(&check);
+        row.set_activatable_widget(Some(&check));
+
+        // Per-row toggled handler. Fires for BOTH the row going inactive and
+        // the row going active in a radio group, so we filter on is_active().
+        {
+            let tx = event_tx.clone();
+            let updating_cb = updating.clone();
+            let khip_available = state.khip_available;
+            check.connect_toggled(move |btn| {
+                // Skip the "deactivating" half of the radio toggle — only the
+                // row gaining selection should send an event.
+                if !btn.is_active() {
+                    return;
+                }
+                // Guard against programmatic mutations from set_engine().
+                if updating_cb.get() {
+                    return;
+                }
+                // Belt-and-suspenders: even if some future code path makes
+                // the unavailable Khip row sensitive, refuse to dispatch.
+                if engine == EngineType::Khip && !khip_available {
+                    return;
+                }
+                if tx.send(UiEvent::EngineChanged(engine)).is_err() {
+                    log::warn!("UI event channel closed - EngineChanged dropped");
+                }
+            });
+        }
+
+        group.add(&row);
+        rows.push((engine, row, check));
+    }
+
+    EngineSelector { group, rows, updating }
 }
 
 // ── Strength level helpers (shared by all engines) ────────────────────────────
@@ -652,11 +750,9 @@ impl WindowHandles {
     /// `state` should be constructed from the current `Config` via
     /// `UiState::from_config`.
     pub fn update_from_state(&self, state: &UiState) {
-        // Engine selector
-        let engine_idx = engine_to_index(state.engine);
-        if self.engine_row.selected() != engine_idx {
-            self.engine_row.set_selected(engine_idx);
-        }
+        // Engine selector — set_engine is a no-op if the matching row is already
+        // active, and uses a guard flag internally so it never re-emits EngineChanged.
+        self.engine_selector.set_engine(state.engine);
 
         // Strength level (3-step, same for all engines)
         let level_idx = strength_to_level_index(state.strength);
