@@ -62,6 +62,9 @@ msgstr "L'algorithme utilisé pour filtrer le bruit"
 msgid "Khip (not installed)"
 msgstr "Khip (non installé)"
 
+msgid "Not detected — copy libkhip.so to ~/.local/lib/"
+msgstr "Non détecté — copiez libkhip.so dans ~/.local/lib/"
+
 msgid "Noise suppression"
 msgstr "Suppression du bruit"
 

@@ -231,6 +231,7 @@ impl EngineSelector {
             if *engine == EngineType::Khip {
                 if available {
                     row.set_title(engine_label(EngineType::Khip));
+                    row.set_subtitle(&engine_subtitle(EngineType::Khip));
                     row.set_sensitive(true);
                     check.set_sensitive(true);
                 } else {
@@ -239,6 +240,7 @@ impl EngineSelector {
                     // (e.g., a manual "Re-detect Khip" debug button) work
                     // without a refactor.
                     row.set_title(&tr!("Khip (not installed)"));
+                    row.set_subtitle(&tr!("Not detected — copy libkhip.so to ~/.local/lib/"));
                     row.set_sensitive(false);
                     check.set_sensitive(false);
                 }
@@ -695,7 +697,12 @@ fn build_engine_selector(
             engine_label(engine).to_owned()
         };
         row.set_title(&title);
-        row.set_subtitle(&engine_subtitle(engine));
+        let subtitle = if engine == EngineType::Khip && !state.khip_available {
+            tr!("Not detected — copy libkhip.so to ~/.local/lib/")
+        } else {
+            engine_subtitle(engine)
+        };
+        row.set_subtitle(&subtitle);
 
         let check = gtk4::CheckButton::new();
         check.set_valign(gtk4::Align::Center);
