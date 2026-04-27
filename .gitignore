@@ -1,6 +1,10 @@
 /target
 /build
 
+# uruntime AppImage runtime stub cache (libfuse3-compatible — Ubuntu 26.04 fix)
+# Already covered by /build, but explicit so future maintainers don't narrow that rule.
+/build/tools/uruntime/
+
 # Repo-root convenience symlink to the freshly-built AppImage in build/
 /CleanMic.AppImage
 

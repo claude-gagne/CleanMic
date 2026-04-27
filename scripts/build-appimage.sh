@@ -34,6 +34,18 @@ OUTPUT="$BUILD_DIR/CleanMic-x86_64.AppImage"
 APPIMAGETOOL="$TOOLS_DIR/appimagetool"
 APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
 
+# ── uruntime pin (Ubuntu 26.04 compat — see .planning/quick/260427-ebz-…/) ───
+# uruntime is a libfuse3-compatible, statically-linked AppImage runtime stub.
+# Default appimagetool runtime is libfuse2-only and breaks on default Ubuntu 26.04
+# installs (libfuse2t64 lives in universe, not in the default desktop install set).
+# We hand uruntime to appimagetool via --runtime-file in Step 8.
+URUNTIME_VERSION="v0.5.7"
+URUNTIME_FILENAME="uruntime-appimage-squashfs-x86_64"
+URUNTIME_URL="https://github.com/VHSgunzo/uruntime/releases/download/${URUNTIME_VERSION}/${URUNTIME_FILENAME}"
+URUNTIME_CACHE_DIR="$TOOLS_DIR/uruntime/${URUNTIME_VERSION}"
+URUNTIME_BIN="$URUNTIME_CACHE_DIR/$URUNTIME_FILENAME"
+URUNTIME_SHA_SIDECAR="$URUNTIME_BIN.sha256"
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 info()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m==> %s\033[0m\n' "$*"; }
@@ -161,20 +173,82 @@ if [ ! -x "$APPIMAGETOOL" ]; then
     chmod +x "$APPIMAGETOOL"
 fi
 
+# ── Step 7b: Download / cache / verify uruntime ──────────────────────────────
+# Two phases: download-if-missing, then SHA256 verify-or-establish (TOFU).
+#
+# TOFU semantics (per plan constraints — different from sibling "mining" project):
+#   - First download: compute hash, persist sidecar (sha256sum-compatible format).
+#   - Subsequent runs: verify cached binary against sidecar via `sha256sum -c`.
+#   - Mismatch: ERROR with clear message; do NOT auto-redownload (could be
+#     tampering OR cache corruption — let the operator decide).
+#   - Missing sidecar but binary present (e.g. partial older cache, or a clean
+#     checkout where someone hand-copied the binary): defensively recompute +
+#     persist the sidecar; don't crash.
+info "Verifying uruntime cache..."
+
+mkdir -p "$URUNTIME_CACHE_DIR"
+
+if [ ! -f "$URUNTIME_BIN" ]; then
+    info "  Cache miss — downloading $URUNTIME_FILENAME ($URUNTIME_VERSION)..."
+    if command -v wget &>/dev/null; then
+        wget -q --show-progress -O "$URUNTIME_BIN.tmp" "$URUNTIME_URL"
+    elif command -v curl &>/dev/null; then
+        curl -fsSL -o "$URUNTIME_BIN.tmp" "$URUNTIME_URL"
+    else
+        error "Neither wget nor curl found. Cannot download uruntime."
+    fi
+    mv "$URUNTIME_BIN.tmp" "$URUNTIME_BIN"
+    # uruntime release asset ships with mode 0644; needs +x for some toolchains
+    # to read it as an executable header. (Sibling project's spike caught this.)
+    chmod +x "$URUNTIME_BIN"
+
+    # First-download TOFU: compute and persist the sidecar.
+    actual_sha=$(sha256sum "$URUNTIME_BIN" | awk '{print $1}')
+    printf '%s  %s\n' "$actual_sha" "$URUNTIME_FILENAME" > "$URUNTIME_SHA_SIDECAR"
+    info "  Downloaded $(du -h "$URUNTIME_BIN" | cut -f1) -> $URUNTIME_BIN"
+    info "  TOFU sidecar pinned: $actual_sha"
+else
+    # Cache hit — sidecar must exist (TOFU). If it doesn't, recompute defensively.
+    if [ ! -f "$URUNTIME_SHA_SIDECAR" ]; then
+        warn "  Cache hit but sidecar missing — recomputing (defensive TOFU)."
+        actual_sha=$(sha256sum "$URUNTIME_BIN" | awk '{print $1}')
+        printf '%s  %s\n' "$actual_sha" "$URUNTIME_FILENAME" > "$URUNTIME_SHA_SIDECAR"
+        info "  Sidecar recomputed: $actual_sha"
+    fi
+
+    # Verify cached binary against sidecar — fail hard on mismatch.
+    # Run sha256sum -c from the cache dir so it reads the bare filename in the sidecar.
+    if ! ( cd "$URUNTIME_CACHE_DIR" && sha256sum -c "$(basename "$URUNTIME_SHA_SIDECAR")" --status ); then
+        echo ""
+        error "uruntime SHA256 mismatch.
+    cached file:  $URUNTIME_BIN
+    sidecar:      $URUNTIME_SHA_SIDECAR
+  Either the cache is corrupted/tampered, or the sidecar is stale.
+  To re-establish TOFU: rm -rf \"$URUNTIME_CACHE_DIR\" && re-run this script."
+    fi
+    info "  Cache hit: $URUNTIME_BIN (SHA256 verified)"
+fi
+
+info "Using uruntime $URUNTIME_VERSION as AppImage runtime (libfuse3-compatible)"
+
 # ── Step 8: Build AppImage ───────────────────────────────────────────────────
 info "Building AppImage..."
 
 # appimagetool requires FUSE to run as an AppImage itself.
 # If FUSE is not available, try extracting and running directly.
+# --runtime-file hands appimagetool the uruntime stub (libfuse3-compatible) so
+# the resulting AppImage launches on default Ubuntu 26.04 (no libfuse2t64 needed).
 if "$APPIMAGETOOL" --version &>/dev/null 2>&1; then
-    ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+    ARCH=x86_64 "$APPIMAGETOOL" --runtime-file "$URUNTIME_BIN" "$APPDIR" "$OUTPUT"
 else
     warn "appimagetool cannot run directly (FUSE may be missing)."
     warn "Trying --appimage-extract-and-run workaround..."
-    ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$OUTPUT"
+    ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run \
+        --runtime-file "$URUNTIME_BIN" "$APPDIR" "$OUTPUT"
 fi
 
 info "AppImage created: $OUTPUT"
 info "Size: $(du -h "$OUTPUT" | cut -f1)"
+info "Runtime: uruntime $URUNTIME_VERSION (libfuse3 — works on Ubuntu 24.04 + 26.04)"
 info ""
 info "To run:  chmod +x $OUTPUT && ./$OUTPUT"
