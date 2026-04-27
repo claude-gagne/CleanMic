@@ -148,7 +148,18 @@ pub(crate) fn send_throttled_notification(
 /// resolve to the correct locale. Falls back gracefully: if locale files
 /// are missing, strings appear in English.
 fn init_i18n() {
-    use gettextrs::{bind_textdomain_codeset, bindtextdomain, textdomain};
+    use gettextrs::{
+        bind_textdomain_codeset, bindtextdomain, setlocale, textdomain, LocaleCategory,
+    };
+
+    // Bind the process locale from the environment ($LANG / $LC_ALL / $LC_MESSAGES)
+    // before any gettext lookup. Without this, LC_MESSAGES stays at "C" until
+    // gtk_init runs setlocale itself — too late for the ksni tray thread, whose
+    // first menu() query would otherwise cache English labels in the panel until
+    // a state change forced a re-query (Ubuntu 26.04 UAT bug #2).
+    if setlocale(LocaleCategory::LcAll, "").is_none() {
+        log::warn!("gettext setlocale(LC_ALL, \"\") returned None — locale may stay at C");
+    }
 
     let locale_dir = std::env::var("APPDIR")
         .map(|d| std::path::PathBuf::from(d).join("usr/share/locale"))
