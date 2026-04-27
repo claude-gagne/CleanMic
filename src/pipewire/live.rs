@@ -1029,19 +1029,17 @@ fn unlink_all_into_cleanmic_capture() {
     }
 }
 
-/// Read the user's configured default audio sink from PipeWire metadata.
+/// Read a single pw-metadata key from the "default" metadata object and parse
+/// its `{"name": "..."}` JSON value.
 ///
-/// Returns the node name listed in `default.configured.audio.sink` — this is
-/// the sink the user selected in GNOME Sound Settings (or equivalent). It
-/// differs from `default.audio.sink`, which reflects whatever sink the
-/// PipeWire graph currently routes to, and which can silently drift to a
-/// fallback device when the configured sink is temporarily unavailable.
-///
-/// Returns `None` if pw-metadata is unreachable or the key is unset.
-fn configured_default_sink() -> Option<String> {
+/// Returns `None` if pw-metadata is unreachable, exits non-zero, or no
+/// `update:` line for the key is present (which is what happens when the key
+/// has never been written — e.g. a fresh GNOME install where the user hasn't
+/// explicitly picked a default device).
+fn pw_metadata_name(key: &str) -> Option<String> {
     let output = std::process::Command::new("pw-metadata")
         .arg("0")
-        .arg("default.configured.audio.sink")
+        .arg(key)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1049,7 +1047,7 @@ fn configured_default_sink() -> Option<String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     // pw-metadata prints lines like:
-    //   update: id:0 key:'default.configured.audio.sink' value:'{"name":"<sink>"}' type:'Spa:String:JSON'
+    //   update: id:0 key:'<key>' value:'{"name":"<node>"}' type:'Spa:String:JSON'
     // Parse out the JSON value and extract "name".
     for line in stdout.lines() {
         let Some(start) = line.find("value:'") else { continue };
@@ -1064,37 +1062,37 @@ fn configured_default_sink() -> Option<String> {
     None
 }
 
-/// Read the user's configured default audio source from PipeWire metadata.
+/// Read the default audio sink from PipeWire metadata.
 ///
-/// Returns the node name listed in `default.configured.audio.source` — this is
-/// the source the user selected in GNOME Sound Settings (or equivalent). It
-/// differs from `default.audio.source`, which reflects whatever source the
-/// PipeWire graph currently routes to, and which can silently drift to a
-/// fallback device when the configured source is temporarily unavailable.
+/// Prefers `default.configured.audio.sink` (the user's explicit GNOME Sound
+/// Settings choice, which doesn't drift if the device is temporarily
+/// unavailable) and falls back to `default.audio.sink` (the runtime
+/// auto-resolved default) when no configured sink has been written. The
+/// fallback matters on fresh installs where the user has never opened Sound
+/// Settings — in that case only the runtime key is populated.
 ///
-/// Returns `None` if pw-metadata is unreachable or the key is unset.
+/// Returns `None` if pw-metadata is unreachable or both keys are unset.
+fn configured_default_sink() -> Option<String> {
+    pw_metadata_name("default.configured.audio.sink")
+        .or_else(|| pw_metadata_name("default.audio.sink"))
+}
+
+/// Read the default audio source from PipeWire metadata.
+///
+/// Prefers `default.configured.audio.source` (the user's explicit GNOME Sound
+/// Settings choice) and falls back to `default.audio.source` (the runtime
+/// auto-resolved default) when no configured source has been written. The
+/// fallback is essential on fresh GNOME installs (e.g. Ubuntu 26.04 out of
+/// the box) where the configured key is never populated until the user
+/// touches the input picker, so without the fallback the mic-picker's
+/// "Default (Mic)" row would silently disappear.
+///
+/// Self-loop safety: callers cross-check this name against
+/// `list_input_devices()` (which excludes CleanMic), so even if the runtime
+/// default points at CleanMic the upstream resolver discards it.
+///
+/// Returns `None` if pw-metadata is unreachable or both keys are unset.
 pub(crate) fn configured_default_source() -> Option<String> {
-    let output = std::process::Command::new("pw-metadata")
-        .arg("0")
-        .arg("default.configured.audio.source")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // pw-metadata prints lines like:
-    //   update: id:0 key:'default.configured.audio.source' value:'{"name":"<source>"}' type:'Spa:String:JSON'
-    // Parse out the JSON value and extract "name".
-    for line in stdout.lines() {
-        let Some(start) = line.find("value:'") else { continue };
-        let rest = &line[start + 7..];
-        let Some(end) = rest.find('\'') else { continue };
-        let json_str = &rest[..end];
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
-        if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-            return Some(name.to_string());
-        }
-    }
-    None
+    pw_metadata_name("default.configured.audio.source")
+        .or_else(|| pw_metadata_name("default.audio.source"))
 }

@@ -72,8 +72,18 @@ fn current_system_default_name(
     pw: &PipeWireManager,
     devices: &[InputDevice],
 ) -> Option<String> {
-    pw.configured_default_source()
-        .filter(|name| devices.iter().any(|d| d.name == *name))
+    let raw = pw.configured_default_source();
+    let resolved = raw
+        .as_ref()
+        .filter(|name| devices.iter().any(|d| &d.name == *name))
+        .cloned();
+    log::debug!(
+        "current_system_default_name: pw-metadata raw={:?} -> resolved={:?} (devices={})",
+        raw,
+        resolved,
+        devices.len()
+    );
+    resolved
 }
 
 /// Resolve the initial capture target at startup or reconnect.

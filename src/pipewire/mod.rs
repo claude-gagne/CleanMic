@@ -282,12 +282,15 @@ impl PipeWireManager {
         self.capture_reader.take()
     }
 
-    /// Query the user's configured default audio source from PipeWire metadata.
+    /// Query the user's default audio source from PipeWire metadata.
     ///
-    /// Returns the PipeWire node name listed in `default.configured.audio.source`
-    /// — the source the user selected in GNOME Sound Settings. Returns `None`
-    /// if pw-metadata is unreachable, the key is unset, or the `pipewire`
-    /// feature is disabled.
+    /// Returns the node name listed in `default.configured.audio.source` (the
+    /// user's explicit GNOME Sound Settings choice) when available, otherwise
+    /// falls back to `default.audio.source` (the runtime auto-resolved
+    /// default). The fallback matters on fresh GNOME installs where the
+    /// configured key is never populated until the user touches the input
+    /// picker. Returns `None` if pw-metadata is unreachable, both keys are
+    /// unset, or the `pipewire` feature is disabled.
     pub fn configured_default_source(&self) -> Option<String> {
         #[cfg(feature = "pipewire")]
         {
