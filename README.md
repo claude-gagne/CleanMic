@@ -37,7 +37,7 @@
 - x86_64 Linux with **PipeWire** and **glibc ≥ 2.39**
 - **GTK4 + libadwaita** (standard on GNOME; install `libadwaita-1-0` on KDE / XFCE / Cinnamon desktops)
 
-**Tested on:** Ubuntu 24.04 LTS.
+**Tested on:** Ubuntu 24.04 LTS, Ubuntu 26.04 LTS.
 
 **Should also work on Ubuntu 24.04+ flavors** (same base, not directly tested): Kubuntu, Xubuntu, Ubuntu MATE, Pop!_OS, Linux Mint 22, elementary OS 8, KDE Neon.
 
