@@ -51,6 +51,48 @@ Other modern Linux distros (Fedora 40+, Debian 13, Bazzite, Arch, openSUSE Tumbl
 - **Linux only** - no Windows or macOS
 - **Khip engine is optional** - requires a user-supplied library, not bundled
 
+## Using Khip
+
+The Khip engine is user-supplied — CleanMic does not ship the library
+because its license forbids redistribution. To enable Khip:
+
+1. Build Khip from upstream source:
+
+    ```bash
+    git clone https://github.com/repository/khip
+    cd khip
+    meson setup build
+    cd build
+    ninja
+    ```
+
+2. Copy the resulting library into a directory CleanMic searches:
+
+    ```bash
+    cp build/libkhip.so ~/.local/lib/
+    ```
+
+    CleanMic searches `/usr/lib`, `/usr/lib/x86_64-linux-gnu`,
+    `/usr/local/lib`, and `~/.local/lib` — `~/.local/lib` is the
+    recommended target because it requires no `sudo` and is
+    per-user.
+
+3. CleanMic auto-detects within ~1.5 seconds — no relaunch needed.
+   The "Khip (not installed)" row in the engine selector flips to
+   plain "Khip" and becomes selectable.
+
+**Troubleshooting:** if the Khip row stays grayed, run CleanMic with
+logging enabled and grep for the discovery message:
+
+```bash
+RUST_LOG=info ./CleanMic-x86_64.AppImage 2>&1 | grep -i khip
+```
+
+The line `Khip library not found in any of: ...` confirms CleanMic
+did not see the library — re-check that `libkhip.so` (not
+`libkhip.so.0` or a versioned symlink) is at one of the four search
+paths.
+
 ## Building from Source
 
 ```bash
