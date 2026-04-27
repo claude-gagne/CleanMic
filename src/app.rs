@@ -1574,6 +1574,14 @@ fn run_with_gui(
                     .map(|d| d.name.clone())
                     .collect(),
             )));
+            // Track whether Khip has been detected at runtime so the re-poll
+            // inside the 1500ms timer can early-return once detected. Seeded
+            // from the construction-time UiState value so the first tick is a
+            // no-op when libkhip.so was already present at boot — no spurious
+            // info log line, no extra is_engine_available calls. Per parent
+            // todo Option E (260427-cgu): one-way flip only; never reverts to
+            // false even if the user removes the lib.
+            let khip_detected: Rc<Cell<bool>> = Rc::new(Cell::new(initial_state.khip_available));
             glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
                 let devices = {
                     let pw_ref = pw_timer_slow.borrow();
@@ -1724,6 +1732,20 @@ fn run_with_gui(
                             *current_capture_target_slow.borrow_mut() = None;
                         }
                     }
+                }
+
+                // ── Khip runtime re-detection (parent todo Option E, 260427-cgu) ──
+                // Until first detection, re-call engine::is_engine_available(Khip)
+                // on every tick and flip the EngineSelector when libkhip.so
+                // appears. After detection, this block early-returns with no
+                // I/O. One-way flip — never reverts to false (engine init
+                // handles late-removal via the D-02 fallback chain).
+                if !khip_detected.get() && engine::is_engine_available(EngineType::Khip) {
+                    khip_detected.set(true);
+                    handles_timer_slow.engine_selector.set_khip_available(true);
+                    log::info!(
+                        "Khip: library detected at runtime — engine selector now enabled"
+                    );
                 }
 
                 glib::ControlFlow::Continue

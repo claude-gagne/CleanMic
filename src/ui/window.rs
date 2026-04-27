@@ -137,6 +137,13 @@ pub struct EngineSelector {
     /// instead of emitting a spurious `UiEvent::EngineChanged`. Mirror of the
     /// existing `device_updating` pattern (window.rs:216-219, 235-237, 702-705).
     updating: Rc<Cell<bool>>,
+    /// Live ground-truth flag for Khip availability. Captured by Rc into
+    /// each row's `connect_toggled` closure so the per-row "is Khip
+    /// available?" filter reflects runtime detection (set_khip_available),
+    /// not just the construction-time value of `state.khip_available`.
+    /// Per parent todo Option E (260427-cgu): hot-detect Khip without
+    /// requiring an app relaunch.
+    khip_available: Rc<Cell<bool>>,
 }
 
 impl EngineSelector {
@@ -183,6 +190,60 @@ impl EngineSelector {
                 false
             };
             row.set_sensitive(allow);
+        }
+    }
+
+    /// Mark Khip as available at runtime, after construction-time detection
+    /// returned false but a subsequent re-poll succeeded. Called from the
+    /// 1500ms UI tick in src/app.rs once `engine::is_engine_available` flips
+    /// to true.
+    ///
+    /// One-way only in practice: this method intentionally has no callers
+    /// flipping it back to `false`. The parent todo (260427-cgu, Option E)
+    /// calls out that we leave khip_available=true for the rest of the session
+    /// even if the user removes the library — engine init will fail cleanly
+    /// via the D-02 fallback chain if they try to switch to Khip after
+    /// deletion.
+    ///
+    /// Effects when flipped to `true`:
+    ///   1. The internal `khip_available` cell flips so the per-row
+    ///      connect_toggled closure stops swallowing user clicks on the
+    ///      Khip row.
+    ///   2. The Khip row's title flips from "Khip (not installed)" to
+    ///      plain "Khip", giving the user a clear visual signal.
+    ///   3. Both the Khip ActionRow and its CheckButton flip to
+    ///      sensitive=true, so the row becomes clickable.
+    ///
+    /// Does NOT fire `UiEvent::EngineChanged`: the row state is mutated
+    /// without touching its CheckButton.is_active() flag, so no
+    /// connect_toggled handler runs (mirrors the existing `updating` guard
+    /// pattern used by `set_engine`).
+    pub fn set_khip_available(&self, available: bool) {
+        // Idempotent — the timer calls this exactly once on flip, but the
+        // defensive guard makes the method safe to call from any future path.
+        if self.khip_available.get() == available {
+            return;
+        }
+        self.khip_available.set(available);
+
+        // Find the Khip row and flip the visible state.
+        for (engine, row, check) in &self.rows {
+            if *engine == EngineType::Khip {
+                if available {
+                    row.set_title(engine_label(EngineType::Khip));
+                    row.set_sensitive(true);
+                    check.set_sensitive(true);
+                } else {
+                    // Defensive — currently unreachable per the one-way
+                    // contract above. Kept symmetric so future callers
+                    // (e.g., a manual "Re-detect Khip" debug button) work
+                    // without a refactor.
+                    row.set_title(&tr!("Khip (not installed)"));
+                    row.set_sensitive(false);
+                    check.set_sensitive(false);
+                }
+                return;
+            }
         }
     }
 }
@@ -604,6 +665,11 @@ fn build_engine_selector(
     group.set_title(&tr!("Noise Processing"));
 
     let updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Live khip-available cell shared with each row's connect_toggled closure
+    // and with `set_khip_available()`. Seeded from the construction-time
+    // detection so behavior is identical to the previous frozen-by-value
+    // capture when no runtime flip occurs (per 260427-cgu Option E).
+    let khip_available: Rc<Cell<bool>> = Rc::new(Cell::new(state.khip_available));
     let mut rows: Vec<(EngineType, libadwaita::ActionRow, gtk4::CheckButton)> =
         Vec::with_capacity(3);
 
@@ -663,7 +729,11 @@ fn build_engine_selector(
         {
             let tx = event_tx.clone();
             let updating_cb = updating.clone();
-            let khip_available = state.khip_available;
+            // Rc clone of the live cell so the runtime flip via
+            // EngineSelector::set_khip_available() is observable here. Before
+            // 260427-cgu this was a frozen-by-value `let khip_available =
+            // state.khip_available;` capture which prevented hot-detection.
+            let khip_available_cb = khip_available.clone();
             check.connect_toggled(move |btn| {
                 // Skip the "deactivating" half of the radio toggle — only the
                 // row gaining selection should send an event.
@@ -676,7 +746,7 @@ fn build_engine_selector(
                 }
                 // Belt-and-suspenders: even if some future code path makes
                 // the unavailable Khip row sensitive, refuse to dispatch.
-                if engine == EngineType::Khip && !khip_available {
+                if engine == EngineType::Khip && !khip_available_cb.get() {
                     return;
                 }
                 if tx.send(UiEvent::EngineChanged(engine)).is_err() {
@@ -689,7 +759,7 @@ fn build_engine_selector(
         rows.push((engine, row, check));
     }
 
-    EngineSelector { group, rows, updating }
+    EngineSelector { group, rows, updating, khip_available }
 }
 
 // ── Strength level helpers (shared by all engines) ────────────────────────────
