@@ -31,6 +31,7 @@
 use super::{NoiseEngine, ProcessingMode};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod ffi;
 
@@ -39,6 +40,12 @@ const KHIP_LIB_NAME: &str = "libkhip.so";
 
 /// Directories where the Khip library is allowed to be loaded from.
 const ALLOWED_DIRS: &[&str] = &["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib"];
+
+/// Process-wide gate: ensures the human-readable "library not found"
+/// summary is emitted at most once per process, even though the 1500ms
+/// hot-detect re-poll in src/app.rs calls find_library() repeatedly
+/// while Khip stays undetected. Per parent todo Option A.
+static WARN_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Validate that a library path is safe to load.
 pub fn validate_library_path(path: &Path) -> Result<()> {
@@ -103,7 +110,17 @@ pub fn find_library() -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    log::debug!("Khip: library not found");
+    if WARN_EMITTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        log::warn!(
+            "Khip library not found in any of: /usr/lib, /usr/lib/x86_64-linux-gnu, /usr/local/lib, ~/.local/lib. \
+             To enable Khip, copy libkhip.so to ~/.local/lib/ (no system install required)."
+        );
+    } else {
+        log::debug!("Khip: library not found");
+    }
     None
 }
 
@@ -477,5 +494,23 @@ mod tests {
         // Should not panic; output may be silence during warmup.
 
         engine.teardown();
+    }
+
+    /// Test-only accessor for the WARN_EMITTED gate so tests can verify
+    /// the warn-once contract without capturing log output.
+    #[allow(dead_code)]
+    pub(super) fn warn_emitted_for_test() -> bool {
+        WARN_EMITTED.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn find_library_does_not_panic_on_repeat_calls() {
+        // The 1500ms hot-detect timer relies on find_library() being
+        // idempotent — same result across calls, no panics.
+        let r1 = find_library();
+        let r2 = find_library();
+        let r3 = find_library();
+        assert_eq!(r1.is_some(), r2.is_some());
+        assert_eq!(r2.is_some(), r3.is_some());
     }
 }
