@@ -81,8 +81,11 @@ because its license forbids redistribution. To enable Khip:
    The "Khip (not installed)" row in the engine selector flips to
    plain "Khip" and becomes selectable.
 
-**Troubleshooting:** if the Khip row stays grayed, run CleanMic with
-logging enabled and grep for the discovery message:
+## Troubleshooting
+
+### Khip row stays grayed after copying `libkhip.so`
+
+Run CleanMic with logging enabled and grep for the discovery message:
 
 ```bash
 RUST_LOG=info ./CleanMic-x86_64.AppImage 2>&1 | grep -i khip
@@ -91,7 +94,26 @@ RUST_LOG=info ./CleanMic-x86_64.AppImage 2>&1 | grep -i khip
 The line `Khip library not found in any of: ...` confirms CleanMic
 did not see the library — re-check that `libkhip.so` (not
 `libkhip.so.0` or a versioned symlink) is at one of the four search
-paths.
+paths: `/usr/lib`, `/usr/lib/x86_64-linux-gnu`, `/usr/local/lib`,
+or `~/.local/lib`.
+
+### `deep_filter_ladspa | Underrun detected` warnings at `RUST_LOG=info`
+
+When DeepFilterNet is the active engine and you run with
+`RUST_LOG=info`, you may see lines like:
+
+```
+WARN  deep_filter_ladspa | Underrun detected (RTF: 1.63). Processing too slow!
+INFO  deep_filter_ladspa | Increasing processing latency to 10.0ms
+```
+
+This is expected upstream telemetry from the DeepFilterNet LADSPA
+plugin's dynamic-latency-manager, not a CleanMic bug. The plugin
+starts at 0ms latency, bumps by 10ms on a single-frame underrun to
+self-heal, and retries dropping back down every ~10s until it finds
+the lowest sustainable latency for your hardware. Audible impact is
+roughly one frame (~10ms) per event — imperceptible on voice calls.
+Same upstream behavior since DeepFilterNet v1.0.0.
 
 ## Building from Source
 
