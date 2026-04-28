@@ -107,7 +107,7 @@ WARN  deep_filter_ladspa | Underrun detected (RTF: 1.63). Processing too slow!
 INFO  deep_filter_ladspa | Increasing processing latency to 10.0ms
 ```
 
-This is expected upstream telemetry from the DeepFilterNet LADSPA
+This is expected log output from the DeepFilterNet LADSPA
 plugin's dynamic-latency-manager, not a CleanMic bug. The plugin
 starts at 0ms latency, bumps by 10ms on a single-frame underrun to
 self-heal, and retries dropping back down every ~10s until it finds
