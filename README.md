@@ -72,10 +72,12 @@ because its license forbids redistribution. To enable Khip:
     cp build/libkhip.so ~/.local/lib/
     ```
 
-    CleanMic searches `/usr/lib`, `/usr/lib/x86_64-linux-gnu`,
-    `/usr/local/lib`, and `~/.local/lib` — `~/.local/lib` is the
-    recommended target because it requires no `sudo` and is
-    per-user.
+    CleanMic searches (in order): `~/.local/lib`, `/usr/local/lib`,
+    `/usr/local/lib64`, `/usr/lib`, `/usr/lib/x86_64-linux-gnu`, and
+    `/usr/lib64`. `~/.local/lib` is the recommended target because it
+    requires no `sudo` and works on every distro. For a system-wide
+    install, use `/usr/lib64/` on RPM distros (Fedora, openSUSE, RHEL,
+    Rocky, Alma) or `/usr/lib/` on Debian-family distros (Debian, Ubuntu).
 
 3. CleanMic auto-detects within ~1.5 seconds — no relaunch needed.
    The "Khip (not installed)" row in the engine selector flips to
@@ -93,9 +95,9 @@ RUST_LOG=info ./CleanMic-x86_64.AppImage 2>&1 | grep -i khip
 
 The line `Khip library not found in any of: ...` confirms CleanMic
 did not see the library — re-check that `libkhip.so` (not
-`libkhip.so.0` or a versioned symlink) is at one of the four search
-paths: `/usr/lib`, `/usr/lib/x86_64-linux-gnu`, `/usr/local/lib`,
-or `~/.local/lib`.
+`libkhip.so.0` or a versioned symlink) is at one of the six search
+paths: `~/.local/lib`, `/usr/local/lib`, `/usr/local/lib64`,
+`/usr/lib`, `/usr/lib/x86_64-linux-gnu`, or `/usr/lib64`.
 
 ### `deep_filter_ladspa | Underrun detected` warnings at `RUST_LOG=info`
 
