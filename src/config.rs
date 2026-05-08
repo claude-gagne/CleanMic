@@ -51,6 +51,16 @@ pub struct Config {
     /// Set to `true` after the first notification so it is only shown once.
     pub tray_absent_notified: bool,
 
+    /// Whether the "CleanMic is running" desktop notification has been shown
+    /// after a hidden autostart launch. Set to `true` after the first hidden
+    /// launch so subsequent autostart-hidden launches are silent.
+    ///
+    /// Kept separate from `tray_hint_shown` (which fires on the close button)
+    /// because the two events are user-triggered vs. system-triggered and a
+    /// user who has only ever closed-with-tray-hint-shown should still get
+    /// the autostart-hidden-launch notification on the first such launch.
+    pub autostart_hidden_notified: bool,
+
     /// The most recent update version the user has been notified about.
     ///
     /// Set to the tag string (e.g. "v1.2.0") after the first banner/desktop
@@ -79,6 +89,7 @@ impl Default for Config {
             khip_library_path: None,
             tray_hint_shown: false,
             tray_absent_notified: false,
+            autostart_hidden_notified: false,
             last_seen_update_version: None,
         }
     }
@@ -202,6 +213,7 @@ mod tests {
             khip_library_path: None,
             tray_hint_shown: false,
             tray_absent_notified: false,
+            autostart_hidden_notified: false,
             last_seen_update_version: None,
         };
         original.save_to(&path).expect("save failed");
@@ -263,6 +275,16 @@ mod tests {
         std::fs::write(&path, "engine = \"RNNoise\"\nstrength = 0.5\n").unwrap();
         let cfg = Config::load_from(&path).expect("load failed");
         assert_eq!(cfg.last_seen_update_version, None);
+    }
+
+    #[test]
+    fn autostart_hidden_notified_defaults_to_false_from_partial_toml() {
+        let (_tmp, path) = temp_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Old config file (pre-260508-k7q) without this field — should load as false.
+        std::fs::write(&path, "engine = \"RNNoise\"\nstrength = 0.5\n").unwrap();
+        let cfg = Config::load_from(&path).expect("load failed");
+        assert!(!cfg.autostart_hidden_notified);
     }
 
     #[test]

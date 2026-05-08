@@ -217,6 +217,7 @@ mod tests {
             khip_library_path: None,
             tray_hint_shown: false,
             tray_absent_notified: false,
+            autostart_hidden_notified: false,
             last_seen_update_version: None,
         };
 
