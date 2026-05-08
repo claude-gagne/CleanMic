@@ -61,6 +61,11 @@ fn desktop_entry_content() -> Result<String> {
 }
 
 /// Generate desktop entry content with a specific `Exec` path.
+///
+/// Used for the **manual launcher** entry that lives in
+/// `~/.local/share/applications/`. Clicking the launcher icon should always
+/// show the main window — so the `Exec=` line has no `--autostart` argument.
+/// See [`desktop_entry_content_with_exec_autostart`] for the autostart variant.
 fn desktop_entry_content_with_exec(exec_path: &str) -> String {
     format!(
         "\
@@ -76,6 +81,50 @@ StartupWMClass={APP_ID}
 Terminal=false
 "
     )
+}
+
+/// Generate desktop entry content for the **autostart** entry that lives in
+/// `~/.config/autostart/`.
+///
+/// Identical to [`desktop_entry_content_with_exec`] except the `Exec=` line
+/// appends ` --autostart`. The CLI flag is parsed in `src/main.rs` and
+/// threaded into `run_with_gui` so the activate closure can switch to the
+/// hide-if-tray policy (see [`crate::app::should_hide_main_window_on_autostart`]).
+///
+/// Why a split helper: if the manual launcher entry also got `--autostart`,
+/// clicking the app-menu icon would fire the autostart hidden-launch policy
+/// (wrong UX — user expected the window to appear because they clicked).
+fn desktop_entry_content_with_exec_autostart(exec_path: &str) -> String {
+    format!(
+        "\
+[Desktop Entry]
+Type=Application
+Name=CleanMic
+Comment=Noise-free virtual microphone
+Exec={exec_path} --autostart
+Icon={APP_ID}
+Categories=Audio;AudioVideo;
+StartupNotify=false
+StartupWMClass={APP_ID}
+Terminal=false
+"
+    )
+}
+
+/// Resolve the `Exec=` path the same way [`desktop_entry_content`] does, then
+/// build the autostart-flavoured entry. See [`desktop_entry_content`] for the
+/// `$APPIMAGE` vs `current_exe()` rationale.
+fn desktop_entry_content_autostart() -> Result<String> {
+    let exec = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|p| Path::new(p).exists())
+        .map(Ok)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .context("failed to determine current executable path")
+                .map(|p| p.display().to_string())
+        })?;
+    Ok(desktop_entry_content_with_exec_autostart(&exec))
 }
 
 /// Install the desktop entry in a given directory, creating parent dirs as
@@ -192,9 +241,15 @@ fn install_desktop_integration_in(applications_dir: &Path, icons_dir: &Path) -> 
 }
 
 fn enable_autostart_in(autostart_dir: &Path, applications_dir: &Path) -> Result<()> {
-    let content = desktop_entry_content()?;
-    install_desktop_entry(autostart_dir, &content)?;
-    install_desktop_entry(applications_dir, &content)?;
+    // The autostart entry must include `--autostart` so the binary can
+    // distinguish system-fired autostart launches (hide-if-tray policy)
+    // from manual launcher clicks (always show window). The applications
+    // entry deliberately does NOT include `--autostart` for the same reason.
+    // See `desktop_entry_content_with_exec_autostart` for the rationale.
+    let autostart_content = desktop_entry_content_autostart()?;
+    let applications_content = desktop_entry_content()?;
+    install_desktop_entry(autostart_dir, &autostart_content)?;
+    install_desktop_entry(applications_dir, &applications_content)?;
     Ok(())
 }
 
@@ -276,6 +331,12 @@ mod tests {
         assert!(content.contains("Exec="));
         assert!(content.contains("Icon=com.cleanmic.CleanMic"));
         assert!(content.contains("Categories=Audio;AudioVideo;"));
+        // Autostart entry must include `--autostart` so the binary applies
+        // the hide-if-tray policy (260508-k7q).
+        assert!(
+            content.contains("--autostart"),
+            "autostart entry must include --autostart arg; got:\n{content}"
+        );
     }
 
     #[test]
@@ -320,6 +381,39 @@ mod tests {
         let content = desktop_entry_content_with_exec("/usr/bin/cleanmic");
         assert!(content.contains("Exec=/usr/bin/cleanmic"));
         assert!(content.starts_with("[Desktop Entry]"));
+    }
+
+    /// The autostart-flavoured helper (~/.config/autostart/) MUST include
+    /// `--autostart` on the Exec= line so the binary knows it was launched
+    /// by the autostart hook and applies the hide-if-tray policy.
+    #[test]
+    fn autostart_entry_includes_autostart_arg() {
+        let content = desktop_entry_content_with_exec_autostart("/usr/bin/cleanmic");
+        assert!(
+            content.contains("Exec=/usr/bin/cleanmic --autostart"),
+            "expected single-space-separated --autostart; got:\n{content}"
+        );
+        // Must still produce a valid Desktop Entry stanza.
+        assert!(content.starts_with("[Desktop Entry]"));
+        assert!(content.contains("Icon=com.cleanmic.CleanMic"));
+        assert!(content.contains("StartupWMClass=com.cleanmic.CleanMic"));
+    }
+
+    /// The applications-entry helper (~/.local/share/applications/) MUST NOT
+    /// include `--autostart` — clicking the launcher icon is a manual
+    /// invocation that should always show the main window.
+    #[test]
+    fn applications_entry_does_not_include_autostart_arg() {
+        let content = desktop_entry_content_with_exec("/usr/bin/cleanmic");
+        // Exec line is followed by a newline (no trailing args).
+        assert!(
+            content.contains("Exec=/usr/bin/cleanmic\n"),
+            "expected bare Exec line with no args; got:\n{content}"
+        );
+        assert!(
+            !content.contains("--autostart"),
+            "applications entry must not include --autostart; got:\n{content}"
+        );
     }
 
     #[test]
@@ -367,5 +461,11 @@ mod tests {
         assert!(content.contains("Icon=com.cleanmic.CleanMic"));
         assert!(content.contains("StartupWMClass=com.cleanmic.CleanMic"));
         assert!(content.contains("StartupNotify=false"));
+        // Sanity-check the split (260508-k7q): the applications entry must
+        // NOT carry --autostart — that's reserved for the autostart entry only.
+        assert!(
+            !content.contains("--autostart"),
+            "applications entry leaked --autostart; got:\n{content}"
+        );
     }
 }
