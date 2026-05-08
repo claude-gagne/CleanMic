@@ -323,9 +323,30 @@ pub fn build_main_window(
         }
     });
 
+    // ── Autostart-no-tray banner (260508-k7q) ─────────────────────────────────
+    // Inline informational warning surfaced when the user toggles "Start on
+    // login" ON on a system that has no SNI tray watcher available. Without
+    // a tray, the autostart-fired binary cannot hide the main window (it
+    // would leave CleanMic invisible and unreachable), so the next login
+    // will pop a visible window. The banner explains that consequence at
+    // toggle time so the user can opt out if they don't want it.
+    //
+    // Stacked just below the existing `update_banner` in the root Box —
+    // banners can't be added to a PreferencesPage (the libadwaita API only
+    // accepts PreferencesGroups there), so we use the same root-Box pattern
+    // as `update_banner`. Both banners are independently revealable.
+    // Hidden by default; the autostart row's `connect_active_notify`
+    // (further down) toggles `set_revealed(active && !tray_available)`.
+    let autostart_no_tray_banner = Banner::new(&tr!(
+        "Your desktop doesn't appear to support tray icons. \
+         On login, CleanMic will start with the main window visible."
+    ));
+    autostart_no_tray_banner.set_revealed(false);
+
     let root = GBox::new(Orientation::Vertical, 0);
     root.append(&header);
     root.append(&update_banner);
+    root.append(&autostart_no_tray_banner);
     root.append(&clamp);
     window.set_content(Some(&root));
 
@@ -462,10 +483,22 @@ pub fn build_main_window(
     autostart_row.set_active(state.autostart);
     {
         let tx = event_tx.clone();
+        // Capture the no-tray banner so the toggle handler can reveal/hide it
+        // when the user flips the switch on a no-tray system. Banner is
+        // GObject-refcounted, so this clone bumps a refcount rather than
+        // deep-copying. Per quick task 260508-k7q.
+        let banner = autostart_no_tray_banner.clone();
         autostart_row.connect_active_notify(move |row: &SwitchRowRef| {
-            if tx.send(UiEvent::AutostartToggled(row.is_active())).is_err() {
+            let active = row.is_active();
+            if tx.send(UiEvent::AutostartToggled(active)).is_err() {
                 log::warn!("UI event channel closed - AutostartToggled dropped");
             }
+            // Reveal the banner only when toggling ON without a tray watcher.
+            // Toggling OFF hides it (covers the case where a previous
+            // ON-without-tray left it visible). Toggling ON with a tray never
+            // shows it — there's no surprise to warn about. Per CONTEXT.md
+            // "AdwBanner at toggle time is the only warning".
+            banner.set_revealed(active && !tray_available);
         });
     }
     settings_group.add(&autostart_row);
