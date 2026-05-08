@@ -54,7 +54,30 @@ fn main() -> anyhow::Result<()> {
     }));
 
     log::info!("CleanMic v{} starting", env!("CARGO_PKG_VERSION"));
-    cleanmic::app::run()
+
+    // Hand-rolled `--autostart` detection to keep the project lean (no clap
+    // dep). `--autostart` is the only flag the autostart `.desktop` Exec line
+    // appends — it is the signal that the binary was launched by the system's
+    // autostart hook (vs. a manual launcher click) and should switch to the
+    // hide-if-tray policy in `run_with_gui`.
+    let launched_via_autostart = parse_autostart_flag(std::env::args());
+    if launched_via_autostart {
+        log::info!("Launched via --autostart");
+    }
+
+    cleanmic::app::run(launched_via_autostart)
+}
+
+/// Return `true` if `--autostart` is present anywhere in the args iterator.
+///
+/// Matches the exact arg `--autostart` with no value form. Lifted into a
+/// helper purely so it can be unit-tested without invoking the GTK runtime.
+fn parse_autostart_flag<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|a| a.as_ref() == "--autostart")
 }
 
 #[cfg(test)]
@@ -67,5 +90,28 @@ mod tests {
         assert_eq!(std::env::var("OPENBLAS_NUM_THREADS").as_deref(), Ok("1"));
         assert_eq!(std::env::var("OMP_NUM_THREADS").as_deref(), Ok("1"));
         assert_eq!(std::env::var("FFTW_NUM_THREADS").as_deref(), Ok("1"));
+    }
+
+    #[test]
+    fn parse_autostart_flag_detects_the_flag() {
+        assert!(parse_autostart_flag(["cleanmic", "--autostart"]));
+    }
+
+    #[test]
+    fn parse_autostart_flag_returns_false_without_the_flag() {
+        assert!(!parse_autostart_flag(["cleanmic"]));
+    }
+
+    #[test]
+    fn parse_autostart_flag_does_not_match_substrings() {
+        // `--autostart-something` should NOT match `--autostart`.
+        assert!(!parse_autostart_flag(["cleanmic", "--autostart-foo"]));
+        assert!(!parse_autostart_flag(["cleanmic", "autostart"]));
+    }
+
+    #[test]
+    fn parse_autostart_flag_finds_flag_among_other_args() {
+        // Future-proofing: even if we add other flags later, --autostart is found.
+        assert!(parse_autostart_flag(["cleanmic", "--foo", "--autostart", "--bar"]));
     }
 }

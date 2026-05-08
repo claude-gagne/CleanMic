@@ -630,7 +630,14 @@ fn handle_tray_command(
 /// - On subsequent runs with enabled=true, auto-starts the pipeline
 /// - Main loop: polls for shutdown, dispatches UI events and tray commands
 /// - On shutdown: saves config, stops audio, destroys virtual mic
-pub fn run() -> Result<()> {
+///
+/// `launched_via_autostart` is `true` when the binary was started by the
+/// XDG autostart hook (`.desktop` file's `Exec=cleanmic --autostart`). It
+/// is `false` for manual launches (user double-clicked the icon, ran
+/// `cleanmic` from a shell, etc.). The flag is consumed by `run_with_gui`
+/// to decide whether to start with the main window hidden — see
+/// `should_hide_main_window_on_autostart` for the policy gate.
+pub fn run(launched_via_autostart: bool) -> Result<()> {
     // Initialize i18n before any UI construction so all tr!() calls resolve correctly.
     init_i18n();
 
@@ -820,11 +827,22 @@ pub fn run() -> Result<()> {
     // -- Run with GUI or headless --
     #[cfg(feature = "gui")]
     {
-        run_with_gui(config, pipeline, pw_manager, first_run, startup_no_input)?;
+        run_with_gui(
+            config,
+            pipeline,
+            pw_manager,
+            first_run,
+            startup_no_input,
+            launched_via_autostart,
+        )?;
     }
 
     #[cfg(not(feature = "gui"))]
     {
+        // `launched_via_autostart` is irrelevant in headless mode (no window
+        // to hide), so we accept-and-discard it via `let _ = ...` rather
+        // than threading it through the headless path.
+        let _ = launched_via_autostart;
         run_headless(config, pipeline, pw_manager)?;
     }
 
@@ -870,6 +888,10 @@ fn run_headless(
 }
 
 /// GTK application main loop.
+///
+/// `launched_via_autostart` propagates the CLI flag from `main.rs` so the
+/// GTK activate closure can apply the hide-if-tray policy (see
+/// [`should_hide_main_window_on_autostart`]).
 #[cfg(feature = "gui")]
 fn run_with_gui(
     mut config: Config,
@@ -877,12 +899,19 @@ fn run_with_gui(
     pw_manager: PipeWireManager,
     first_run: bool,
     startup_no_input: bool,
+    launched_via_autostart: bool,
 ) -> Result<()> {
     use gtk4::glib;
     use gtk4::prelude::*;
     use libadwaita::prelude::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    // Task-2-of-260508-k7q placeholder consume — Task 3 (next commit in this
+    // series) wires `launched_via_autostart` into the activate closure for
+    // the hide-if-tray policy gate. Suppresses the unused-variable warning
+    // for the intermediate Task-2 commit so the build stays clean.
+    let _ = launched_via_autostart;
 
     // -- Detect SNI tray watcher availability --
     let tray_available = is_sni_watcher_available();
