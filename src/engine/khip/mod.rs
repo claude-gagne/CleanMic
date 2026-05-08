@@ -39,7 +39,19 @@ pub mod ffi;
 const KHIP_LIB_NAME: &str = "libkhip.so";
 
 /// Directories where the Khip library is allowed to be loaded from.
-const ALLOWED_DIRS: &[&str] = &["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib"];
+///
+/// Order matters: `find_library()` scans these in sequence after the
+/// user's `~/.local/lib` (so a user-installed copy overrides a system
+/// one). The list mirrors `/etc/ld.so.conf` precedence intuition:
+/// admin-local first, then system; Debian and RPM canonical paths
+/// included so CleanMic discovers libkhip.so regardless of distro.
+const ALLOWED_DIRS: &[&str] = &[
+    "/usr/local/lib",            // admin-installed, Debian-flavored
+    "/usr/local/lib64",          // admin-installed, RPM-flavored
+    "/usr/lib",                  // system, Debian-flavored
+    "/usr/lib/x86_64-linux-gnu", // system, Debian multiarch
+    "/usr/lib64",                // system, RPM-flavored
+];
 
 /// Process-wide gate: ensures the human-readable "library not found"
 /// summary is emitted at most once per process, even though the 1500ms
@@ -98,10 +110,11 @@ fn home_local_lib() -> Option<PathBuf> {
 /// Search well-known paths for the Khip shared library.
 pub fn find_library() -> Option<PathBuf> {
     let user_local = home_local_lib();
-    let mut dirs: Vec<PathBuf> = ALLOWED_DIRS.iter().map(PathBuf::from).collect();
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(ALLOWED_DIRS.len() + 1);
     if let Some(p) = user_local {
-        dirs.push(p);
+        dirs.push(p); // user path scanned first — overrides system installs
     }
+    dirs.extend(ALLOWED_DIRS.iter().map(PathBuf::from));
     for dir in &dirs {
         let candidate = dir.join(KHIP_LIB_NAME);
         log::debug!("Khip: checking {}", candidate.display());
@@ -115,8 +128,11 @@ pub fn find_library() -> Option<PathBuf> {
         .is_ok()
     {
         log::warn!(
-            "Khip library not found in any of: /usr/lib, /usr/lib/x86_64-linux-gnu, /usr/local/lib, ~/.local/lib. \
-             To enable Khip, copy libkhip.so to ~/.local/lib/ (no system install required)."
+            "Khip library not found in any of: ~/.local/lib, /usr/local/lib, /usr/local/lib64, \
+             /usr/lib, /usr/lib/x86_64-linux-gnu, /usr/lib64. \
+             To enable Khip, copy libkhip.so to ~/.local/lib/ (no system install required, \
+             works on every distro), or to /usr/lib64/ (RPM: Fedora, openSUSE, RHEL) or \
+             /usr/lib/ (Debian, Ubuntu) for a system-wide install."
         );
     } else {
         log::debug!("Khip: library not found");
