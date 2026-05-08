@@ -267,6 +267,24 @@ pub fn request_shutdown() {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
+/// Decide whether the main window should start hidden.
+///
+/// Pure helper so the autostart launch policy is unit-testable without GTK.
+/// Hiding only happens when BOTH conditions are met:
+///   - the binary was launched via `--autostart` (system-fired, not user-clicked)
+///   - an SNI tray watcher is available (so the user can recover the window)
+///
+/// Without a tray, hiding would leave CleanMic invisible and unreachable —
+/// the fallback is always to show the window in that case. See
+/// `260508-k7q-CONTEXT.md` for the no-tray-fallback decision.
+#[inline]
+pub(crate) fn should_hide_main_window_on_autostart(
+    launched_via_autostart: bool,
+    tray_available: bool,
+) -> bool {
+    launched_via_autostart && tray_available
+}
+
 /// Check if a StatusNotifierItem host (tray) is available on the D-Bus session bus.
 ///
 /// Called once at startup. If `dbus-send` is not found, conservatively returns `false`.
@@ -907,12 +925,6 @@ fn run_with_gui(
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    // Task-2-of-260508-k7q placeholder consume — Task 3 (next commit in this
-    // series) wires `launched_via_autostart` into the activate closure for
-    // the hide-if-tray policy gate. Suppresses the unused-variable warning
-    // for the intermediate Task-2 commit so the build stays clean.
-    let _ = launched_via_autostart;
-
     // -- Detect SNI tray watcher availability --
     let tray_available = is_sni_watcher_available();
     log::info!("SNI tray watcher available: {}", tray_available);
@@ -1107,6 +1119,52 @@ fn run_with_gui(
             tray_available,
         );
         handles.window.present();
+
+        // -- Autostart hidden-launch policy (260508-k7q) ----------------------
+        // When BOTH conditions hold, hide the window and (first time only)
+        // fire a desktop notification:
+        //   1. The binary was launched via `--autostart` (system-fired login).
+        //   2. An SNI tray watcher is available (so the user can open the
+        //      window again from the tray icon).
+        //
+        // GTK4 + Wayland subtlety: the window must enter the realized/mapped
+        // state at least once for the application's window list to include
+        // it (so the tray-driven `OpenWindow` path can later re-show it).
+        // `present()` triggers map; the immediately following `set_visible(false)`
+        // unmaps without unregistering. See CONTEXT.md "Wayland smoke-test".
+        //
+        // No-tray autostart fallback (`--autostart` && !tray_available): do
+        // nothing — the window is already presented visible, which is the
+        // documented fallback (per CONTEXT.md "No-tray fallback at autostart:
+        // visible window, no extra notification"). The user already saw the
+        // AdwBanner warning at toggle time (Task 5), so no surprise.
+        if should_hide_main_window_on_autostart(launched_via_autostart, tray_available) {
+            handles.window.set_visible(false);
+            log::info!("Main window hidden (autostart launch with tray available)");
+
+            // First-time-only "CleanMic is running" notification, gated on
+            // the new `autostart_hidden_notified` config flag. Mirrors the
+            // close-button-with-tray-hint pattern at src/ui/window.rs:497-518:
+            // set the flag, save, then send the notification — so a crash
+            // mid-flight doesn't repeat the notification on next launch.
+            let mut cfg = config_clone.borrow_mut();
+            if !cfg.autostart_hidden_notified {
+                cfg.autostart_hidden_notified = true;
+                if let Err(e) = cfg.save() {
+                    log::warn!("Failed to save autostart_hidden_notified flag: {e}");
+                }
+
+                let notif = gtk4::gio::Notification::new(
+                    &gettextrs::gettext("CleanMic is running"),
+                );
+                notif.set_body(Some(
+                    &gettextrs::gettext(
+                        "The window has been hidden. Click the tray icon to open it.",
+                    ),
+                ));
+                app.send_notification(Some("autostart-hidden"), &notif);
+            }
+        }
 
         // Enforce D-10 from startup: if the pre-window check found no usable
         // input, gray out the enable toggle immediately so it never renders
@@ -1953,6 +2011,19 @@ fn sync_tray_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Truth table for the autostart hide-policy gate (260508-k7q).
+    ///
+    /// Hiding fires only on the autostart+tray combination — every other
+    /// combination falls back to "show the window" so CleanMic is reachable.
+    #[test]
+    fn should_hide_main_window_on_autostart_truth_table() {
+        use super::should_hide_main_window_on_autostart as gate;
+        assert!(gate(true, true), "autostart + tray → hide");
+        assert!(!gate(true, false), "autostart + no tray → show (reachable fallback)");
+        assert!(!gate(false, true), "manual launch → always show, even with tray");
+        assert!(!gate(false, false), "manual launch + no tray → show");
+    }
 
     /// Ensure the atomic shutdown flag can be set and read.
     #[test]
