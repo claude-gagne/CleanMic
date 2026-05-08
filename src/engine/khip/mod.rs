@@ -437,6 +437,29 @@ mod tests {
     }
 
     #[test]
+    fn accept_usr_lib64() {
+        // RPM-family canonical 64-bit system path (Fedora, openSUSE, RHEL,
+        // Rocky, Alma). Confirmed-broken on Fedora 44 UAT 2026-05-06 before
+        // this fix; this test guards the regression.
+        assert!(validate_library_path(Path::new("/usr/lib64/libkhip.so")).is_ok());
+    }
+
+    #[test]
+    fn accept_usr_local_lib64() {
+        // RPM-family admin-local 64-bit path (counterpart to /usr/local/lib
+        // on Debian-flavored distros).
+        assert!(validate_library_path(Path::new("/usr/local/lib64/libkhip.so")).is_ok());
+    }
+
+    #[test]
+    fn reject_lib64_lookalike_paths() {
+        // Guard against over-broad whitelisting: only the exact two new
+        // parents are accepted, not arbitrary lib64-suffixed paths.
+        assert!(validate_library_path(Path::new("/opt/lib64/libkhip.so")).is_err());
+        assert!(validate_library_path(Path::new("/usr/lib64/extra/libkhip.so")).is_err());
+    }
+
+    #[test]
     fn downsample_length() {
         let input = [0.0f32; ffi::BUF_SIZE_48K];
         let out = downsample_48_to_32(&input);
