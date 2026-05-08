@@ -229,3 +229,15 @@ msgstr "Léger, faible consommation CPU"
 # D-01: Engine subtitle — Khip
 msgid "User-supplied, adaptive"
 msgstr "Fourni par l'utilisateur, adaptatif"
+
+# 260508-k7q: Notification title — fired on first hidden autostart launch (src/app.rs)
+msgid "CleanMic is running"
+msgstr "CleanMic est actif"
+
+# 260508-k7q: Notification body — first hidden autostart launch
+msgid "The window has been hidden. Click the tray icon to open it."
+msgstr "La fenêtre a été masquée. Cliquez sur l'icône système pour la rouvrir."
+
+# 260508-k7q: AdwBanner — shown when toggling "Start on login" without an SNI tray watcher (src/ui/window.rs)
+msgid "Your desktop doesn't appear to support tray icons. On login, CleanMic will start with the main window visible."
+msgstr "Votre environnement de bureau ne semble pas prendre en charge les icônes système. Lors de la prochaine connexion, CleanMic démarrera avec la fenêtre principale visible."
