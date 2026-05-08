@@ -232,7 +232,7 @@ msgstr "Fourni par l'utilisateur, adaptatif"
 
 # 260508-k7q: Notification title — fired on first hidden autostart launch (src/app.rs)
 msgid "CleanMic is running"
-msgstr "CleanMic est actif"
+msgstr "CleanMic est en cours d'exécution"
 
 # 260508-k7q: Notification body — first hidden autostart launch
 msgid "The window has been hidden. Click the tray icon to open it."
