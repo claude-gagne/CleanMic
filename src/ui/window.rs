@@ -343,12 +343,13 @@ pub fn build_main_window(
         }
     });
 
-    // ── Autostart-no-tray banner (260508-k7q) ─────────────────────────────────
+    // ── Autostart-no-tray banner (260508-k7q + 260510-fuq) ────────────────────
     // Inline informational warning surfaced when the user toggles "Start on
     // login" ON on a system that has no SNI tray watcher available. Without
-    // a tray, the autostart-fired binary cannot hide the main window (it
-    // would leave CleanMic invisible and unreachable), so the next login
-    // will pop a visible window. The banner explains that consequence at
+    // a tray, the autostart-fired binary has no tray icon to recover the
+    // window from, so it starts the window minimized to the taskbar instead
+    // of hiding it (260510-fuq — matches Discord/Telegram/Spotify/Steam/
+    // ProtonVPN industry pattern). The banner explains that consequence at
     // toggle time so the user can opt out if they don't want it.
     //
     // Stacked just below the existing `update_banner` in the root Box —
@@ -359,7 +360,7 @@ pub fn build_main_window(
     // (further down) toggles `set_revealed(active && !tray_available)`.
     let autostart_no_tray_banner = Banner::new(&tr!(
         "Your desktop doesn't appear to support tray icons. \
-         On login, CleanMic will start with the main window visible."
+         On login, CleanMic will start minimized to the taskbar."
     ));
     autostart_no_tray_banner.set_revealed(false);
 
