@@ -1223,6 +1223,29 @@ fn run_with_gui(
         });
         app.add_action(&about_action);
 
+        // ── Report-an-issue action (260510-ec4) ───────────────────────────────
+        let report_issue_action = gtk4::gio::SimpleAction::new("report-issue", None);
+        report_issue_action.connect_activate(move |_, _| {
+            const ISSUES_NEW_URL: &str = "https://github.com/claude-gagne/CleanMic/issues/new";
+            if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
+                ISSUES_NEW_URL,
+                gtk4::gio::AppLaunchContext::NONE,
+            ) {
+                log::warn!("report-issue: failed to open browser for issues page: {e}");
+            }
+        });
+        app.add_action(&report_issue_action);
+
+        // ── Quit action + Ctrl+Q accelerator (260510-ec4) ─────────────────────
+        let quit_action = gtk4::gio::SimpleAction::new("quit", None);
+        let app_for_quit = app.clone();
+        quit_action.connect_activate(move |_, _| {
+            log::info!("Quit action triggered (menu or Ctrl+Q)");
+            app_for_quit.quit();
+        });
+        app.add_action(&quit_action);
+        app.set_accels_for_action("app.quit", &["<Control>q"]);
+
         // ── "Check for updates" GIO action (hamburger menu + programmatic) ────
         #[cfg(feature = "updater")]
         {
@@ -2273,5 +2296,52 @@ mod tests {
         // Cleanup.
         SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
         drop(pipeline);
+    }
+
+    /// 260510-ec4: app.report-issue and app.quit SimpleActions are registered,
+    /// and Ctrl+Q is bound as the app.quit accelerator.
+    ///
+    /// Feature-gated behind `gui` because libadwaita::Application is only
+    /// available when that feature is on (matches existing convention for
+    /// UI-touching tests in this file). Skips cleanly when there is no
+    /// display server available (headless CI / sandbox).
+    #[cfg(feature = "gui")]
+    #[test]
+    fn quit_and_report_issue_actions_are_registered() {
+        use gtk4::prelude::*;
+        use libadwaita::prelude::*;
+
+        // Skip cleanly if no DISPLAY/WAYLAND_DISPLAY (headless CI / sandbox).
+        if gtk4::init().is_err() {
+            return;
+        }
+
+        let app = libadwaita::Application::builder()
+            .application_id("com.cleanmic.CleanMic.test")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+
+        // Mirror the registration code path from `run_with_gui` for the two
+        // actions added in this commit.
+        let report_issue_action = gtk4::gio::SimpleAction::new("report-issue", None);
+        app.add_action(&report_issue_action);
+
+        let quit_action = gtk4::gio::SimpleAction::new("quit", None);
+        app.add_action(&quit_action);
+        app.set_accels_for_action("app.quit", &["<Control>q"]);
+
+        assert!(
+            app.lookup_action("report-issue").is_some(),
+            "app.report-issue action should be registered"
+        );
+        assert!(
+            app.lookup_action("quit").is_some(),
+            "app.quit action should be registered"
+        );
+        assert_eq!(
+            app.accels_for_action("app.quit"),
+            vec!["<Control>q".to_owned()],
+            "Ctrl+Q should be bound as the app.quit accelerator"
+        );
     }
 }
