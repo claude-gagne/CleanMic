@@ -292,9 +292,24 @@ pub fn build_main_window(
     header.set_decoration_layout(Some(":minimize,close"));
 
     // ── Hamburger menu (primary menu) ─────────────────────────────────────────
+    // 260510-ec4: HIG three-section grouping —
+    //   Section 1: app actions (updates / about)
+    //   Section 2: feedback (report issue)
+    //   Section 3: window-level (quit)
     let menu = gio::Menu::new();
-    menu.append(Some(&tr!("Check for updates")), Some("app.check-for-updates"));
-    menu.append(Some(&tr!("About CleanMic")), Some("app.about"));
+
+    let app_section = gio::Menu::new();
+    app_section.append(Some(&tr!("Check for updates")), Some("app.check-for-updates"));
+    app_section.append(Some(&tr!("About CleanMic")), Some("app.about"));
+    menu.append_section(None, &app_section);
+
+    let feedback_section = gio::Menu::new();
+    feedback_section.append(Some(&tr!("Report an issue")), Some("app.report-issue"));
+    menu.append_section(None, &feedback_section);
+
+    let quit_section = gio::Menu::new();
+    quit_section.append(Some(&tr!("Quit")), Some("app.quit"));
+    menu.append_section(None, &quit_section);
 
     let menu_button = gtk4::MenuButton::new();
     menu_button.set_icon_name("open-menu-symbolic");
