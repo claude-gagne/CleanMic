@@ -2072,13 +2072,29 @@ mod tests {
 
     /// Truth table for the autostart hide-policy gate (260508-k7q).
     ///
-    /// Hiding fires only on the autostart+tray combination — every other
-    /// combination falls back to "show the window" so CleanMic is reachable.
+    /// Hiding fires only on the autostart+tray combination. The
+    /// autostart+no-tray combination now goes through the minimize gate
+    /// (see `should_minimize_on_autostart_truth_table`); manual launches
+    /// always show the window regardless of tray availability.
     #[test]
     fn should_hide_main_window_on_autostart_truth_table() {
         use super::should_hide_main_window_on_autostart as gate;
         assert!(gate(true, true), "autostart + tray → hide");
-        assert!(!gate(true, false), "autostart + no tray → show (reachable fallback)");
+        assert!(!gate(true, false), "autostart + no tray → minimize path, not hide");
+        assert!(!gate(false, true), "manual launch → always show, even with tray");
+        assert!(!gate(false, false), "manual launch + no tray → show");
+    }
+
+    /// Truth table for the autostart minimize-policy gate (260510-fuq).
+    ///
+    /// Minimizing fires only on the autostart+no-tray combination. The
+    /// autostart+tray combination goes through the hide gate; manual
+    /// launches always show the window regardless of tray availability.
+    #[test]
+    fn should_minimize_on_autostart_truth_table() {
+        use super::should_minimize_on_autostart as gate;
+        assert!(!gate(true, true), "autostart + tray → hide path, not minimize");
+        assert!(gate(true, false), "autostart + no tray → minimize (industry pattern)");
         assert!(!gate(false, true), "manual launch → always show, even with tray");
         assert!(!gate(false, false), "manual launch + no tray → show");
     }
