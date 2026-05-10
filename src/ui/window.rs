@@ -286,6 +286,11 @@ pub fn build_main_window(
     let win_title = libadwaita::WindowTitle::new(&tr!("CleanMic"), "");
     header.set_title_widget(Some(&win_title));
 
+    // 260510-ec4: explicit decoration layout — show minimize + close.
+    // Maximize is omitted because the window is .resizable(false) (line 281),
+    // so a maximize button would be a no-op.
+    header.set_decoration_layout(Some(":minimize,close"));
+
     // ── Hamburger menu (primary menu) ─────────────────────────────────────────
     let menu = gio::Menu::new();
     menu.append(Some(&tr!("Check for updates")), Some("app.check-for-updates"));
