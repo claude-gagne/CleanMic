@@ -239,8 +239,9 @@ msgid "The window has been hidden. Click the tray icon to open it."
 msgstr "La fenêtre a été masquée. Cliquez sur l'icône système pour la rouvrir."
 
 # 260508-k7q: AdwBanner — shown when toggling "Start on login" without an SNI tray watcher (src/ui/window.rs)
-msgid "Your desktop doesn't appear to support tray icons. On login, CleanMic will start with the main window visible."
-msgstr "Votre environnement de bureau ne semble pas prendre en charge les icônes système. Lors de la prochaine connexion, CleanMic démarrera avec la fenêtre principale visible."
+# 260510-fuq: wording updated — autostart-no-tray now minimizes the window instead of leaving it visible
+msgid "Your desktop doesn't appear to support tray icons. On login, CleanMic will start minimized to the taskbar."
+msgstr "Votre environnement de bureau ne semble pas prendre en charge les icônes système. Lors de la prochaine connexion, CleanMic démarrera réduit dans la barre des tâches."
 
 # 260510-ec4: Hamburger menu — opens https://github.com/claude-gagne/CleanMic/issues/new (src/ui/window.rs)
 msgid "Report an issue"
