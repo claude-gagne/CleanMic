@@ -275,14 +275,32 @@ pub fn request_shutdown() {
 ///   - an SNI tray watcher is available (so the user can recover the window)
 ///
 /// Without a tray, hiding would leave CleanMic invisible and unreachable —
-/// the fallback is always to show the window in that case. See
-/// `260508-k7q-CONTEXT.md` for the no-tray-fallback decision.
+/// the no-tray fallback now goes through `should_minimize_on_autostart`
+/// (260510-fuq) instead of doing nothing. See `260508-k7q-CONTEXT.md` for
+/// the original hide-policy decision.
 #[inline]
 pub(crate) fn should_hide_main_window_on_autostart(
     launched_via_autostart: bool,
     tray_available: bool,
 ) -> bool {
     launched_via_autostart && tray_available
+}
+
+/// Decide whether the main window should start minimized to the taskbar.
+///
+/// Pure helper so the autostart launch policy is unit-testable without GTK.
+/// Minimizing fires only when the binary was launched via `--autostart`
+/// AND no SNI tray watcher is available — the user has no tray to recover
+/// the window from, so we follow the dominant industry pattern (Discord,
+/// Telegram, Spotify, Steam, ProtonVPN) and start minimized rather than
+/// pop a visible window. Tray-available autostart goes through
+/// `should_hide_main_window_on_autostart` instead. See `260510-fuq`.
+#[inline]
+pub(crate) fn should_minimize_on_autostart(
+    launched_via_autostart: bool,
+    tray_available: bool,
+) -> bool {
+    launched_via_autostart && !tray_available
 }
 
 /// Check if a StatusNotifierItem host (tray) is available on the D-Bus session bus.
@@ -1120,24 +1138,38 @@ fn run_with_gui(
         );
         handles.window.present();
 
-        // -- Autostart hidden-launch policy (260508-k7q) ----------------------
-        // When BOTH conditions hold, hide the window and (first time only)
-        // fire a desktop notification:
-        //   1. The binary was launched via `--autostart` (system-fired login).
-        //   2. An SNI tray watcher is available (so the user can open the
-        //      window again from the tray icon).
+        // -- Autostart launch policy (260508-k7q + 260510-fuq) ----------------
+        // The autostart launch path now branches three ways depending on
+        // tray availability — pure helpers `should_hide_main_window_on_autostart`
+        // and `should_minimize_on_autostart` encode the decision so the
+        // policy is unit-tested without GTK.
         //
-        // GTK4 + Wayland subtlety: the window must enter the realized/mapped
-        // state at least once for the application's window list to include
-        // it (so the tray-driven `OpenWindow` path can later re-show it).
-        // `present()` triggers map; the immediately following `set_visible(false)`
-        // unmaps without unregistering. See CONTEXT.md "Wayland smoke-test".
+        // (1) `--autostart` && tray_available  → HIDE the window (260508-k7q)
+        //     + first-time-only "CleanMic is running" desktop notification
+        //     so the user knows where to find it. The tray icon is the
+        //     recovery affordance.
         //
-        // No-tray autostart fallback (`--autostart` && !tray_available): do
-        // nothing — the window is already presented visible, which is the
-        // documented fallback (per CONTEXT.md "No-tray fallback at autostart:
-        // visible window, no extra notification"). The user already saw the
-        // AdwBanner warning at toggle time (Task 5), so no surprise.
+        //     GTK4 + Wayland subtlety: the window must enter the
+        //     realized/mapped state at least once for the application's
+        //     window list to include it (so the tray-driven `OpenWindow`
+        //     path can later re-show it). `present()` triggers map; the
+        //     immediately following `set_visible(false)` unmaps without
+        //     unregistering. See 260508-k7q-CONTEXT.md "Wayland smoke-test".
+        //
+        // (2) `--autostart` && !tray_available → MINIMIZE the window
+        //     to the taskbar (260510-fuq). Matches the dominant industry
+        //     pattern (Discord, Telegram, Spotify, Steam, ProtonVPN): the
+        //     binary still starts on login but doesn't pop a visible window
+        //     in the user's face. The taskbar entry / Activities thumbnail /
+        //     Alt-Tab is the recovery affordance. No notification fires —
+        //     the AdwBanner shown at toggle time (src/ui/window.rs) already
+        //     told the user this would happen. If a Wayland compositor
+        //     doesn't honor `xdg-toplevel.set_minimized`, the window stays
+        //     visible (graceful degradation, no crash).
+        //
+        // (3) Manual launch (no `--autostart` flag) → SHOW the window
+        //     visible-and-focused, regardless of tray availability.
+        //     `present()` above already did this; no further action.
         if should_hide_main_window_on_autostart(launched_via_autostart, tray_available) {
             handles.window.set_visible(false);
             log::info!("Main window hidden (autostart launch with tray available)");
@@ -1164,6 +1196,9 @@ fn run_with_gui(
                 ));
                 app.send_notification(Some("autostart-hidden"), &notif);
             }
+        } else if should_minimize_on_autostart(launched_via_autostart, tray_available) {
+            handles.window.minimize();
+            log::info!("Main window minimized (autostart launch with no tray available)");
         }
 
         // Enforce D-10 from startup: if the pre-window check found no usable
