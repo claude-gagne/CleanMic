@@ -9,6 +9,7 @@
 #   fmt       - Run cargo fmt
 #   lint      - Run cargo clippy
 #   test      - Run cargo test
+#   ci-check  - Run fmt-check, clippy -D warnings, and tests (mirrors release CI)
 #   clean     - Remove build artifacts
 
 # Use cargo from PATH; fall back to $HOME/.cargo/bin if rustup is installed
@@ -18,7 +19,7 @@ DESTDIR ?=
 
 BINARY  := target/release/cleanmic
 
-.PHONY: build appimage kill vendors mo install uninstall fmt lint test clean
+.PHONY: build appimage kill vendors mo install uninstall fmt lint test ci-check clean
 
 mo:
 	@mkdir -p locale/fr/LC_MESSAGES
@@ -59,6 +60,13 @@ lint:
 	$(CARGO) clippy --all-features
 
 test:
+	$(CARGO) test --all-features
+
+# CI-mirror: runs the same gates as .github/workflows/release.yml in fail-fast order.
+# Use this locally to confirm a change will pass CI before pushing.
+ci-check:
+	$(CARGO) fmt --check
+	$(CARGO) clippy --all-features -- -D warnings
 	$(CARGO) test --all-features
 
 clean:
