@@ -284,7 +284,7 @@ pub fn build_menu(state: &TrayState) -> Vec<MenuItem> {
 pub mod icon {
     //! `ksni::Tray` implementation for CleanMic.
 
-    use super::{build_menu, TrayCommand, TrayState};
+    use super::{TrayCommand, TrayState, build_menu};
     use ksni::{self, MenuItem as KsniItem};
     use std::sync::{Arc, Mutex};
 

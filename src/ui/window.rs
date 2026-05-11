@@ -88,8 +88,8 @@ pub struct WindowHandles {
 type SwitchRowRef = SwitchRow;
 
 use crate::engine::EngineType;
-use crate::ui::{DeviceInfo, UiEvent, UiState};
 use crate::tr;
+use crate::ui::{DeviceInfo, UiEvent, UiState};
 
 // ── Engine selector helpers ───────────────────────────────────────────────────
 
@@ -299,7 +299,10 @@ pub fn build_main_window(
     let menu = gio::Menu::new();
 
     let app_section = gio::Menu::new();
-    app_section.append(Some(&tr!("Check for updates")), Some("app.check-for-updates"));
+    app_section.append(
+        Some(&tr!("Check for updates")),
+        Some("app.check-for-updates"),
+    );
     app_section.append(Some(&tr!("About CleanMic")), Some("app.about"));
     menu.append_section(None, &app_section);
 
@@ -324,7 +327,11 @@ pub fn build_main_window(
     clamp.set_maximum_size(500);
     clamp.set_child(Some(&page));
 
-    let subtitle = if state.active { tr!("Active") } else { tr!("Inactive") };
+    let subtitle = if state.active {
+        tr!("Active")
+    } else {
+        tr!("Inactive")
+    };
     win_title.set_subtitle(&subtitle);
 
     // Update notification banner (per D-05, D-08) — hidden initially
@@ -525,16 +532,14 @@ pub fn build_main_window(
 
                     // Show a desktop notification via GNotification.
                     if let Some(app) = win.application() {
-                        let notif = gtk4::gio::Notification::new(
-                            &gettextrs::gettext("CleanMic is still running"),
-                        );
-                        notif.set_body(Some(
-                            &gettextrs::gettext(
-                                "The window was closed but CleanMic continues processing \
+                        let notif = gtk4::gio::Notification::new(&gettextrs::gettext(
+                            "CleanMic is still running",
+                        ));
+                        notif.set_body(Some(&gettextrs::gettext(
+                            "The window was closed but CleanMic continues processing \
                                  your microphone in the background. Look for the tray icon \
                                  to reopen or quit.",
-                            ),
-                        ));
+                        )));
                         app.send_notification(Some("tray-hint"), &notif);
                     }
                 }
@@ -663,9 +668,7 @@ fn build_device_row(state: &UiState) -> ComboRow {
         state.input_device.as_deref(),
     );
 
-    let list = gtk4::StringList::new(
-        &model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-    );
+    let list = gtk4::StringList::new(&model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     row.set_model(Some(&list));
     row.set_selected(model.selected_idx);
     row.set_sensitive(!model.no_input);
@@ -680,10 +683,7 @@ fn build_device_row(state: &UiState) -> ComboRow {
 /// `set_activatable(false)` on a `gtk4::ListItem` only affects rendering, not
 /// GtkDropDown's selection model, so users could still pick "Khip (not
 /// installed)" with no effect. Mirrors the tray's enabled-flag semantics.
-fn build_engine_selector(
-    state: &UiState,
-    event_tx: mpsc::Sender<UiEvent>,
-) -> EngineSelector {
+fn build_engine_selector(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> EngineSelector {
     let group = PreferencesGroup::new();
     group.set_title(&tr!("Noise Processing"));
 
@@ -787,7 +787,12 @@ fn build_engine_selector(
         rows.push((engine, row, check));
     }
 
-    EngineSelector { group, rows, updating, khip_available }
+    EngineSelector {
+        group,
+        rows,
+        updating,
+        khip_available,
+    }
 }
 
 // ── Strength level helpers (shared by all engines) ────────────────────────────
@@ -868,7 +873,11 @@ impl WindowHandles {
             self.monitor_row.set_active(state.monitor_enabled);
         }
 
-        self.win_title.set_subtitle(&if state.active { tr!("Active") } else { tr!("Inactive") });
+        self.win_title.set_subtitle(&if state.active {
+            tr!("Active")
+        } else {
+            tr!("Inactive")
+        });
     }
 
     /// Repopulate the device picker with a fresh device list.
@@ -886,9 +895,8 @@ impl WindowHandles {
         system_default_name: Option<&str>,
     ) {
         let model = build_device_model(devices, system_default_name, current_device);
-        let list = gtk4::StringList::new(
-            &model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        );
+        let list =
+            gtk4::StringList::new(&model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
         // G-05: guard the selected-item-notify handler so the programmatic
         // set_model / set_selected calls below don't emit a spurious
         // UiEvent::DeviceChanged. Resetting to false after both calls complete

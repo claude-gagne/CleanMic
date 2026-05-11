@@ -9,7 +9,7 @@
 //! no allocations, no mutexes, no I/O on the hot path.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -142,7 +142,10 @@ impl AudioPipeline {
     /// The audio thread reads from `capture_reader`, runs the noise engine, and
     /// writes the result to `output_writer`. If the capture ring buffer is empty
     /// the thread yields briefly instead of busy-spinning.
-    pub fn with_ring_buffers(capture_reader: RingBufReader, output_writer: RingBufWriter) -> Result<Self> {
+    pub fn with_ring_buffers(
+        capture_reader: RingBufReader,
+        output_writer: RingBufWriter,
+    ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let (level_tx, level_rx) = mpsc::channel::<LevelReport>();
         let channel_alive = Arc::new(AtomicBool::new(true));
@@ -152,7 +155,13 @@ impl AudioPipeline {
         let thread_handle = thread::Builder::new()
             .name("cleanmic-audio".into())
             .spawn(move || {
-                audio_thread_main(cmd_rx, level_tx, Some(capture_reader), Some(output_writer), heartbeat_thread);
+                audio_thread_main(
+                    cmd_rx,
+                    level_tx,
+                    Some(capture_reader),
+                    Some(output_writer),
+                    heartbeat_thread,
+                );
             })
             .context("failed to spawn audio thread")?;
 
@@ -204,7 +213,11 @@ impl AudioPipeline {
 
     /// Change the input device.
     pub fn set_input_device(&self, device_id: String) {
-        if self.cmd_tx.send(AudioCommand::SetInputDevice(device_id)).is_err() {
+        if self
+            .cmd_tx
+            .send(AudioCommand::SetInputDevice(device_id))
+            .is_err()
+        {
             log::error!("audio thread channel closed - SetInputDevice command dropped");
             self.channel_alive.store(false, Ordering::Release);
         }
@@ -212,7 +225,11 @@ impl AudioPipeline {
 
     /// Set the normalized suppression strength on the active engine.
     pub fn set_strength(&self, strength: f32) {
-        if self.cmd_tx.send(AudioCommand::SetStrength(strength)).is_err() {
+        if self
+            .cmd_tx
+            .send(AudioCommand::SetStrength(strength))
+            .is_err()
+        {
             log::error!("audio thread channel closed - SetStrength command dropped");
             self.channel_alive.store(false, Ordering::Release);
         }
@@ -240,7 +257,11 @@ impl AudioPipeline {
     /// after `set_monitor(false)` so the audio thread stops writing to a
     /// destroyed stream.
     pub fn set_monitor_writer(&self, writer: Option<RingBufWriter>) {
-        if self.cmd_tx.send(AudioCommand::SetMonitorWriter(writer)).is_err() {
+        if self
+            .cmd_tx
+            .send(AudioCommand::SetMonitorWriter(writer))
+            .is_err()
+        {
             log::error!("audio thread channel closed - SetMonitorWriter command dropped");
             self.channel_alive.store(false, Ordering::Release);
         }
@@ -546,7 +567,10 @@ fn audio_thread_main(
         // Drain all pending commands (non-blocking).
         loop {
             match cmd_rx.try_recv() {
-                Ok(AudioCommand::SetRingBuffers { capture_reader: new_cr, output_writer: new_ow }) => {
+                Ok(AudioCommand::SetRingBuffers {
+                    capture_reader: new_cr,
+                    output_writer: new_ow,
+                }) => {
                     log::info!("Audio thread: ring buffers replaced (PipeWire reconnect)");
                     capture_reader = new_cr;
                     output_writer = new_ow;
@@ -604,25 +628,28 @@ fn audio_thread_main(
                         *s = 0.0;
                     }
 
-                    let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if let Some(ref mut xfade) = crossfade {
-                            let done = process_with_crossfade(
-                                xfade,
-                                &mut engine,
-                                &input_buf,
-                                &mut output_buf,
-                                &mut crossfade_old_buf,
-                            );
-                            if done {
-                                if let Some(mut finished) = crossfade.take() {
-                                    finished.old_engine.teardown();
-                                    log::info!("Engine crossfade complete, old engine torn down");
+                    let process_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Some(ref mut xfade) = crossfade {
+                                let done = process_with_crossfade(
+                                    xfade,
+                                    &mut engine,
+                                    &input_buf,
+                                    &mut output_buf,
+                                    &mut crossfade_old_buf,
+                                );
+                                if done {
+                                    if let Some(mut finished) = crossfade.take() {
+                                        finished.old_engine.teardown();
+                                        log::info!(
+                                            "Engine crossfade complete, old engine torn down"
+                                        );
+                                    }
                                 }
+                            } else {
+                                process_buffer(&mut engine, &input_buf, &mut output_buf);
                             }
-                        } else {
-                            process_buffer(&mut engine, &input_buf, &mut output_buf);
-                        }
-                    }));
+                        }));
 
                     if process_result.is_err() {
                         log::error!(
@@ -718,7 +745,10 @@ fn audio_thread_main(
         } else {
             // When not running, block briefly to avoid busy-waiting.
             match cmd_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(AudioCommand::SetRingBuffers { capture_reader: new_cr, output_writer: new_ow }) => {
+                Ok(AudioCommand::SetRingBuffers {
+                    capture_reader: new_cr,
+                    output_writer: new_ow,
+                }) => {
                     log::info!("Audio thread: ring buffers replaced (PipeWire reconnect, idle)");
                     capture_reader = new_cr;
                     output_writer = new_ow;
@@ -1100,8 +1130,13 @@ mod tests {
     #[test]
     #[ignore] // Parallel LADSPA init is not thread-safe; run with --ignored
     fn switch_rnnoise_to_deepfilter_no_panic() {
-        use crate::engine::{deepfilter::{self, DeepFilterEngine}, rnnoise::RNNoiseEngine};
-        if !deepfilter::is_available() { return; }
+        use crate::engine::{
+            deepfilter::{self, DeepFilterEngine},
+            rnnoise::RNNoiseEngine,
+        };
+        if !deepfilter::is_available() {
+            return;
+        }
 
         let pipeline = AudioPipeline::new().unwrap();
         pipeline.start();
@@ -1123,8 +1158,13 @@ mod tests {
     #[test]
     #[ignore] // Parallel LADSPA init is not thread-safe; run with --ignored
     fn switch_deepfilter_to_rnnoise_no_panic() {
-        use crate::engine::{deepfilter::{self, DeepFilterEngine}, rnnoise::RNNoiseEngine};
-        if !deepfilter::is_available() { return; }
+        use crate::engine::{
+            deepfilter::{self, DeepFilterEngine},
+            rnnoise::RNNoiseEngine,
+        };
+        if !deepfilter::is_available() {
+            return;
+        }
 
         let pipeline = AudioPipeline::new().unwrap();
         pipeline.start();
@@ -1146,8 +1186,13 @@ mod tests {
     #[test]
     #[ignore] // Parallel LADSPA init is not thread-safe; run with --ignored
     fn rapid_switches_no_crash_or_deadlock() {
-        use crate::engine::{deepfilter::{self, DeepFilterEngine}, rnnoise::RNNoiseEngine};
-        if !deepfilter::is_available() { return; }
+        use crate::engine::{
+            deepfilter::{self, DeepFilterEngine},
+            rnnoise::RNNoiseEngine,
+        };
+        if !deepfilter::is_available() {
+            return;
+        }
 
         let pipeline = AudioPipeline::new().unwrap();
         pipeline.start();
@@ -1256,8 +1301,8 @@ mod tests {
 
     #[test]
     fn switch_to_khip_when_unavailable_handled_gracefully() {
-        use crate::engine::{EngineType, create_engine};
         use crate::engine::khip::KhipEngine;
+        use crate::engine::{EngineType, create_engine};
 
         if KhipEngine::is_available() {
             return; // Library is installed; skip the "unavailable" path.
@@ -1296,9 +1341,14 @@ mod tests {
     #[ignore] // Parallel LADSPA init is not thread-safe; run with --ignored
     fn create_engine_factory_deepfilter() {
         use crate::engine::{EngineType, create_engine, deepfilter};
-        if !deepfilter::is_available() { return; }
+        if !deepfilter::is_available() {
+            return;
+        }
         let engine = create_engine(EngineType::DeepFilterNet);
-        assert!(engine.is_ok(), "Should create DeepFilterNet engine successfully");
+        assert!(
+            engine.is_ok(),
+            "Should create DeepFilterNet engine successfully"
+        );
     }
 
     #[cfg(not(feature = "deepfilter"))]
@@ -1364,11 +1414,17 @@ mod tests {
         /// An engine that panics on the first process() call.
         struct PanickingEngine;
         impl NoiseEngine for PanickingEngine {
-            fn init(&mut self, _: u32) -> anyhow::Result<()> { Ok(()) }
-            fn process(&mut self, _: &[f32], _: &mut [f32]) { panic!("intentional test panic"); }
+            fn init(&mut self, _: u32) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn process(&mut self, _: &[f32], _: &mut [f32]) {
+                panic!("intentional test panic");
+            }
             fn set_strength(&mut self, _: f32) {}
             fn set_mode(&mut self, _: ProcessingMode) {}
-            fn latency_frames(&self) -> u32 { 0 }
+            fn latency_frames(&self) -> u32 {
+                0
+            }
             fn teardown(&mut self) {}
         }
 

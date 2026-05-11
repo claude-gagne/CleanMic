@@ -183,8 +183,13 @@ fn install_icon(icons_dir: &Path) -> Result<()> {
         .with_context(|| format!("failed to create icons directory {}", icons_dir.display()))?;
 
     let dest = icons_dir.join(format!("{APP_ID}.svg"));
-    fs::copy(&src, &dest)
-        .with_context(|| format!("failed to copy icon from {} to {}", src.display(), dest.display()))?;
+    fs::copy(&src, &dest).with_context(|| {
+        format!(
+            "failed to copy icon from {} to {}",
+            src.display(),
+            dest.display()
+        )
+    })?;
 
     log::debug!("Icon installed to {}", dest.display());
     Ok(())
@@ -420,20 +425,34 @@ mod tests {
     fn install_desktop_integration_creates_applications_entry() {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let applications = tmp.path().join("data").join("applications");
-        let icons = tmp.path().join("data").join("icons").join("hicolor").join("scalable").join("apps");
+        let icons = tmp
+            .path()
+            .join("data")
+            .join("icons")
+            .join("hicolor")
+            .join("scalable")
+            .join("apps");
 
         // APPDIR is not set in tests, so icon install is skipped silently.
         install_desktop_integration_in(&applications, &icons).expect("install failed");
 
-        assert!(applications.join(DESKTOP_FILENAME).exists(),
-            "desktop file should be installed to applications dir");
+        assert!(
+            applications.join(DESKTOP_FILENAME).exists(),
+            "desktop file should be installed to applications dir"
+        );
     }
 
     #[test]
     fn install_desktop_integration_is_idempotent() {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let applications = tmp.path().join("data").join("applications");
-        let icons = tmp.path().join("data").join("icons").join("hicolor").join("scalable").join("apps");
+        let icons = tmp
+            .path()
+            .join("data")
+            .join("icons")
+            .join("hicolor")
+            .join("scalable")
+            .join("apps");
 
         install_desktop_integration_in(&applications, &icons).expect("first install failed");
         let content_first = fs::read_to_string(applications.join(DESKTOP_FILENAME))
@@ -443,7 +462,10 @@ mod tests {
         let content_second = fs::read_to_string(applications.join(DESKTOP_FILENAME))
             .expect("failed to read desktop file after second install");
 
-        assert_eq!(content_first, content_second, "idempotent: both installs should produce the same file");
+        assert_eq!(
+            content_first, content_second,
+            "idempotent: both installs should produce the same file"
+        );
     }
 
     #[test]

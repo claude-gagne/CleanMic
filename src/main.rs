@@ -169,7 +169,12 @@ mod tests {
     #[test]
     fn parse_autostart_flag_finds_flag_among_other_args() {
         // Future-proofing: even if we add other flags later, --autostart is found.
-        assert!(parse_autostart_flag(["cleanmic", "--foo", "--autostart", "--bar"]));
+        assert!(parse_autostart_flag([
+            "cleanmic",
+            "--foo",
+            "--autostart",
+            "--bar"
+        ]));
     }
 
     #[test]

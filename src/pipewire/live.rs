@@ -143,7 +143,9 @@ impl LivePipeWireManager {
                 if id == 0 {
                     log::warn!(
                         "PipeWire core error (id={}, res={}): {} — daemon may have disconnected",
-                        id, res, msg
+                        id,
+                        res,
+                        msg
                     );
                     daemon_disconnected_core.store(true, Ordering::Release);
                     if let Some(ml) = mainloop_weak_core.upgrade() {
@@ -493,9 +495,7 @@ impl LivePipeWireManager {
         };
 
         let node: pw::node::Node = core.create_object("adapter", &props).map_err(|e| {
-            PipeWireError::NodeCreationFailed(format!(
-                "core.create_object(adapter) failed: {e}"
-            ))
+            PipeWireError::NodeCreationFailed(format!("core.create_object(adapter) failed: {e}"))
         })?;
 
         log::info!(
@@ -535,38 +535,36 @@ impl LivePipeWireManager {
             .state_changed(|_stream, _data: &mut (), old, new| {
                 log::info!("CleanMic output stream state: {:?} -> {:?}", old, new);
             })
-            .process(move |stream, _data: &mut ()| {
-                unsafe {
-                    let raw_buf = stream.dequeue_raw_buffer();
-                    if raw_buf.is_null() {
-                        return;
-                    }
-                    let buf = &mut *raw_buf;
-                    if buf.buffer.is_null() {
-                        stream.queue_raw_buffer(raw_buf);
-                        return;
-                    }
-                    let spa_buf = &mut *buf.buffer;
-                    if spa_buf.n_datas > 0 && !spa_buf.datas.is_null() {
-                        let data = &mut *spa_buf.datas;
-                        if !data.data.is_null() && data.maxsize > 0 {
-                            let n_samples = data.maxsize as usize / std::mem::size_of::<f32>();
-                            let slice =
-                                std::slice::from_raw_parts_mut(data.data as *mut f32, n_samples);
-                            let read = output_reader.read(slice);
-                            for s in &mut slice[read..] {
-                                *s = 0.0;
-                            }
-                            if !data.chunk.is_null() {
-                                let chunk = &mut *data.chunk;
-                                chunk.offset = 0;
-                                chunk.stride = std::mem::size_of::<f32>() as i32;
-                                chunk.size = (n_samples * std::mem::size_of::<f32>()) as u32;
-                            }
+            .process(move |stream, _data: &mut ()| unsafe {
+                let raw_buf = stream.dequeue_raw_buffer();
+                if raw_buf.is_null() {
+                    return;
+                }
+                let buf = &mut *raw_buf;
+                if buf.buffer.is_null() {
+                    stream.queue_raw_buffer(raw_buf);
+                    return;
+                }
+                let spa_buf = &mut *buf.buffer;
+                if spa_buf.n_datas > 0 && !spa_buf.datas.is_null() {
+                    let data = &mut *spa_buf.datas;
+                    if !data.data.is_null() && data.maxsize > 0 {
+                        let n_samples = data.maxsize as usize / std::mem::size_of::<f32>();
+                        let slice =
+                            std::slice::from_raw_parts_mut(data.data as *mut f32, n_samples);
+                        let read = output_reader.read(slice);
+                        for s in &mut slice[read..] {
+                            *s = 0.0;
+                        }
+                        if !data.chunk.is_null() {
+                            let chunk = &mut *data.chunk;
+                            chunk.offset = 0;
+                            chunk.stride = std::mem::size_of::<f32>() as i32;
+                            chunk.size = (n_samples * std::mem::size_of::<f32>()) as u32;
                         }
                     }
-                    stream.queue_raw_buffer(raw_buf);
                 }
+                stream.queue_raw_buffer(raw_buf);
             })
             .register()
             .map_err(|e| {
@@ -629,37 +627,35 @@ impl LivePipeWireManager {
             .state_changed(|_stream, _data: &mut (), old, new| {
                 log::info!("CleanMic capture stream state: {:?} -> {:?}", old, new);
             })
-            .process(move |stream, _data: &mut ()| {
-                unsafe {
-                    let raw_buf = stream.dequeue_raw_buffer();
-                    if raw_buf.is_null() {
-                        return;
-                    }
-                    let buf = &mut *raw_buf;
-                    if buf.buffer.is_null() {
+            .process(move |stream, _data: &mut ()| unsafe {
+                let raw_buf = stream.dequeue_raw_buffer();
+                if raw_buf.is_null() {
+                    return;
+                }
+                let buf = &mut *raw_buf;
+                if buf.buffer.is_null() {
+                    stream.queue_raw_buffer(raw_buf);
+                    return;
+                }
+                let spa_buf = &mut *buf.buffer;
+                if spa_buf.n_datas > 0 && !spa_buf.datas.is_null() {
+                    let data = &mut *spa_buf.datas;
+                    if !data.data.is_null() && data.chunk.is_null() {
                         stream.queue_raw_buffer(raw_buf);
                         return;
                     }
-                    let spa_buf = &mut *buf.buffer;
-                    if spa_buf.n_datas > 0 && !spa_buf.datas.is_null() {
-                        let data = &mut *spa_buf.datas;
-                        if !data.data.is_null() && data.chunk.is_null() {
-                            stream.queue_raw_buffer(raw_buf);
-                            return;
-                        }
-                        if !data.data.is_null() && !data.chunk.is_null() {
-                            let chunk = &*data.chunk;
-                            let n_bytes = chunk.size as usize;
-                            let n_samples = n_bytes / std::mem::size_of::<f32>();
-                            let slice = std::slice::from_raw_parts(
-                                (data.data as *const u8).add(chunk.offset as usize) as *const f32,
-                                n_samples,
-                            );
-                            capture_writer.write(slice);
-                        }
+                    if !data.data.is_null() && !data.chunk.is_null() {
+                        let chunk = &*data.chunk;
+                        let n_bytes = chunk.size as usize;
+                        let n_samples = n_bytes / std::mem::size_of::<f32>();
+                        let slice = std::slice::from_raw_parts(
+                            (data.data as *const u8).add(chunk.offset as usize) as *const f32,
+                            n_samples,
+                        );
+                        capture_writer.write(slice);
                     }
-                    stream.queue_raw_buffer(raw_buf);
                 }
+                stream.queue_raw_buffer(raw_buf);
             })
             .register()
             .map_err(|e| {
@@ -706,12 +702,13 @@ impl LivePipeWireManager {
             *pw::keys::NODE_DESCRIPTION => "CleanMic Monitor",
         };
         if let Some(sink) = configured_default_sink() {
-            log::info!("Pinning CleanMic monitor stream to configured sink {}", sink);
+            log::info!(
+                "Pinning CleanMic monitor stream to configured sink {}",
+                sink
+            );
             props.insert("target.object", sink);
         } else {
-            log::debug!(
-                "No configured audio sink found — monitor stream will auto-connect"
-            );
+            log::debug!("No configured audio sink found — monitor stream will auto-connect");
         }
 
         let stream = Stream::new(core, "CleanMic-monitor", props)
@@ -771,8 +768,7 @@ impl LivePipeWireManager {
                                 chunk.offset = 0;
                                 // stride = bytes per frame = 2 channels * 4 bytes
                                 chunk.stride = (2 * std::mem::size_of::<f32>()) as i32;
-                                chunk.size =
-                                    (n_stereo_samples * std::mem::size_of::<f32>()) as u32;
+                                chunk.size = (n_stereo_samples * std::mem::size_of::<f32>()) as u32;
                             }
                         }
                     }
@@ -999,7 +995,11 @@ fn unlink_all_into_cleanmic_capture() {
     // pw-link has no "disconnect everything into X" mode, so we parse
     // `pw-link -l -I` for lines ending at CleanMic-capture:input_MONO
     // and disconnect each link id.
-    let Ok(out) = std::process::Command::new("pw-link").arg("-l").arg("-I").output() else {
+    let Ok(out) = std::process::Command::new("pw-link")
+        .arg("-l")
+        .arg("-I")
+        .output()
+    else {
         return;
     };
     if !out.status.success() {
@@ -1020,7 +1020,9 @@ fn unlink_all_into_cleanmic_capture() {
             continue;
         }
         // Line looks like: "  <link-id>   |<-   <src-node>:<src-port>"
-        let Some(link_id) = line.split_whitespace().next() else { continue };
+        let Some(link_id) = line.split_whitespace().next() else {
+            continue;
+        };
         let _ = std::process::Command::new("pw-link")
             .arg("-d")
             .arg(link_id)
@@ -1050,11 +1052,15 @@ fn pw_metadata_name(key: &str) -> Option<String> {
     //   update: id:0 key:'<key>' value:'{"name":"<node>"}' type:'Spa:String:JSON'
     // Parse out the JSON value and extract "name".
     for line in stdout.lines() {
-        let Some(start) = line.find("value:'") else { continue };
+        let Some(start) = line.find("value:'") else {
+            continue;
+        };
         let rest = &line[start + 7..];
         let Some(end) = rest.find('\'') else { continue };
         let json_str = &rest[..end];
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            continue;
+        };
         if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
             return Some(name.to_string());
         }

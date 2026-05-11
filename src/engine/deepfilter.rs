@@ -30,7 +30,7 @@
 //! - Balanced → 50 dB  (EasyEffects default)
 //! - Strong   → 100 dB (maximum suppression)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 use super::{NoiseEngine, ProcessingMode};
@@ -367,7 +367,8 @@ mod tests {
     fn strength_mapping() {
         // Thresholds are constant across presets (EasyEffects defaults);
         // only atten_lim (and post_beta at High) varies.
-        let (atten, min_proc, max_erb, max_df, beta) = DeepFilterEngine::strength_to_params(1.0 / 6.0);
+        let (atten, min_proc, max_erb, max_df, beta) =
+            DeepFilterEngine::strength_to_params(1.0 / 6.0);
         assert!((atten - 35.0).abs() < 1e-5);
         assert!((min_proc - -10.0).abs() < 1e-5);
         assert!((max_erb - 35.0).abs() < 1e-5);
@@ -381,7 +382,8 @@ mod tests {
         assert!((max_df - 35.0).abs() < 1e-5);
         assert!((beta - 0.0).abs() < 1e-5);
 
-        let (atten, min_proc, max_erb, max_df, beta) = DeepFilterEngine::strength_to_params(5.0 / 6.0);
+        let (atten, min_proc, max_erb, max_df, beta) =
+            DeepFilterEngine::strength_to_params(5.0 / 6.0);
         assert!((atten - 100.0).abs() < 1e-5);
         assert!((min_proc - -10.0).abs() < 1e-5);
         assert!((max_erb - 35.0).abs() < 1e-5);

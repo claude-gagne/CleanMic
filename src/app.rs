@@ -68,10 +68,7 @@ fn resolve_runtime_capture_target(
 /// is CleanMic itself (not in the filtered device list) or unresolvable.
 ///
 /// Used by both the runtime resolver wrapper and the 1500ms polling timer.
-fn current_system_default_name(
-    pw: &PipeWireManager,
-    devices: &[InputDevice],
-) -> Option<String> {
+fn current_system_default_name(pw: &PipeWireManager, devices: &[InputDevice]) -> Option<String> {
     let raw = pw.configured_default_source();
     let resolved = raw
         .as_ref()
@@ -94,10 +91,7 @@ fn current_system_default_name(
 /// CleanMic happened to be the OS default (the phase 08.2 fix). Because
 /// `list_input_devices()` filters CleanMic out of the enumerable set, the
 /// returned name — if any — is guaranteed to be a real physical mic.
-fn resolve_initial_capture_target(
-    pw: &PipeWireManager,
-    config: &Config,
-) -> Option<String> {
+fn resolve_initial_capture_target(pw: &PipeWireManager, config: &Config) -> Option<String> {
     let devices = pw.device_enumerator().list_input_devices();
     let system_default_name = current_system_default_name(pw, &devices);
 
@@ -159,7 +153,7 @@ pub(crate) fn send_throttled_notification(
 /// are missing, strings appear in English.
 fn init_i18n() {
     use gettextrs::{
-        bind_textdomain_codeset, bindtextdomain, setlocale, textdomain, LocaleCategory,
+        LocaleCategory, bind_textdomain_codeset, bindtextdomain, setlocale, textdomain,
     };
 
     // Bind the process locale from the environment ($LANG / $LC_ALL / $LC_MESSAGES)
@@ -210,21 +204,18 @@ fn schedule_debounced_save(
     }
     let config = config.clone();
     let pending_weak = std::rc::Rc::downgrade(pending);
-    let id = gtk4::glib::timeout_add_local_once(
-        std::time::Duration::from_millis(300),
-        move || {
-            // Clear the cell so a future schedule_debounced_save does not try
-            // to remove this already-consumed source.
-            if let Some(p) = pending_weak.upgrade() {
-                p.set(Option::<gtk4::glib::SourceId>::None);
-            }
-            if let Err(e) = config.borrow().save() {
-                log::error!("Debounced config save failed: {e}");
-            } else {
-                log::debug!("Debounced config saved");
-            }
-        },
-    );
+    let id = gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+        // Clear the cell so a future schedule_debounced_save does not try
+        // to remove this already-consumed source.
+        if let Some(p) = pending_weak.upgrade() {
+            p.set(Option::<gtk4::glib::SourceId>::None);
+        }
+        if let Err(e) = config.borrow().save() {
+            log::error!("Debounced config save failed: {e}");
+        } else {
+            log::debug!("Debounced config saved");
+        }
+    });
     pending.set(Some(id));
 }
 
@@ -617,14 +608,35 @@ fn handle_tray_command(
     match cmd {
         TrayCommand::Toggle => {
             let new_state = !config.enabled;
-            handle_ui_event(UiEvent::EnableToggled(new_state), pipeline, config, pw_manager, last_explicit, current_capture_target);
+            handle_ui_event(
+                UiEvent::EnableToggled(new_state),
+                pipeline,
+                config,
+                pw_manager,
+                last_explicit,
+                current_capture_target,
+            );
         }
         TrayCommand::SetEngine(engine_type) => {
-            handle_ui_event(UiEvent::EngineChanged(engine_type), pipeline, config, pw_manager, last_explicit, current_capture_target);
+            handle_ui_event(
+                UiEvent::EngineChanged(engine_type),
+                pipeline,
+                config,
+                pw_manager,
+                last_explicit,
+                current_capture_target,
+            );
         }
         TrayCommand::ToggleMonitor => {
             let new_state = !config.monitor_enabled;
-            handle_ui_event(UiEvent::MonitorToggled(new_state), pipeline, config, pw_manager, last_explicit, current_capture_target);
+            handle_ui_event(
+                UiEvent::MonitorToggled(new_state),
+                pipeline,
+                config,
+                pw_manager,
+                last_explicit,
+                current_capture_target,
+            );
         }
         TrayCommand::OpenWindow => {
             log::info!("Open main window requested (not yet implemented in headless mode)");
@@ -650,7 +662,9 @@ fn handle_tray_command(
             }
             #[cfg(not(all(feature = "updater", feature = "gui")))]
             {
-                log::warn!("tray: OpenReleasesPage requested but updater/gui features are disabled");
+                log::warn!(
+                    "tray: OpenReleasesPage requested but updater/gui features are disabled"
+                );
             }
         }
     }
@@ -768,8 +782,7 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
         }
         _ => {
             log::warn!("Ring buffers not available — audio pipeline running in simulation mode");
-            AudioPipeline::new()
-                .context("failed to spawn audio thread in simulation mode")?
+            AudioPipeline::new().context("failed to spawn audio thread in simulation mode")?
         }
     };
 
@@ -842,9 +855,7 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
         devices.is_empty() && system_default_name.is_none()
     };
     if startup_no_input {
-        log::warn!(
-            "D-10 at startup: no input device available — pipeline will not auto-start"
-        );
+        log::warn!("D-10 at startup: no input device available — pipeline will not auto-start");
         // Prevent the enable toggle from rendering as on against an absent
         // source. Matches the transition-into-D-10 behaviour from the 1500ms
         // timer (set_input_available(false) forces the toggle off which
@@ -910,10 +921,24 @@ fn run_headless(
 
     while !is_shutdown_requested() {
         while let Ok(event) = ui_rx.try_recv() {
-            handle_ui_event(event, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless, &current_capture_target_headless);
+            handle_ui_event(
+                event,
+                &pipeline,
+                &mut config,
+                &mut pw_manager,
+                &last_explicit_headless,
+                &current_capture_target_headless,
+            );
         }
         while let Ok(cmd) = tray_rx.try_recv() {
-            handle_tray_command(cmd, &pipeline, &mut config, &mut pw_manager, &last_explicit_headless, &current_capture_target_headless);
+            handle_tray_command(
+                cmd,
+                &pipeline,
+                &mut config,
+                &mut pw_manager,
+                &last_explicit_headless,
+                &current_capture_target_headless,
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -978,7 +1003,10 @@ fn run_with_gui(
         let (tray_cmd_tx, tray_cmd_rx) = mpsc::channel::<TrayCommand>();
 
         let tray = CleanMicTray {
-            state: tray_state.as_ref().expect("tray_state set when tray_available").clone(),
+            state: tray_state
+                .as_ref()
+                .expect("tray_state set when tray_available")
+                .clone(),
             sender: tray_cmd_tx,
         };
 
@@ -1035,9 +1063,8 @@ fn run_with_gui(
     // explicit UI picks (DeviceChanged / DeviceChangedToDefault) — auto-switch
     // never writes. Wrapped in Rc so both the 33ms timer and the 1500ms timer
     // can clone it into their closures. Per D-03, D-06, D-07.
-    let last_explicit_input_device: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(
-        config.borrow().input_device.clone(),
-    ));
+    let last_explicit_input_device: Rc<RefCell<Option<String>>> =
+        Rc::new(RefCell::new(config.borrow().input_device.clone()));
 
     // App-layer record of the PipeWire node name the capture stream is
     // currently pinned to. Used by the 1500ms polling timer (Task 2 of
@@ -1063,7 +1090,8 @@ fn run_with_gui(
     };
 
     // Pending debounced config save (for rapid-fire events: strength, engine, device).
-    let pending_save: Rc<std::cell::Cell<Option<glib::SourceId>>> = Rc::new(std::cell::Cell::new(None));
+    let pending_save: Rc<std::cell::Cell<Option<glib::SourceId>>> =
+        Rc::new(std::cell::Cell::new(None));
 
     #[cfg(feature = "tray")]
     let tray_state = Rc::new(tray_state);
@@ -2054,7 +2082,8 @@ fn sync_tray_state(
     use crate::tray::TrayState;
     if let (Some(state), Some(handle)) = (tray_state.as_deref(), tray_handle) {
         {
-            let mut ts: std::sync::MutexGuard<TrayState> = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ts: std::sync::MutexGuard<TrayState> =
+                state.lock().unwrap_or_else(|e| e.into_inner());
             ts.set_active(config.enabled)
                 .set_engine(config.engine)
                 .set_mode(config.mode)
@@ -2080,8 +2109,14 @@ mod tests {
     fn should_hide_main_window_on_autostart_truth_table() {
         use super::should_hide_main_window_on_autostart as gate;
         assert!(gate(true, true), "autostart + tray → hide");
-        assert!(!gate(true, false), "autostart + no tray → minimize path, not hide");
-        assert!(!gate(false, true), "manual launch → always show, even with tray");
+        assert!(
+            !gate(true, false),
+            "autostart + no tray → minimize path, not hide"
+        );
+        assert!(
+            !gate(false, true),
+            "manual launch → always show, even with tray"
+        );
         assert!(!gate(false, false), "manual launch + no tray → show");
     }
 
@@ -2093,9 +2128,18 @@ mod tests {
     #[test]
     fn should_minimize_on_autostart_truth_table() {
         use super::should_minimize_on_autostart as gate;
-        assert!(!gate(true, true), "autostart + tray → hide path, not minimize");
-        assert!(gate(true, false), "autostart + no tray → minimize (industry pattern)");
-        assert!(!gate(false, true), "manual launch → always show, even with tray");
+        assert!(
+            !gate(true, true),
+            "autostart + tray → hide path, not minimize"
+        );
+        assert!(
+            gate(true, false),
+            "autostart + no tray → minimize (industry pattern)"
+        );
+        assert!(
+            !gate(false, true),
+            "manual launch → always show, even with tray"
+        );
         assert!(!gate(false, false), "manual launch + no tray → show");
     }
 
@@ -2272,10 +2316,24 @@ mod tests {
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_ui_event(UiEvent::EnableToggled(false), &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
+        handle_ui_event(
+            UiEvent::EnableToggled(false),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
         assert!(!config.enabled);
 
-        handle_ui_event(UiEvent::EnableToggled(true), &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
+        handle_ui_event(
+            UiEvent::EnableToggled(true),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
         assert!(config.enabled);
 
         drop(pipeline);
@@ -2306,7 +2364,11 @@ mod tests {
         );
         // Khip unavailable — fallback chain assigns best available engine (D-02).
         // Config should have been updated to the actual engine used.
-        assert_ne!(config.engine, EngineType::Khip, "Khip should not be set when unavailable");
+        assert_ne!(
+            config.engine,
+            EngineType::Khip,
+            "Khip should not be set when unavailable"
+        );
 
         drop(pipeline);
     }
@@ -2321,10 +2383,24 @@ mod tests {
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
+        handle_tray_command(
+            TrayCommand::Toggle,
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
         assert!(!config.enabled);
 
-        handle_tray_command(TrayCommand::Toggle, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
+        handle_tray_command(
+            TrayCommand::Toggle,
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
         assert!(config.enabled);
 
         drop(pipeline);
@@ -2341,7 +2417,14 @@ mod tests {
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
-        handle_tray_command(TrayCommand::Quit, &pipeline, &mut config, &mut pw, &last_explicit_test, &current_capture_target_test);
+        handle_tray_command(
+            TrayCommand::Quit,
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
         assert!(is_shutdown_requested());
 
         // Cleanup.

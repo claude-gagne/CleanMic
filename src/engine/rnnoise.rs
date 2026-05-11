@@ -228,8 +228,7 @@ impl NoiseEngine for RNNoiseEngine {
                 // input but be robust to sub-frame tails).
                 if pos < input.len() {
                     let remaining = input.len() - pos;
-                    let vad =
-                        apply_frame(state, &input[pos..], &mut scratch_in, &mut scratch_out);
+                    let vad = apply_frame(state, &input[pos..], &mut scratch_in, &mut scratch_out);
 
                     // Continuous VAD-based target instead of a hard step:
                     // glide from full attenuation (vad=0, pure noise) up to
@@ -247,10 +246,7 @@ impl NoiseEngine for RNNoiseEngine {
 
                     let gate = self.gate_gain;
                     let out_tail = &mut output[pos..];
-                    for (src, dst) in scratch_out[..remaining]
-                        .iter()
-                        .zip(out_tail.iter_mut())
-                    {
+                    for (src, dst) in scratch_out[..remaining].iter().zip(out_tail.iter_mut()) {
                         *dst = (*src / I16_SCALE) * gate;
                     }
                 }
@@ -321,39 +317,67 @@ mod tests {
     fn strength_mapping_at_0() {
         let p = map_strength(0.0);
         assert!(approx_eq(p.vad_threshold, 0.85), "got {}", p.vad_threshold);
-        assert!(approx_eq(p.attenuation_db, -1.0), "got {}", p.attenuation_db);
+        assert!(
+            approx_eq(p.attenuation_db, -1.0),
+            "got {}",
+            p.attenuation_db
+        );
     }
 
     #[test]
     fn strength_mapping_at_0_5() {
         let p = map_strength(0.5);
         assert!(approx_eq(p.vad_threshold, 0.675), "got {}", p.vad_threshold);
-        assert!(approx_eq(p.attenuation_db, -4.5), "got {}", p.attenuation_db);
+        assert!(
+            approx_eq(p.attenuation_db, -4.5),
+            "got {}",
+            p.attenuation_db
+        );
     }
 
     #[test]
     fn strength_mapping_at_1() {
         let p = map_strength(1.0);
         assert!(approx_eq(p.vad_threshold, 0.50), "got {}", p.vad_threshold);
-        assert!(approx_eq(p.attenuation_db, -8.0), "got {}", p.attenuation_db);
+        assert!(
+            approx_eq(p.attenuation_db, -8.0),
+            "got {}",
+            p.attenuation_db
+        );
     }
 
     #[test]
     fn strength_mapping_at_0_25() {
         let p = map_strength(0.25);
         // vad: lerp(0.85, 0.50, 0.25) = 0.7625
-        assert!(approx_eq(p.vad_threshold, 0.7625), "got {}", p.vad_threshold);
+        assert!(
+            approx_eq(p.vad_threshold, 0.7625),
+            "got {}",
+            p.vad_threshold
+        );
         // atten: lerp(-1, -8, 0.25) = -2.75
-        assert!(approx_eq(p.attenuation_db, -2.75), "got {}", p.attenuation_db);
+        assert!(
+            approx_eq(p.attenuation_db, -2.75),
+            "got {}",
+            p.attenuation_db
+        );
     }
 
     #[test]
     fn strength_mapping_at_0_75() {
         let p = map_strength(0.75);
         // vad: lerp(0.85, 0.50, 0.75) = 0.5875
-        assert!(approx_eq(p.vad_threshold, 0.5875), "got {}", p.vad_threshold);
+        assert!(
+            approx_eq(p.vad_threshold, 0.5875),
+            "got {}",
+            p.vad_threshold
+        );
         // atten: lerp(-1, -8, 0.75) = -6.25
-        assert!(approx_eq(p.attenuation_db, -6.25), "got {}", p.attenuation_db);
+        assert!(
+            approx_eq(p.attenuation_db, -6.25),
+            "got {}",
+            p.attenuation_db
+        );
     }
 
     #[test]
@@ -495,7 +519,9 @@ mod tests {
         // RNNoise processes audio — verify it produces different output than input.
         // With short warm-up, suppression amount varies; just verify the engine
         // ran without panic and produced non-identical output.
-        let differs = analysis_input.iter().zip(analysis_output.iter())
+        let differs = analysis_input
+            .iter()
+            .zip(analysis_output.iter())
             .any(|(i, o)| (i - o).abs() > 1e-6);
         assert!(
             differs,

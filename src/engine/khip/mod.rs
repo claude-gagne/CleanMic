@@ -62,11 +62,17 @@ static WARN_EMITTED: AtomicBool = AtomicBool::new(false);
 /// Validate that a library path is safe to load.
 pub fn validate_library_path(path: &Path) -> Result<()> {
     if !path.is_absolute() {
-        bail!("Khip library path must be absolute, got: {}", path.display());
+        bail!(
+            "Khip library path must be absolute, got: {}",
+            path.display()
+        );
     }
     for component in path.components() {
         if let std::path::Component::ParentDir = component {
-            bail!("Khip library path contains '..' traversal: {}", path.display());
+            bail!(
+                "Khip library path contains '..' traversal: {}",
+                path.display()
+            );
         }
     }
 
@@ -74,7 +80,10 @@ pub fn validate_library_path(path: &Path) -> Result<()> {
         Ok(resolved) => {
             for component in resolved.components() {
                 if let std::path::Component::ParentDir = component {
-                    bail!("Khip resolved path contains '..' traversal: {}", resolved.display());
+                    bail!(
+                        "Khip resolved path contains '..' traversal: {}",
+                        resolved.display()
+                    );
                 }
             }
             resolved
@@ -96,7 +105,10 @@ pub fn validate_library_path(path: &Path) -> Result<()> {
         bail!(
             "Khip library path is not in an allowed directory. \
              Allowed: {:?}. Got: {}",
-            all_allowed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            all_allowed
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
             parent.display()
         );
     }
@@ -181,7 +193,10 @@ impl KhipEngine {
     }
 
     pub fn with_library_path(path: PathBuf) -> Self {
-        Self { custom_library_path: Some(path), ..Self::new() }
+        Self {
+            custom_library_path: Some(path),
+            ..Self::new()
+        }
     }
 
     /// Return true if `libkhip.so` can be found in a valid path.
@@ -192,14 +207,14 @@ impl KhipEngine {
     fn resolve_library_path(&self) -> Result<PathBuf> {
         if let Some(ref custom) = self.custom_library_path {
             validate_library_path(custom)?;
-            anyhow::ensure!(custom.is_file(), "Khip library not found at {}", custom.display());
+            anyhow::ensure!(
+                custom.is_file(),
+                "Khip library not found at {}",
+                custom.display()
+            );
             Ok(custom.clone())
         } else {
-            find_library().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Khip library not found."
-                )
-            })
+            find_library().ok_or_else(|| anyhow::anyhow!("Khip library not found."))
         }
     }
 }
@@ -212,7 +227,10 @@ impl Default for KhipEngine {
 
 impl NoiseEngine for KhipEngine {
     fn init(&mut self, sample_rate: u32) -> Result<()> {
-        anyhow::ensure!(sample_rate == 48_000, "Pipeline must run at 48 kHz, got {sample_rate}");
+        anyhow::ensure!(
+            sample_rate == 48_000,
+            "Pipeline must run at 48 kHz, got {sample_rate}"
+        );
 
         let lib_path = self.resolve_library_path()?;
         log::info!("Khip: loading library from {}", lib_path.display());
@@ -241,16 +259,26 @@ impl NoiseEngine for KhipEngine {
         // Resolve all function pointers. Dereferencing Symbol<F> copies the
         // function pointer value — it remains valid while `library` is alive.
         let functions = unsafe {
-            let create: unsafe extern "C" fn() -> *mut ffi::KhipSession =
-                *library.get(b"khip_create\0").context("khip_create not found in library")?;
-            let destroy: unsafe extern "C" fn(*mut ffi::KhipSession) =
-                *library.get(b"khip_destroy\0").context("khip_destroy not found in library")?;
-            let reset: unsafe extern "C" fn(*mut ffi::KhipSession) =
-                *library.get(b"khip_reset\0").context("khip_reset not found in library")?;
+            let create: unsafe extern "C" fn() -> *mut ffi::KhipSession = *library
+                .get(b"khip_create\0")
+                .context("khip_create not found in library")?;
+            let destroy: unsafe extern "C" fn(*mut ffi::KhipSession) = *library
+                .get(b"khip_destroy\0")
+                .context("khip_destroy not found in library")?;
+            let reset: unsafe extern "C" fn(*mut ffi::KhipSession) = *library
+                .get(b"khip_reset\0")
+                .context("khip_reset not found in library")?;
             let process: unsafe extern "C" fn(*mut ffi::KhipSession, *const f32, *mut f32, f32) =
-                *library.get(b"khip_process\0").context("khip_process not found in library")?;
+                *library
+                    .get(b"khip_process\0")
+                    .context("khip_process not found in library")?;
 
-            ffi::KhipFunctions { create, destroy, reset, process }
+            ffi::KhipFunctions {
+                create,
+                destroy,
+                reset,
+                process,
+            }
         };
 
         let session = unsafe { (functions.create)() };
@@ -302,7 +330,12 @@ impl NoiseEngine for KhipEngine {
             // SAFETY: session is non-null and library is loaded; buffers are
             // correctly sized for the library's expectations.
             unsafe {
-                (fns.process)(self.session, chunk_32k.as_ptr(), out_32k.as_mut_ptr(), self.attenuation);
+                (fns.process)(
+                    self.session,
+                    chunk_32k.as_ptr(),
+                    out_32k.as_mut_ptr(),
+                    self.attenuation,
+                );
             }
 
             let out_48k = upsample_32_to_48(&out_32k);
@@ -333,7 +366,11 @@ impl NoiseEngine for KhipEngine {
         } else {
             1.0 // Strong — maximum cancellation
         };
-        log::info!("Khip: strength {:.3} → attenuation {:.2}", strength, self.attenuation);
+        log::info!(
+            "Khip: strength {:.3} → attenuation {:.2}",
+            strength,
+            self.attenuation
+        );
     }
 
     fn set_mode(&mut self, _mode: ProcessingMode) {
@@ -374,7 +411,11 @@ fn downsample_48_to_32(input: &[f32; ffi::BUF_SIZE_48K]) -> [f32; ffi::BUF_SIZE]
         let idx = pos as usize;
         let frac = pos - idx as f32;
         let a = input[idx];
-        let b = if idx + 1 < ffi::BUF_SIZE_48K { input[idx + 1] } else { a };
+        let b = if idx + 1 < ffi::BUF_SIZE_48K {
+            input[idx + 1]
+        } else {
+            a
+        };
         *s = a + frac * (b - a);
     }
     out
@@ -415,7 +456,11 @@ mod tests {
     fn reject_outside_allowed_dirs() {
         let r = validate_library_path(Path::new("/tmp/libkhip.so"));
         assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("not in an allowed directory"));
+        assert!(
+            r.unwrap_err()
+                .to_string()
+                .contains("not in an allowed directory")
+        );
     }
 
     #[test]

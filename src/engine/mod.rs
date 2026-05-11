@@ -127,7 +127,11 @@ impl NoiseEngine for PassthroughEngine {
 /// a [`PassthroughEngine`] that copies audio unchanged.
 pub fn create_engine_with_fallback(preferred: EngineType) -> (Box<dyn NoiseEngine>, EngineType) {
     let chain: &[EngineType] = match preferred {
-        EngineType::Khip => &[EngineType::Khip, EngineType::DeepFilterNet, EngineType::RNNoise],
+        EngineType::Khip => &[
+            EngineType::Khip,
+            EngineType::DeepFilterNet,
+            EngineType::RNNoise,
+        ],
         EngineType::DeepFilterNet => &[EngineType::DeepFilterNet, EngineType::RNNoise],
         EngineType::RNNoise => &[EngineType::RNNoise],
     };
