@@ -1,7 +1,3 @@
-CleanMic v1.0.4 — Fedora support.
-
-A reliability follow-up to v1.0.3, driven by a Fedora 44 UAT pass.
-
 ## What's new in v1.0.4
 
 ### Fedora support
