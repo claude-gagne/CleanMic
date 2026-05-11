@@ -22,9 +22,8 @@
 //!         └── AdwSwitchRow   — monitor (listen to processed mic)
 //! ```
 //!
-//! Only compiled when the `gui` feature is enabled.
-
-#![cfg(feature = "gui")]
+//! Only compiled when the `gui` feature is enabled (gated on the `pub mod
+//! window` declaration in `src/ui/mod.rs`).
 
 use std::cell::Cell;
 use std::rc::Rc;

@@ -384,11 +384,11 @@ impl NoiseEngine for KhipEngine {
 
     fn teardown(&mut self) {
         if self.initialized {
-            if let Some(ref fns) = self.functions {
-                if !self.session.is_null() {
-                    unsafe { (fns.destroy)(self.session) };
-                    self.session = std::ptr::null_mut();
-                }
+            if let Some(ref fns) = self.functions
+                && !self.session.is_null()
+            {
+                unsafe { (fns.destroy)(self.session) };
+                self.session = std::ptr::null_mut();
             }
             self.functions = None;
             self.library = None; // dlclose

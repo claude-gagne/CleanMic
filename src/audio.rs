@@ -638,13 +638,9 @@ fn audio_thread_main(
                                     &mut output_buf,
                                     &mut crossfade_old_buf,
                                 );
-                                if done {
-                                    if let Some(mut finished) = crossfade.take() {
-                                        finished.old_engine.teardown();
-                                        log::info!(
-                                            "Engine crossfade complete, old engine torn down"
-                                        );
-                                    }
+                                if done && let Some(mut finished) = crossfade.take() {
+                                    finished.old_engine.teardown();
+                                    log::info!("Engine crossfade complete, old engine torn down");
                                 }
                             } else {
                                 process_buffer(&mut engine, &input_buf, &mut output_buf);
@@ -708,11 +704,9 @@ fn audio_thread_main(
                             &mut output_buf,
                             &mut crossfade_old_buf,
                         );
-                        if done {
-                            if let Some(mut finished) = crossfade.take() {
-                                finished.old_engine.teardown();
-                                log::info!("Engine crossfade complete, old engine torn down");
-                            }
+                        if done && let Some(mut finished) = crossfade.take() {
+                            finished.old_engine.teardown();
+                            log::info!("Engine crossfade complete, old engine torn down");
                         }
                     } else {
                         process_buffer(&mut engine, &input_buf, &mut output_buf);

@@ -183,11 +183,11 @@ impl DeepFilterEngine {
     ///
     /// Presets:
     /// - Low    (< 0.33): 35 dB cap — noticeable bite on transients
-    ///                    (fan + keyboard + mouse) while leaving voice
-    ///                    character largely intact.
+    ///   (fan + keyboard + mouse) while leaving voice
+    ///   character largely intact.
     /// - Medium (< 0.67): balanced — 50 dB cap, EasyEffects default level.
     /// - High   (≥ 0.67): maximum — 100 dB cap + post-filter beta 0.05
-    ///                    for aggressive residual cleanup.
+    ///   for aggressive residual cleanup.
     fn strength_to_params(strength: f32) -> (f32, f32, f32, f32, f32) {
         // Returns (atten_lim, min_proc, max_erb, max_df, post_beta)
         const MIN_PROC: f32 = -10.0;
