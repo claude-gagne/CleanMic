@@ -23,6 +23,33 @@ fn limit_thread_pools() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Hand-rolled --version / --help handlers. Run before logging init so
+    // their stdout is not polluted by env_logger INFO lines. Mirrors the
+    // existing --autostart flag-parsing pattern (no clap dep).
+    let args: Vec<String> = std::env::args().collect();
+    if parse_version_flag(&args) {
+        println!("cleanmic {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    if parse_help_flag(&args) {
+        println!(
+            "CleanMic — clean virtual microphone with switchable noise suppression engines.\n\
+             \n\
+             USAGE:\n\
+             \x20   cleanmic [FLAGS]\n\
+             \n\
+             FLAGS:\n\
+             \x20   -h, --help         Print this help message and exit.\n\
+             \x20   -V, --version      Print version information and exit.\n\
+             \x20       --autostart    Internal flag set by the autostart .desktop file —\n\
+             \x20                      signals that the binary was launched by the user's\n\
+             \x20                      session autostart hook (vs a manual launcher click).\n\
+             \n\
+             For documentation, visit: https://github.com/claude-gagne/CleanMic"
+        );
+        std::process::exit(0);
+    }
+
     limit_thread_pools();
 
     // Initialize logging. Default to "info" level if RUST_LOG is not set.
@@ -80,6 +107,36 @@ where
     args.into_iter().any(|a| a.as_ref() == "--autostart")
 }
 
+/// Return `true` if `--version` or `-V` is present anywhere in the args iterator.
+///
+/// Matches the exact args `--version` or `-V` with no value form. Lifted into a
+/// helper purely so it can be unit-tested without invoking the GTK runtime.
+fn parse_version_flag<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|a| {
+        let s = a.as_ref();
+        s == "--version" || s == "-V"
+    })
+}
+
+/// Return `true` if `--help` or `-h` is present anywhere in the args iterator.
+///
+/// Matches the exact args `--help` or `-h` with no value form. Lifted into a
+/// helper purely so it can be unit-tested without invoking the GTK runtime.
+fn parse_help_flag<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|a| {
+        let s = a.as_ref();
+        s == "--help" || s == "-h"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +170,41 @@ mod tests {
     fn parse_autostart_flag_finds_flag_among_other_args() {
         // Future-proofing: even if we add other flags later, --autostart is found.
         assert!(parse_autostart_flag(["cleanmic", "--foo", "--autostart", "--bar"]));
+    }
+
+    #[test]
+    fn parse_version_flag_detects_long_form() {
+        assert!(parse_version_flag(["cleanmic", "--version"]));
+    }
+
+    #[test]
+    fn parse_version_flag_detects_short_form() {
+        assert!(parse_version_flag(["cleanmic", "-V"]));
+    }
+
+    #[test]
+    fn parse_version_flag_returns_false_without() {
+        assert!(!parse_version_flag(["cleanmic"]));
+    }
+
+    #[test]
+    fn parse_version_flag_does_not_match_substrings() {
+        assert!(!parse_version_flag(["cleanmic", "--versions"]));
+        assert!(!parse_version_flag(["cleanmic", "version"]));
+    }
+
+    #[test]
+    fn parse_help_flag_detects_long_form() {
+        assert!(parse_help_flag(["cleanmic", "--help"]));
+    }
+
+    #[test]
+    fn parse_help_flag_detects_short_form() {
+        assert!(parse_help_flag(["cleanmic", "-h"]));
+    }
+
+    #[test]
+    fn parse_help_flag_returns_false_without() {
+        assert!(!parse_help_flag(["cleanmic"]));
     }
 }
