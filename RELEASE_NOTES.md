@@ -20,3 +20,7 @@
 - PipeWire only — PulseAudio is not supported
 - Linux x86_64 only
 - Khip engine is optional — requires a user-supplied library, not bundled. See "Using Khip" in the README.
+
+## Support
+
+If CleanMic is useful to you, you can [buy me a coffee](https://buymeacoffee.com/claudegagne).
