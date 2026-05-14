@@ -733,6 +733,19 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
     // -- Load config --
     let mut config = Config::load().context("failed to load configuration")?;
 
+    // -- Reconcile autostart drift ----------------------------------------
+    // If the on-disk autostart .desktop file disagrees with config.autostart
+    // (e.g. orphan from an earlier session — see quick task 260514-bbp),
+    // mutate the filesystem to match config. Self-healing on every startup.
+    match crate::autostart::is_autostart_enabled() {
+        Ok(actual) => {
+            if let Err(e) = crate::autostart::reconcile(config.autostart, actual) {
+                log::error!("autostart reconciliation failed: {}", e);
+            }
+        }
+        Err(e) => log::warn!("Failed to check autostart state for reconciliation: {}", e),
+    }
+
     // -- Connect to PipeWire --
     let mut pw_manager = PipeWireManager::connect()
         .inspect_err(|_e| {

@@ -235,6 +235,25 @@ pub fn is_autostart_enabled() -> Result<bool> {
     Ok(is_autostart_enabled_in(&default_autostart_dir()))
 }
 
+/// Reconcile the on-disk autostart state with the user's stated intent (config).
+/// If they disagree, mutate the filesystem to match config. Logged at warn level
+/// because drift is unexpected; the fix self-heals.
+pub fn reconcile(config_value: bool, actual: bool) -> Result<()> {
+    if config_value == actual {
+        return Ok(());
+    }
+    log::warn!(
+        "autostart drift detected (config={}, filesystem={}). Reconciling to match config.",
+        config_value,
+        actual
+    );
+    if config_value {
+        enable_autostart()
+    } else {
+        disable_autostart()
+    }
+}
+
 // -- Internal helpers used by both the public API and tests ------------------
 
 fn install_desktop_integration_in(applications_dir: &Path, icons_dir: &Path) -> Result<()> {
@@ -276,6 +295,19 @@ fn disable_autostart_in(autostart_dir: &Path) -> Result<()> {
 
 fn is_autostart_enabled_in(autostart_dir: &Path) -> bool {
     autostart_dir.join(DESKTOP_FILENAME).exists()
+}
+
+#[cfg(test)]
+fn reconcile_in(config_value: bool, autostart_dir: &Path, applications_dir: &Path) -> Result<()> {
+    let actual = is_autostart_enabled_in(autostart_dir);
+    if config_value == actual {
+        return Ok(());
+    }
+    if config_value {
+        enable_autostart_in(autostart_dir, applications_dir)
+    } else {
+        disable_autostart_in(autostart_dir)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +411,57 @@ mod tests {
 
         // Should not error even if the file doesn't exist.
         disable_autostart_in(&autostart).expect("disable when not enabled should succeed");
+    }
+
+    #[test]
+    fn reconcile_noop_when_both_true() {
+        let (_tmp, autostart, applications) = setup_temp_dirs();
+        enable_autostart_in(&autostart, &applications).expect("enable failed");
+        assert!(is_autostart_enabled_in(&autostart));
+
+        reconcile_in(true, &autostart, &applications).expect("reconcile failed");
+
+        // No change: file still present.
+        assert!(is_autostart_enabled_in(&autostart));
+    }
+
+    #[test]
+    fn reconcile_noop_when_both_false() {
+        let (_tmp, autostart, applications) = setup_temp_dirs();
+        assert!(!is_autostart_enabled_in(&autostart));
+
+        reconcile_in(false, &autostart, &applications).expect("reconcile failed");
+
+        // No change: file still absent.
+        assert!(!is_autostart_enabled_in(&autostart));
+    }
+
+    #[test]
+    fn reconcile_enables_when_config_true_filesystem_false() {
+        let (_tmp, autostart, applications) = setup_temp_dirs();
+        assert!(!is_autostart_enabled_in(&autostart));
+
+        reconcile_in(true, &autostart, &applications).expect("reconcile failed");
+
+        assert!(
+            is_autostart_enabled_in(&autostart),
+            "reconcile should have enabled autostart to match config"
+        );
+    }
+
+    #[test]
+    fn reconcile_disables_when_config_false_filesystem_true() {
+        let (_tmp, autostart, applications) = setup_temp_dirs();
+        // Simulate the drift bug: filesystem has the entry, config doesn't.
+        enable_autostart_in(&autostart, &applications).expect("enable failed");
+        assert!(is_autostart_enabled_in(&autostart));
+
+        reconcile_in(false, &autostart, &applications).expect("reconcile failed");
+
+        assert!(
+            !is_autostart_enabled_in(&autostart),
+            "reconcile should have removed the orphan autostart entry"
+        );
     }
 
     #[test]
