@@ -1,23 +1,13 @@
-## What's new in v1.0.4
+## What's new in v1.0.5
 
-### Fedora support
+### Bug fixes
 
-- **Khip auto-discovery now covers `/usr/lib64` and `/usr/local/lib64`**, the standard system-wide library directories on Fedora, openSUSE, RHEL, Alma, and Rocky. Dropping `libkhip.so` into either path now works as expected.
-- **Confirmed working on Fedora 44** (GNOME on Wayland).
+- **Autostart toggle now correctly reflects whether CleanMic actually starts on login.** Previously, the toggle could show "off" while a stale autostart entry from an earlier session continued to fire every login. v1.0.5 detects this drift on startup and reconciles the system state to match what the toggle says.
 
-### Autostart UX
-
-- **CleanMic now detects whether your desktop has a system tray and adapts.** On desktops without an AppIndicator extension (default GNOME on Fedora, Ubuntu, and others), the autostart flow launches the window minimized to the taskbar instead of trying to hide it.
-
-### Window controls
-
-- **New header-bar minimize button.**
-- **New hamburger menu** with "Report an issue" so you can file bugs straight from the app.
-
-## Upgrading from v1.0.3
+## Upgrading from v1.0.4
 
 - Your existing config at `~/.config/cleanmic/config.toml` loads unchanged.
-- If you had `libkhip.so` installed in `~/.local/lib/` or `/usr/lib/` for v1.0.3, you can leave it there — those paths are still searched. The new `/usr/lib64` and `/usr/local/lib64` entries are additive.
+- If you previously experienced the autostart-toggle drift (CleanMic starting at login despite the toggle being off), upgrading to v1.0.5 cleans up the stale entry on first launch.
 
 ## System Requirements
 
@@ -25,7 +15,7 @@
 - GTK4 + libadwaita
 - The AppImage requires libfuse3
 
-## Known Limitations (unchanged from v1.0.3)
+## Known Limitations (unchanged from v1.0.4)
 
 - PipeWire only — PulseAudio is not supported
 - Linux x86_64 only
