@@ -56,20 +56,10 @@ Other modern Linux distros (Debian 13, Bazzite, Arch, openSUSE Tumbleweed, etc.)
 The Khip engine is user-supplied — CleanMic does not ship the library
 because its license forbids redistribution. To enable Khip:
 
-1. Build Khip from upstream source:
+1. Copy `libkhip.so` into a directory CleanMic searches:
 
     ```bash
-    git clone https://github.com/repository/khip
-    cd khip
-    meson setup build
-    cd build
-    ninja
-    ```
-
-2. Copy the resulting library into a directory CleanMic searches:
-
-    ```bash
-    cp build/libkhip.so ~/.local/lib/
+    cp libkhip.so ~/.local/lib/
     ```
 
     CleanMic searches (in order): `~/.local/lib`, `/usr/local/lib`,
@@ -79,7 +69,7 @@ because its license forbids redistribution. To enable Khip:
     install, use `/usr/lib64/` on RPM distros (Fedora, openSUSE, RHEL,
     Rocky, Alma) or `/usr/lib/` on Debian-family distros (Debian, Ubuntu).
 
-3. CleanMic auto-detects within ~1.5 seconds — no relaunch needed.
+2. CleanMic auto-detects within ~1.5 seconds — no relaunch needed.
    The "Khip (not installed)" row in the engine selector flips to
    plain "Khip" and becomes selectable.
 
