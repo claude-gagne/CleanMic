@@ -2571,16 +2571,15 @@ mod tests {
         #[test]
         fn returns_true_on_first_attempt_when_watcher_already_present() {
             let mut calls = 0u32;
-            let result = wait_for_sni_watcher_with_probe(
-                6,
-                std::time::Duration::ZERO,
-                || {
-                    calls += 1;
-                    true // watcher present from the start
-                },
-            );
+            let result = wait_for_sni_watcher_with_probe(6, std::time::Duration::ZERO, || {
+                calls += 1;
+                true // watcher present from the start
+            });
             assert!(result, "should return true when watcher is present");
-            assert_eq!(calls, 1, "should probe exactly once when first attempt succeeds");
+            assert_eq!(
+                calls, 1,
+                "should probe exactly once when first attempt succeeds"
+            );
         }
 
         /// When the watcher registers on the Nth attempt, the function returns
@@ -2588,14 +2587,10 @@ mod tests {
         #[test]
         fn returns_true_when_watcher_appears_on_later_attempt() {
             let mut calls = 0u32;
-            let result = wait_for_sni_watcher_with_probe(
-                6,
-                std::time::Duration::ZERO,
-                || {
-                    calls += 1;
-                    calls >= 3 // watcher appears on 3rd attempt (simulates login race)
-                },
-            );
+            let result = wait_for_sni_watcher_with_probe(6, std::time::Duration::ZERO, || {
+                calls += 1;
+                calls >= 3 // watcher appears on 3rd attempt (simulates login race)
+            });
             assert!(result, "should return true once watcher registers");
             assert_eq!(calls, 3, "should stop probing as soon as watcher is found");
         }
@@ -2605,14 +2600,10 @@ mod tests {
         #[test]
         fn returns_false_after_all_attempts_exhausted() {
             let mut calls = 0u32;
-            let result = wait_for_sni_watcher_with_probe(
-                4,
-                std::time::Duration::ZERO,
-                || {
-                    calls += 1;
-                    false // watcher never appears
-                },
-            );
+            let result = wait_for_sni_watcher_with_probe(4, std::time::Duration::ZERO, || {
+                calls += 1;
+                false // watcher never appears
+            });
             assert!(!result, "should return false when watcher is never present");
             assert_eq!(calls, 4, "should probe exactly max_attempts times");
         }
@@ -2623,21 +2614,19 @@ mod tests {
         fn single_attempt_no_retry() {
             // Single attempt, watcher absent.
             let mut calls = 0u32;
-            let result = wait_for_sni_watcher_with_probe(
-                1,
-                std::time::Duration::ZERO,
-                || { calls += 1; false },
-            );
+            let result = wait_for_sni_watcher_with_probe(1, std::time::Duration::ZERO, || {
+                calls += 1;
+                false
+            });
             assert!(!result);
             assert_eq!(calls, 1);
 
             // Single attempt, watcher present.
             calls = 0;
-            let result = wait_for_sni_watcher_with_probe(
-                1,
-                std::time::Duration::ZERO,
-                || { calls += 1; true },
-            );
+            let result = wait_for_sni_watcher_with_probe(1, std::time::Duration::ZERO, || {
+                calls += 1;
+                true
+            });
             assert!(result);
             assert_eq!(calls, 1);
         }
@@ -2650,14 +2639,10 @@ mod tests {
             let mut calls = 0u32;
             let max = 5u32;
             // Watcher becomes available only on the very last attempt.
-            let result = wait_for_sni_watcher_with_probe(
-                max,
-                std::time::Duration::ZERO,
-                || {
-                    calls += 1;
-                    calls == max
-                },
-            );
+            let result = wait_for_sni_watcher_with_probe(max, std::time::Duration::ZERO, || {
+                calls += 1;
+                calls == max
+            });
             assert!(result, "watcher found on last attempt → should return true");
             assert_eq!(calls, max, "all {} attempts should have been probed", max);
         }
