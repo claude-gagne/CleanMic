@@ -1,13 +1,13 @@
-## What's new in v1.0.5
+## What's new in v1.0.6
 
 ### Bug fixes
 
-- **Autostart toggle now correctly reflects whether CleanMic actually starts on login.** Previously, the toggle could show "off" while a stale autostart entry from an earlier session continued to fire every login. v1.0.5 detects this drift on startup and reconciles the system state to match what the toggle says.
+- **No more spurious "no system tray detected" notification at login.** When CleanMic started automatically on login, it sometimes checked for the system tray a moment before your desktop's tray support (the AppIndicator extension on GNOME) had finished loading. CleanMic would then wrongly conclude there was no tray, fall back to its no-tray behaviour, and show a "no notification area detected" message — even though your tray was working fine. v1.0.6 retries the check for a few seconds, so the tray is found as soon as it appears and the false warning no longer fires.
 
-## Upgrading from v1.0.4
+## Upgrading from v1.0.5
 
 - Your existing config at `~/.config/cleanmic/config.toml` loads unchanged.
-- If you previously experienced the autostart-toggle drift (CleanMic starting at login despite the toggle being off), upgrading to v1.0.5 cleans up the stale entry on first launch.
+- If you saw the occasional "no system tray detected" notification on login despite having a working tray, upgrading to v1.0.6 resolves it — no action needed.
 
 ## System Requirements
 
@@ -15,7 +15,7 @@
 - GTK4 + libadwaita
 - The AppImage requires libfuse3
 
-## Known Limitations (unchanged from v1.0.4)
+## Known Limitations (unchanged from v1.0.5)
 
 - PipeWire only — PulseAudio is not supported
 - Linux x86_64 only
