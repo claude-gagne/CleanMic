@@ -1,0 +1,27 @@
+name: i18n guard
+
+# Backstop for the local pre-commit hook (scripts/pre-commit-i18n-check.sh):
+# catches untranslated or unwrapped user-facing strings in pull requests from
+# contributors who have not installed the local hook. See the "i18n Discipline"
+# section of CLAUDE.md.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'locale/**'
+      - 'scripts/pre-commit-i18n-check.sh'
+
+jobs:
+  i18n-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need base branch history for the diff range
+
+      - name: Run i18n guard on PR diff
+        run: |
+          BASE="origin/${{ github.event.pull_request.base.ref }}"
+          git fetch --quiet origin "${{ github.event.pull_request.base.ref }}"
+          bash scripts/pre-commit-i18n-check.sh "${BASE}...HEAD"

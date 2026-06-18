@@ -30,6 +30,28 @@ Please run `make fmt` and `make lint` before opening a pull request, and keep
 each PR focused on a single concern. Large, unfocused PRs are likely to be
 closed or asked to be split.
 
+## Translations (i18n)
+
+CleanMic ships a French translation, and all user-facing strings must stay
+translatable. Two rules:
+
+1. **Wrap user-facing strings** (menu labels, notifications, window text) in
+   `gettext("…")`. Never build a visible label from a raw `format!("…")`.
+2. **Add the French translation in the same change** — put the `msgstr` in
+   `locale/fr/LC_MESSAGES/cleanmic.po`, then run `make mo`.
+
+Install the local guard once after cloning:
+
+```sh
+bash scripts/install-git-hooks.sh
+```
+
+This installs a `pre-commit` hook (`scripts/pre-commit-i18n-check.sh`) that
+blocks commits introducing an untranslated or unwrapped user-facing string.
+The same check runs on pull requests as a backstop. In a genuine exception you
+can bypass a single commit with `git commit --no-verify`, or mark a non-UI
+literal with a trailing `// i18n-ignore` comment.
+
 ## Code of conduct
 
 Participation in this project is governed by the
