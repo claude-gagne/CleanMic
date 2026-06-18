@@ -263,7 +263,7 @@ pub fn build_menu(state: &TrayState) -> Vec<MenuItem> {
     // Persistent update indicator — clicking opens Releases page (per 08.3 D-04).
     if let Some(ref version) = state.update_available {
         items.push(MenuItem::action(
-            format!("Update available: {}", version),
+            format!("{}: {}", gettext("Update available"), version),
             TrayCommand::OpenReleasesPage,
         ));
     }
