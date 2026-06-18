@@ -1,13 +1,17 @@
-## What's new in v1.0.6
+## What's new in v1.0.7
 
 ### Bug fixes
 
-- **No more spurious "no system tray detected" notification at login.** When CleanMic started automatically on login, it sometimes checked for the system tray a moment before your desktop's tray support (the AppIndicator extension on GNOME) had finished loading. CleanMic would then wrongly conclude there was no tray, fall back to its no-tray behaviour, and show a "no notification area detected" message — even though your tray was working fine. v1.0.6 retries the check for a few seconds, so the tray is found as soon as it appears and the false warning no longer fires.
+- **The "Update available" tray entry is now translated.** On a French desktop, the tray menu's update indicator showed the English "Update available: v…" while every other menu item was in French. It now reads "Mise à jour disponible : v…" — the translation already existed and is simply applied correctly.
 
-## Upgrading from v1.0.5
+### Under the hood
+
+- Added an automated translation guard (a pre-commit hook plus a pull-request check) that blocks any new user-facing text from shipping unwrapped or untranslated, so this class of mixed-language glitch can't slip through again.
+
+## Upgrading from v1.0.6
 
 - Your existing config at `~/.config/cleanmic/config.toml` loads unchanged.
-- If you saw the occasional "no system tray detected" notification on login despite having a working tray, upgrading to v1.0.6 resolves it — no action needed.
+- No action needed — the fix applies automatically on a French-locale system.
 
 ## System Requirements
 
@@ -15,7 +19,7 @@
 - GTK4 + libadwaita
 - The AppImage requires libfuse3
 
-## Known Limitations (unchanged from v1.0.5)
+## Known Limitations (unchanged from v1.0.6)
 
 - PipeWire only — PulseAudio is not supported
 - Linux x86_64 only
