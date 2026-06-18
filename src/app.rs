@@ -294,14 +294,14 @@ pub(crate) fn should_minimize_on_autostart(
     launched_via_autostart && !tray_available
 }
 
-/// Check if a StatusNotifierItem host (tray) is available on the D-Bus session bus.
+/// Perform a single D-Bus `ListNames` call and return whether
+/// `org.kde.StatusNotifierWatcher` is currently registered.
 ///
-/// Called once at startup. If `dbus-send` is not found, conservatively returns `false`.
-/// Uses the `org.kde.StatusNotifierWatcher` service name as a proxy for tray host
-/// availability — this watcher is registered whenever an AppIndicator-compatible
-/// tray host is running.
+/// This is the low-level primitive. Callers should use `wait_for_sni_watcher`
+/// which adds a bounded retry loop to tolerate the GNOME AppIndicator shell
+/// extension registering the watcher slightly after CleanMic starts at login.
 #[cfg(feature = "gui")]
-fn is_sni_watcher_available() -> bool {
+fn query_sni_watcher_once() -> bool {
     std::process::Command::new("dbus-send")
         .args([
             "--session",
@@ -316,6 +316,65 @@ fn is_sni_watcher_available() -> bool {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.contains("org.kde.StatusNotifierWatcher"))
         .unwrap_or(false)
+}
+
+/// Core retry loop for SNI watcher detection, parameterised over the probe
+/// function so that unit tests can inject a controlled probe without spawning
+/// real D-Bus processes.
+///
+/// Returns `true` as soon as `probe` returns `true`; `false` if all attempts
+/// are exhausted.
+#[cfg(feature = "gui")]
+fn wait_for_sni_watcher_with_probe<F>(
+    max_attempts: u32,
+    interval: std::time::Duration,
+    mut probe: F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
+    for attempt in 1..=max_attempts {
+        if probe() {
+            if attempt > 1 {
+                log::info!(
+                    "SNI watcher found on attempt {}/{} (login-race resolved)",
+                    attempt,
+                    max_attempts
+                );
+            }
+            return true;
+        }
+        if attempt < max_attempts {
+            log::debug!(
+                "SNI watcher not yet available (attempt {}/{}), retrying in {}ms…",
+                attempt,
+                max_attempts,
+                interval.as_millis()
+            );
+            std::thread::sleep(interval);
+        }
+    }
+    false
+}
+
+/// Poll for a StatusNotifierItem host (tray) on the D-Bus session bus,
+/// retrying up to `max_attempts` times with `interval` sleep between each
+/// attempt.
+///
+/// The retry loop exists because on autostart at login the GNOME AppIndicator
+/// shell extension that registers `org.kde.StatusNotifierWatcher` may not yet
+/// have finished loading when CleanMic queries D-Bus. A bounded retry (default
+/// ~6 attempts × 500 ms = 3 s total budget) closes the race without adding
+/// meaningful latency when the watcher is already present (first attempt
+/// succeeds immediately) or when the user genuinely has no tray (all attempts
+/// fail, total wait is ~3 s, happens only once per session and only on the
+/// cold-start race path).
+///
+/// Returns `true` as soon as any attempt detects the watcher; `false` if all
+/// attempts fail.
+#[cfg(feature = "gui")]
+fn wait_for_sni_watcher(max_attempts: u32, interval: std::time::Duration) -> bool {
+    wait_for_sni_watcher_with_probe(max_attempts, interval, query_sni_watcher_once)
 }
 
 /// Register signal handlers for SIGTERM, SIGINT, and SIGHUP using `sigaction`.
@@ -981,8 +1040,14 @@ fn run_with_gui(
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    // -- Detect SNI tray watcher availability --
-    let tray_available = is_sni_watcher_available();
+    // -- Detect SNI tray watcher availability (with login-race retry) --
+    //
+    // Poll up to 6 times with 500 ms between attempts (≤ 3 s total budget).
+    // On machines where the watcher is already registered the first attempt
+    // returns immediately with no extra latency. The retry budget only pays
+    // off on cold-start autostart launches where the GNOME AppIndicator shell
+    // extension registers the watcher a second or two after CleanMic starts.
+    let tray_available = wait_for_sni_watcher(6, std::time::Duration::from_millis(500));
     log::info!("SNI tray watcher available: {}", tray_available);
 
     let app = libadwaita::Application::builder()
@@ -2490,5 +2555,111 @@ mod tests {
             vec!["<Control>q".to_owned()],
             "Ctrl+Q should be bound as the app.quit accelerator"
         );
+    }
+
+    // ── wait_for_sni_watcher retry-loop tests ──────────────────────────────
+    // These tests use `wait_for_sni_watcher_with_probe` with a controlled probe
+    // closure so no real D-Bus process is spawned. The production path (which
+    // calls `query_sni_watcher_once`) is separately covered by the fact that the
+    // AppImage smoke-test runs CleanMic end-to-end on a system with a real bus.
+    #[cfg(feature = "gui")]
+    mod sni_retry {
+        use super::*;
+
+        /// When the watcher is present on the very first probe, the function
+        /// returns true immediately without any sleeping.
+        #[test]
+        fn returns_true_on_first_attempt_when_watcher_already_present() {
+            let mut calls = 0u32;
+            let result = wait_for_sni_watcher_with_probe(
+                6,
+                std::time::Duration::ZERO,
+                || {
+                    calls += 1;
+                    true // watcher present from the start
+                },
+            );
+            assert!(result, "should return true when watcher is present");
+            assert_eq!(calls, 1, "should probe exactly once when first attempt succeeds");
+        }
+
+        /// When the watcher registers on the Nth attempt, the function returns
+        /// true and records the correct attempt count.
+        #[test]
+        fn returns_true_when_watcher_appears_on_later_attempt() {
+            let mut calls = 0u32;
+            let result = wait_for_sni_watcher_with_probe(
+                6,
+                std::time::Duration::ZERO,
+                || {
+                    calls += 1;
+                    calls >= 3 // watcher appears on 3rd attempt (simulates login race)
+                },
+            );
+            assert!(result, "should return true once watcher registers");
+            assert_eq!(calls, 3, "should stop probing as soon as watcher is found");
+        }
+
+        /// When all attempts are exhausted without the watcher appearing, the
+        /// function returns false and performs exactly max_attempts probes.
+        #[test]
+        fn returns_false_after_all_attempts_exhausted() {
+            let mut calls = 0u32;
+            let result = wait_for_sni_watcher_with_probe(
+                4,
+                std::time::Duration::ZERO,
+                || {
+                    calls += 1;
+                    false // watcher never appears
+                },
+            );
+            assert!(!result, "should return false when watcher is never present");
+            assert_eq!(calls, 4, "should probe exactly max_attempts times");
+        }
+
+        /// max_attempts = 1 is a degenerate single-shot case (no retry).
+        /// Returns the result of the single probe.
+        #[test]
+        fn single_attempt_no_retry() {
+            // Single attempt, watcher absent.
+            let mut calls = 0u32;
+            let result = wait_for_sni_watcher_with_probe(
+                1,
+                std::time::Duration::ZERO,
+                || { calls += 1; false },
+            );
+            assert!(!result);
+            assert_eq!(calls, 1);
+
+            // Single attempt, watcher present.
+            calls = 0;
+            let result = wait_for_sni_watcher_with_probe(
+                1,
+                std::time::Duration::ZERO,
+                || { calls += 1; true },
+            );
+            assert!(result);
+            assert_eq!(calls, 1);
+        }
+
+        /// The last probe (attempt == max_attempts) is executed even when all
+        /// prior probes failed — the interval sleep is skipped only after the
+        /// final probe, not before it.
+        #[test]
+        fn last_attempt_is_probed_when_all_prior_fail() {
+            let mut calls = 0u32;
+            let max = 5u32;
+            // Watcher becomes available only on the very last attempt.
+            let result = wait_for_sni_watcher_with_probe(
+                max,
+                std::time::Duration::ZERO,
+                || {
+                    calls += 1;
+                    calls == max
+                },
+            );
+            assert!(result, "watcher found on last attempt → should return true");
+            assert_eq!(calls, max, "all {} attempts should have been probed", max);
+        }
     }
 }
