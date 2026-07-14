@@ -46,3 +46,6 @@ semver = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# WAV read/write for the offline demo tool (examples/offline_denoise.rs).
+# Example-only: never ships in the release binary or the AppImage.
+hound = "3.5"
