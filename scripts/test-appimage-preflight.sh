@@ -198,14 +198,34 @@ exit 0
 EOF
 chmod +x "$CASE4_DIR/zenity"
 
-# Minimal controlled PATH: sandbox dir (fake ldd + fake zenity, no kdialog
-# shim) first, then just enough of the real PATH for coreutils (grep/awk/cut/
-# tr/wc) that the helper and this harness both need. `command -v` resolves in
-# PATH order, so our fake zenity wins over any real one; kdialog is assumed
-# absent on the standard CI/dev hosts this test targets (verified: not present
-# on this host).
+# Fully controlled PATH (WR-02): rather than falling back to the real
+# /usr/bin:/bin (whose contents depend on the host -- a KDE dev box would
+# have a real kdialog there, causing a spurious FAIL), build a minimal bin
+# directory containing ONLY symlinks to the specific coreutils the helper
+# needs (grep/awk/cut/tr/wc/head), plus this sandbox's fake ldd/zenity. No
+# real system bin directory is ever on PATH, so kdialog (or any other real
+# GUI tool) can NEVER be resolved here, regardless of what's installed on the
+# host running this test.
+CASE4_BIN="$SANDBOX/case4-bin"
+mkdir -p "$CASE4_BIN"
+# `bash` itself must be resolvable via PATH too: the fake ldd/zenity scripts
+# use a `#!/usr/bin/env bash` shebang, and `env` looks up `bash` on PATH when
+# the OS execs them -- without a real bin directory on PATH, that lookup
+# would otherwise fail and silently break the fakes.
+for tool in grep awk cut tr wc head bash; do
+    # `type -P` resolves the on-disk binary even if a shell function or
+    # alias shadows the name in this shell (command -v would return just
+    # the bare name in that case, producing a broken/relative symlink).
+    tool_path="$(type -P "$tool")"
+    ln -s "$tool_path" "$CASE4_BIN/$tool"
+done
+
+# Resolve bash itself BEFORE restricting PATH, then invoke by absolute path
+# so the restricted PATH only governs what the helper script can see.
+BASH_BIN="$(type -P bash)"
+
 set +e
-PATH="$CASE4_DIR:/usr/bin:/bin" PREFLIGHT_NO_GUI="" bash "$HELPER" "$BINARY_ARG" >/dev/null 2>&1
+PATH="$CASE4_DIR:$CASE4_BIN" PREFLIGHT_NO_GUI="" "$BASH_BIN" "$HELPER" "$BINARY_ARG" >/dev/null 2>&1
 set -e
 
 if [ -f "$MARKER_FILE" ]; then
