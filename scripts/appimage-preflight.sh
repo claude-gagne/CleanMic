@@ -40,7 +40,13 @@ fi
 # errors -- `command -v` guard avoids `set -e` aborting the whole script.
 MISSING=""
 if command -v ldd >/dev/null 2>&1; then
-    MISSING="$(ldd "$BINARY" 2>/dev/null | LC_ALL=C grep 'not found' | awk '{print $1}' || true)"
+    # Anchor on the "=> not found" shape of a genuine missing shared-library
+    # dependency line. A bare 'not found' also matches glibc symbol-version
+    # mismatch lines (e.g. "version `GLIBC_2.38' not found"), which have no
+    # "=>" token and are NOT a missing library -- misclassifying them here
+    # would print the binary's own path as a fake "missing library" and a
+    # wrong install command (CR-01).
+    MISSING="$(ldd "$BINARY" 2>/dev/null | LC_ALL=C grep '=> not found' | awk '{print $1}' || true)"
 fi
 
 if [ -z "$MISSING" ]; then

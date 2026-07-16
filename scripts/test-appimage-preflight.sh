@@ -70,6 +70,37 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
+# Case 1b: CR-01 regression -- a glibc symbol-version mismatch line (ends in
+# "not found" but has NO "=>" token) must NOT be misdetected as a missing
+# library, even alongside a genuinely resolved line. Happy path expected.
+# ─────────────────────────────────────────────────────────────────────────
+CASE1B_DIR="$SANDBOX/case1b"
+mkdir -p "$CASE1B_DIR"
+cat > "$CASE1B_DIR/ldd" << 'EOF'
+#!/usr/bin/env bash
+echo "	libc.so.6 => /lib/libc.so.6 (0x1234)"
+echo "./cleanmic: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.38' not found (required by ./cleanmic)"
+EOF
+chmod +x "$CASE1B_DIR/ldd"
+
+set +e
+CASE1B_STDERR="$(PATH="$CASE1B_DIR:$PATH" PREFLIGHT_NO_GUI=1 bash "$HELPER" "$BINARY_ARG" 2>&1 1>/dev/null)"
+CASE1B_EXIT=$?
+set -e
+
+if [ "$CASE1B_EXIT" -eq 0 ]; then
+    pass "case1b: GLIBC version-mismatch line (no '=>' token) treated as happy path (exit 0)"
+else
+    fail "case1b: expected exit 0 (fail-open on GLIBC mismatch), got $CASE1B_EXIT"
+fi
+
+if [ -z "$CASE1B_STDERR" ]; then
+    pass "case1b: no false 'missing library' message printed for GLIBC mismatch"
+else
+    fail "case1b: expected empty stderr, got: $CASE1B_STDERR"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
 # Case 2: happy path -- no missing libs
 # ─────────────────────────────────────────────────────────────────────────
 CASE2_DIR="$SANDBOX/case2"
