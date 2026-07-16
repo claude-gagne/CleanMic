@@ -299,7 +299,6 @@ dependencies = [
  "env_logger",
  "gettext-rs",
  "gtk4",
- "hound",
  "ksni",
  "libadwaita",
  "libc",
