@@ -1534,7 +1534,15 @@ fn run_with_gui(
                     {
                         if let Some(ref ts_arc) = *tray_state_timer {
                             let mut ts = ts_arc.lock().unwrap_or_else(|e| e.into_inner());
-                            ts.set_update_available(Some(new_version.clone()));
+                            // Route through the same helper as the startup
+                            // restore path (sync_tray_state) so both agree on
+                            // what counts as newer — defense in depth even
+                            // though check_for_update() already validated
+                            // new_version > current before we got here.
+                            ts.set_update_available(crate::updater::update_available_for(
+                                Some(new_version.as_str()),
+                                env!("CARGO_PKG_VERSION"),
+                            ));
                             drop(ts);
                             if let Some(ref handle) = tray_handle_timer {
                                 handle.update(|_tray: &mut crate::tray::icon::CleanMicTray| {});
@@ -2166,7 +2174,10 @@ fn sync_tray_state(
                 .set_engine(config.engine)
                 .set_mode(config.mode)
                 .set_monitor_enabled(config.monitor_enabled)
-                .set_update_available(config.last_seen_update_version.clone());
+                .set_update_available(crate::updater::update_available_for(
+                    config.last_seen_update_version.as_deref(),
+                    env!("CARGO_PKG_VERSION"),
+                ));
         }
         // Notify ksni to send LayoutUpdated so the panel re-queries menu().
         handle.update(|_tray: &mut crate::tray::icon::CleanMicTray| {});

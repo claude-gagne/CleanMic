@@ -87,6 +87,53 @@ pub fn check_for_update() -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
+/// Decide whether a persisted "last seen update" tag still represents a genuine
+/// update relative to the version currently running.
+///
+/// This is the single source of truth for "is this version tag newer than the
+/// running binary?", shared by every place that surfaces an update indicator
+/// from *persisted* state (as opposed to a fresh network check, which already
+/// enforces this in [`check_for_update`]):
+///
+/// - `sync_tray_state()` in `src/app.rs` restores `Config::last_seen_update_version`
+///   into the tray on startup and on every config-change sync.
+/// - The poll-path in `src/app.rs` writes the same value into `TrayState` right
+///   after a live check confirms an update — routed through here too so both
+///   call sites agree and neither can regress independently.
+///
+/// Without this gate, a value persisted by an *older* installed version (e.g.
+/// v1.0.6 detects v1.0.7 and saves `last_seen_update_version = "v1.0.7"`) would
+/// keep resurfacing as "update available: v1.0.7" forever after the user
+/// upgrades to v1.0.7, even though they are already on the latest version
+/// (debug session: updater-false-positive).
+///
+/// Returns `Some(tag)` (the input string, unchanged, e.g. `"v1.2.0"`) only when
+/// `tag` parses as a semver version strictly greater than `current`. Returns
+/// `None` when `last_seen` is `None`, equal to or older than `current`, or
+/// either string fails to parse (fail safe: an unparseable value is never
+/// surfaced as an update).
+#[cfg(feature = "updater")]
+pub fn update_available_for(last_seen: Option<&str>, current: &str) -> Option<String> {
+    use semver::Version;
+
+    let tag = last_seen?;
+    let current_v = Version::parse(current.trim_start_matches('v')).ok()?;
+    let remote_v = Version::parse(tag.trim_start_matches('v')).ok()?;
+
+    if remote_v > current_v {
+        Some(tag.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Stub when the `updater` feature is disabled — never surfaces a persisted
+/// value as an update, since there is no live check to have validated it.
+#[cfg(not(feature = "updater"))]
+pub fn update_available_for(_last_seen: Option<&str>, _current: &str) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     // These tests exercise the version comparison logic without network calls.
@@ -130,11 +177,65 @@ mod tests {
         fn major_bump_detected() {
             assert_eq!(compare("1.0.0", "v2.0.0"), Some("v2.0.0".to_owned()));
         }
+
+        // Regression tests for `update_available_for` — debug session
+        // updater-false-positive. A persisted `last_seen_update_version` that
+        // is <= the running version must never be surfaced as an update, in
+        // either the tray restore path or the poll-path, once the user has
+        // upgraded to (or past) that version.
+
+        #[test]
+        fn last_seen_equal_to_current_returns_none() {
+            // Exact reproduction of the reported false positive: a v1.0.6
+            // install persisted last_seen_update_version = "v1.0.7", then the
+            // user upgraded to v1.0.7. The tray must not claim v1.0.7 is
+            // available while v1.0.7 is what's running.
+            assert_eq!(
+                super::super::update_available_for(Some("v1.0.7"), "1.0.7"),
+                None
+            );
+        }
+
+        #[test]
+        fn last_seen_greater_than_current_returns_some() {
+            assert_eq!(
+                super::super::update_available_for(Some("v1.2.0"), "1.0.0"),
+                Some("v1.2.0".to_owned())
+            );
+        }
+
+        #[test]
+        fn last_seen_older_than_current_returns_none() {
+            // e.g. a stale value from before the user upgraded past it.
+            assert_eq!(
+                super::super::update_available_for(Some("v1.0.0"), "1.2.0"),
+                None
+            );
+        }
+
+        #[test]
+        fn last_seen_none_returns_none() {
+            assert_eq!(super::super::update_available_for(None, "1.0.0"), None);
+        }
+
+        #[test]
+        fn last_seen_unparseable_returns_none() {
+            assert_eq!(
+                super::super::update_available_for(Some("not-a-version"), "1.0.0"),
+                None
+            );
+        }
     }
 
     #[cfg(not(feature = "updater"))]
     #[test]
     fn stub_returns_none() {
         assert_eq!(super::check_for_update().unwrap(), None);
+    }
+
+    #[cfg(not(feature = "updater"))]
+    #[test]
+    fn stub_update_available_for_always_none() {
+        assert_eq!(super::update_available_for(Some("v9.9.9"), "1.0.0"), None);
     }
 }
