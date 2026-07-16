@@ -171,8 +171,18 @@ export TEXTDOMAINDIR="$HERE/usr/share/locale"
 # Inherits the LD_LIBRARY_PATH/env exported above so ldd sees exactly what
 # the real launch would resolve. Fails open (exits 0 fast) when nothing is
 # missing, so the happy path pays only this one extra invocation.
-if ! "$HERE/usr/bin/cleanmic-preflight" "$HERE/usr/bin/cleanmic"; then
+#
+# Exit code 3 is the ONE sentinel meaning "a required library is genuinely
+# missing" -- only that code aborts launch. Any OTHER nonzero exit means the
+# helper itself failed to run (crash, bad shebang, lost +x, etc.), which is
+# unrelated to a missing library; fail OPEN in that case so a bug in the
+# ~90-line helper can never brick a healthy launch.
+"$HERE/usr/bin/cleanmic-preflight" "$HERE/usr/bin/cleanmic"
+PREFLIGHT_STATUS=$?
+if [ "$PREFLIGHT_STATUS" -eq 3 ]; then
     exit 1
+elif [ "$PREFLIGHT_STATUS" -ne 0 ]; then
+    echo "cleanmic-preflight: unexpected exit status $PREFLIGHT_STATUS -- ignoring and launching anyway (fail-open)" >&2
 fi
 
 exec "$HERE/usr/bin/cleanmic" "$@"

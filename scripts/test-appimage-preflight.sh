@@ -51,10 +51,10 @@ CASE1_STDERR="$(PATH="$CASE1_DIR:$PATH" PREFLIGHT_NO_GUI=1 bash "$HELPER" "$BINA
 CASE1_EXIT=$?
 set -e
 
-if [ "$CASE1_EXIT" -eq 1 ]; then
-    pass "case1: exit code is 1 on missing lib"
+if [ "$CASE1_EXIT" -eq 3 ]; then
+    pass "case1: exit code is 3 on missing lib"
 else
-    fail "case1: expected exit 1, got $CASE1_EXIT"
+    fail "case1: expected exit 3, got $CASE1_EXIT"
 fi
 
 if printf '%s' "$CASE1_STDERR" | grep -q 'libadwaita-1.so.0'; then

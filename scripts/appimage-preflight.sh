@@ -11,8 +11,20 @@
 #
 # Usage: appimage-preflight.sh <path-to-cleanmic-binary>
 #
-# Fail-open: if `ldd` is unavailable or reports nothing missing, this script
-# exits 0 immediately -- the happy path costs exactly one `ldd` invocation.
+# Exit codes:
+#   0 - happy path: no missing library detected (also used when `ldd` is
+#       unavailable, or the binary-path argument is missing/empty -- see
+#       fail-open note below).
+#   3 - a required shared library is genuinely missing. AppRun must abort
+#       launch ONLY on this specific code. Any OTHER nonzero exit means the
+#       helper itself failed to run to completion (crash, bad shebang, lost
+#       +x, etc.) and is unrelated to a missing library -- callers must fail
+#       OPEN on those (still exec the app) so a bug in this ~90-line helper
+#       can never brick a healthy launch.
+#
+# Fail-open: if `ldd` is unavailable, the binary-path argument ($1) is
+# missing/empty, or ldd reports nothing missing, this script exits 0
+# immediately -- the happy path costs exactly one `ldd` invocation.
 #
 # Env overrides (testability only):
 #   PREFLIGHT_OS_RELEASE  -- path to read instead of /etc/os-release
@@ -121,4 +133,6 @@ if [ -z "${PREFLIGHT_NO_GUI:-}" ]; then
     fi
 fi
 
-exit 1
+# Exit 3 = "a required library is genuinely missing" -- the ONE code that
+# should ever block launch. See the exit-codes docstring at the top.
+exit 3
