@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+#
+# appimage-preflight.sh -- pre-flight host-library check for the CleanMic AppImage.
+#
+# Invoked by AppRun immediately before `exec`ing the real cleanmic binary.
+# Detects any missing shared library the binary needs (e.g. libadwaita-1.so.0
+# on non-GNOME hosts) and, instead of letting the dynamic linker crash with a
+# cryptic error, prints a clear stderr message naming the missing lib(s) and
+# the exact distro install command, best-effort mirrors that message via a GUI
+# dialog for double-click users, then exits non-zero so AppRun does not exec.
+#
+# Usage: appimage-preflight.sh <path-to-cleanmic-binary>
+#
+# Fail-open: if `ldd` is unavailable or reports nothing missing, this script
+# exits 0 immediately -- the happy path costs exactly one `ldd` invocation.
+#
+# Env overrides (testability only):
+#   PREFLIGHT_OS_RELEASE  -- path to read instead of /etc/os-release
+#   PREFLIGHT_NO_GUI      -- when set to a non-empty value, skip the GUI dialog
+#                            cascade entirely (stderr message still prints)
+#
+# Threat model notes (see 10-CONTEXT.md / PLAN threat_model):
+#   - os-release ID/ID_LIKE values only ever select a fixed literal `case`
+#     branch below; they are never eval'd or interpolated into a displayed or
+#     executed command.
+#   - The message is passed to each GUI dialog tool as a single argument, never
+#     via a re-splittable/eval'd shell string.
+
+set -euo pipefail
+
+BINARY="${1:-}"
+
+if [ -z "$BINARY" ]; then
+    echo "appimage-preflight.sh: missing required argument <path-to-cleanmic-binary>" >&2
+    exit 0
+fi
+
+# ── Detection (D-01/D-02) ────────────────────────────────────────────────────
+# Canonical form per 10-CONTEXT.md D-01. Fail-open if ldd itself is missing or
+# errors -- `command -v` guard avoids `set -e` aborting the whole script.
+MISSING=""
+if command -v ldd >/dev/null 2>&1; then
+    MISSING="$(ldd "$BINARY" 2>/dev/null | LC_ALL=C grep 'not found' | awk '{print $1}' || true)"
+fi
+
+if [ -z "$MISSING" ]; then
+    # All libs resolve, or ldd unavailable/errored -- fail-open, launch proceeds.
+    exit 0
+fi
+
+# ── Distro detection -> fixed install command (never eval os-release values) ─
+OS_RELEASE="${PREFLIGHT_OS_RELEASE:-/etc/os-release}"
+
+ID_VAL=""
+ID_LIKE_VAL=""
+if [ -f "$OS_RELEASE" ]; then
+    # Parse only the ID= and ID_LIKE= lines; strip surrounding quotes. Values
+    # are used purely as case-match tokens below, never eval'd or executed.
+    ID_VAL="$(grep -E '^ID=' "$OS_RELEASE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"' || true)"
+    ID_LIKE_VAL="$(grep -E '^ID_LIKE=' "$OS_RELEASE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"' || true)"
+fi
+
+DISTRO_TOKENS="$ID_VAL $ID_LIKE_VAL"
+
+CMD_PACMAN="sudo pacman -S libadwaita"
+CMD_APT="sudo apt install libadwaita-1-0"
+CMD_DNF="sudo dnf install libadwaita"
+
+INSTALL_CMD=""
+case "$DISTRO_TOKENS" in
+    *arch*)
+        INSTALL_CMD="$CMD_PACMAN"
+        ;;
+    *debian*|*ubuntu*)
+        INSTALL_CMD="$CMD_APT"
+        ;;
+    *fedora*)
+        INSTALL_CMD="$CMD_DNF"
+        ;;
+    *)
+        INSTALL_CMD="$CMD_PACMAN
+    $CMD_APT
+    $CMD_DNF"
+        ;;
+esac
+
+# ── Message builder (D-03) ───────────────────────────────────────────────────
+MISSING_LIST="$(printf '%s' "$MISSING" | tr '\n' ' ')"
+
+MSG="CleanMic can't start: the following required librar$( [ "$(printf '%s\n' "$MISSING" | wc -l)" -gt 1 ] && echo 'ies are' || echo 'y is' ) missing:
+
+    $MISSING_LIST
+
+Install $( [ "$(printf '%s\n' "$MISSING" | wc -l)" -gt 1 ] && echo 'them' || echo 'it' ) with:
+
+    $INSTALL_CMD
+"
+
+# ALWAYS print to stderr, regardless of GUI availability.
+printf '%s\n' "$MSG" >&2
+
+# ── GUI cascade (D-03 / D-03a) ───────────────────────────────────────────────
+# kdialog -> zenity -> notify-send -> xmessage, first available wins. Message
+# passed as a single argument to each tool. Skipped entirely under
+# PREFLIGHT_NO_GUI (used by the automated regression test / CI).
+if [ -z "${PREFLIGHT_NO_GUI:-}" ]; then
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --error "$MSG" >/dev/null 2>&1 || true
+    elif command -v zenity >/dev/null 2>&1; then
+        zenity --error --text "$MSG" >/dev/null 2>&1 || true
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "CleanMic can't start" "$MSG" >/dev/null 2>&1 || true
+    elif command -v xmessage >/dev/null 2>&1; then
+        xmessage -center "$MSG" >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 1
