@@ -7,19 +7,33 @@
 <p align="center">Noise-free virtual microphone for Linux. It's dead simple: select your mic, enable CleanMic, and every app on your system hears clean audio. Enable it and forget about it.</p>
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="CleanMic main window">
+  <a href="https://github.com/claude-gagne/CleanMic/releases/latest"><img src="https://img.shields.io/github/v/release/claude-gagne/CleanMic" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://github.com/claude-gagne/CleanMic/actions/workflows/release.yml"><img src="https://github.com/claude-gagne/CleanMic/actions/workflows/release.yml/badge.svg" alt="CI status"></a>
 </p>
+
+<p align="center"><strong>Runs fully offline.</strong> No network, no accounts, no telemetry — your audio never leaves your machine.</p>
+
+## Demo
+
+A public-domain voice over fan noise, then over keyboard typing, with CleanMic off and then on — recorded from the app at mid strength.
+
+<video src="https://github.com/claude-gagne/CleanMic/raw/master/assets/demo/cleanmic-demo.webm" controls muted width="640">
+  Your browser can't play the embedded video —
+  <a href="https://github.com/claude-gagne/CleanMic/raw/master/assets/demo/cleanmic-demo.webm">download the demo clip</a> instead.
+</video>
 
 ## Features
 
 - **Three noise suppression engines** with pre-tuned defaults:
-  - **DeepFilterNet** (default) - modern neural model, high-quality output
-  - **RNNoise** - lightweight classic RNN denoiser, low CPU
+  - **DeepFilterNet** (default) - modern neural model, highest quality
+  - **RNNoise** - lightweight classic RNN denoiser, lowest CPU
   - **Khip** - adaptive model (user-supplied library)
 - **Light / Balanced / Strong strength dropdown** - tuned per-engine against real noise (fan, keyboard, mouse); each step is a distinct audible change on all three engines
 - Works with any app through a PipeWire virtual microphone source (Teams, Meet, Discord, Zoom)
 - System tray integration with quick enable / disable
 - Monitor - route processed mic back to your headphones when you want to hear what the app hears
+- **Crash recovery** - automatically reconnects and rebuilds the virtual mic; survives suspend/resume and PipeWire restarts without losing your setup
 
 ## Download
 
@@ -37,24 +51,28 @@
 - x86_64 Linux with **PipeWire** and **glibc ≥ 2.39**
 - **GTK4 + libadwaita** (standard on GNOME; install `libadwaita-1-0` on KDE / XFCE / Cinnamon desktops)
 
-**Tested on:** Ubuntu 24.04 LTS, Ubuntu 26.04 LTS, Fedora 44.
+**Tested on:** Ubuntu 24.04 LTS, Ubuntu 26.04 LTS, Fedora 44, and EndeavourOS (Arch-based, rolling).
 
 **Should also work on Ubuntu 24.04+ flavors** (same base, not directly tested): Kubuntu, Xubuntu, Ubuntu MATE, Pop!_OS, Linux Mint 22, elementary OS 8, KDE Neon.
 
-Other modern Linux distros (Debian 13, Bazzite, Arch, openSUSE Tumbleweed, etc.) with glibc ≥ 2.39, PipeWire, GTK4 and libadwaita should also work — untested from my end. Feedback welcome.
+Other modern Linux distros (Debian 13, Bazzite, openSUSE Tumbleweed, etc.) with glibc ≥ 2.39, PipeWire, GTK4 and libadwaita should also work — untested from my end. Feedback welcome.
 
 **Won't run on** glibc < 2.39 — including Ubuntu 22.04, Mint 21.x, Pop!_OS 22.04, Fedora ≤ 39, Debian 12, and RHEL / Alma / Rocky 9.
 
-## Known Limitations
+## How It Works
 
-- **PipeWire only** - PulseAudio is not supported
-- **Linux only** - no Windows or macOS
-- **Khip engine is optional** - requires a user-supplied library, not bundled
+CleanMic is two cooperating parts:
+
+- A **background audio service** owns a virtual "CleanMic" PipeWire source and routes your physical microphone through exactly one active suppression engine, normalizing sample rate and handling bypass, crash recovery, and persistence.
+- A **thin GTK4 + libadwaita window** gives you the engine selector, strength dropdown, device picker, and live input/output level meters.
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="The CleanMic application window showing the engine selector, strength dropdown, device picker, and live input/output level meters">
+</p>
 
 ## Using Khip
 
-The Khip engine is user-supplied — CleanMic does not ship the library
-because its license forbids redistribution. To enable Khip:
+The Khip engine is user-supplied — CleanMic does not ship the library. To enable Khip:
 
 1. Copy `libkhip.so` into a directory CleanMic searches:
 
@@ -72,6 +90,26 @@ because its license forbids redistribution. To enable Khip:
 2. CleanMic auto-detects within ~1.5 seconds — no relaunch needed.
    The "Khip (not installed)" row in the engine selector flips to
    plain "Khip" and becomes selectable.
+
+## FAQ
+
+**Does CleanMic send my audio anywhere?**
+No. CleanMic runs fully offline — no network, no accounts, no telemetry. Audio is processed locally and never leaves your machine.
+
+**Does it survive suspend/resume and PipeWire restarts?**
+Yes. CleanMic has crash recovery: it automatically reconnects and rebuilds the virtual microphone after your machine wakes up or after PipeWire restarts, so you don't have to re-enable it.
+
+**Which engine should I pick, and how heavy is it?**
+Think in lanes, not numbers. **RNNoise** is the lightweight lane for the smallest CPU footprint; **DeepFilterNet** is the quality lane for the cleanest neural suppression. Both are comfortable on a normal laptop during a call.
+
+**Does it work with PulseAudio?**
+No — CleanMic is PipeWire only.
+
+**Is there a Windows or macOS build?**
+No. CleanMic is Linux only.
+
+**Do I need the GNOME tray/AppIndicator extension?**
+No. CleanMic has a real application window, so it works whether or not you have a tray extension. The tray icon is optional convenience.
 
 ## Troubleshooting
 
@@ -129,3 +167,21 @@ No paywalled features. No ads. No nagware in the app. Ever.
 ## License
 
 MIT
+
+## Credits
+
+CleanMic stands on excellent open-source work:
+
+- **[RNNoise](https://github.com/xiph/rnnoise)** via the pure-Rust **[nnnoiseless](https://github.com/jneem/nnnoiseless)** port — the lightweight suppression lane.
+- **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)** — the neural quality lane.
+- **[PipeWire](https://pipewire.org/)** — the audio graph and virtual source that make the clean mic possible.
+- **[GTK4](https://www.gtk.org/) + [libadwaita](https://gitlab.gnome.org/GNOME/libadwaita)** — the application window and GNOME design language.
+- **[ksni](https://github.com/iovxw/ksni)** — the StatusNotifierItem system-tray integration.
+
+The **Khip** engine is supported as a user-supplied backend; its library is not bundled or redistributed.
+
+**Demo audio** — the before/after demo uses real recordings under CC0 / public domain:
+
+- Speech — [*Hans Brinker* (LibriVox), chapter 1, read by Mark F. Smith](https://archive.org/details/hans_brinker_mfs_librivox) — public domain
+- Fan noise — [*SSE Library: MACHINES* (USC Cinema / Sunset Editorial, via the Internet Archive)](https://archive.org/details/SSE_Library_MACHINES) — CC0 1.0
+- Keyboard typing — [*"399603 dustin-davis typing"* by Dustin_Davis (Wikimedia Commons)](https://commons.wikimedia.org/wiki/File:399603_dustin-davis_typing.wav) — CC0 1.0
