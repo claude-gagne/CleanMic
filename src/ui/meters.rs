@@ -183,7 +183,13 @@ pub mod widget {
 
             let bar = gtk4::ProgressBar::new();
             bar.set_valign(gtk4::Align::Center);
-            bar.set_hexpand(true);
+            // Do NOT hexpand: an hexpanding suffix would consume the leftover
+            // row width, which differs between the "Input" and "Output" rows
+            // because their AdwActionRow titles have different widths. A
+            // fixed, non-expanding width keeps both bars the same size and
+            // right-aligned as suffixes, so their left edges land in the same
+            // place regardless of title text.
+            bar.set_hexpand(false);
             bar.set_width_request(160);
             // Use a CSS class so themes can style the meter bar distinctively.
             bar.add_css_class("level-meter");
@@ -394,4 +400,17 @@ mod tests {
         assert_eq!(meters.input.display_dbfs(), DBFS_MIN);
         assert_eq!(meters.output.display_dbfs(), DBFS_MIN);
     }
+
+    // 260716-g9z: a widget-level regression test for the bar alignment
+    // invariant (both `MeterRow`s report the same `width_request` and
+    // `hexpands() == false`) was attempted here but dropped. GTK's test-harness
+    // convention in this crate (see `app::tests::quit_and_report_issue_actions_are_registered`)
+    // calls `gtk4::init()` and skips cleanly with no display server — but GTK
+    // only permits initialization from a single OS thread ever, and `cargo
+    // test` runs each `#[test]` on its own thread. With more than one
+    // GTK-touching test in the binary this reliably panics with "Attempted to
+    // initialize GTK from two different threads" regardless of display
+    // availability, i.e. it is flaky by construction, not just headless-skip.
+    // Per plan guidance, we do not force it: the fixed-size/no-hexpand
+    // invariant is covered by build success + manual UAT instead.
 }
