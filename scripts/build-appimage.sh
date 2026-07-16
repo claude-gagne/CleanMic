@@ -76,6 +76,18 @@ info "Installing binary..."
 cp "$BINARY" "$APPDIR/usr/bin/cleanmic"
 strip "$APPDIR/usr/bin/cleanmic" 2>/dev/null || warn "strip not available, binary not stripped"
 
+# ── Step 3a: Bundle the pre-flight dependency-check helper ──────────────────
+# AppRun invokes this immediately before exec to catch a missing host library
+# (e.g. libadwaita-1.so.0) with a clear message instead of a cryptic linker
+# crash. Required artifact, unlike the optional DeepFilter .so below.
+info "Bundling pre-flight helper..."
+PREFLIGHT_SRC="$SCRIPT_DIR/appimage-preflight.sh"
+if [ ! -f "$PREFLIGHT_SRC" ]; then
+    error "Required file not found: $PREFLIGHT_SRC"
+fi
+cp "$PREFLIGHT_SRC" "$APPDIR/usr/bin/cleanmic-preflight"
+chmod +x "$APPDIR/usr/bin/cleanmic-preflight"
+
 # ── Step 3b: Bundle DeepFilterNet LADSPA plugin ─────────────────────────────
 # libdeep_filter_ladspa.so has the DeepFilterNet3 model embedded — no extra
 # model files needed. It only depends on standard system libs (libc, libm).
@@ -153,6 +165,15 @@ export XDG_DATA_DIRS="$HERE/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
 # Set up locale search path so gettext finds bundled .mo files
 export TEXTDOMAIN=cleanmic
 export TEXTDOMAINDIR="$HERE/usr/share/locale"
+
+# Pre-flight: abort launch with a clear message if a required host library
+# (e.g. libadwaita-1.so.0) is missing, instead of a cryptic linker crash.
+# Inherits the LD_LIBRARY_PATH/env exported above so ldd sees exactly what
+# the real launch would resolve. Fails open (exits 0 fast) when nothing is
+# missing, so the happy path pays only this one extra invocation.
+if ! "$HERE/usr/bin/cleanmic-preflight" "$HERE/usr/bin/cleanmic"; then
+    exit 1
+fi
 
 exec "$HERE/usr/bin/cleanmic" "$@"
 APPRUN_EOF
