@@ -1,0 +1,178 @@
+name: CI regression harness
+
+# Distro smoke-test matrix for the AppImage. Complements release.yml (which
+# still owns fmt/clippy/test/publish on tag push) — this workflow answers a
+# different question: "does the artifact we ship actually run on the distros
+# we claim to support?"
+#
+# BUILD-ONCE-RUN-EVERYWHERE: we build the AppImage exactly once, on the same
+# oldest-glibc Ubuntu runner release.yml uses, then run THAT SAME artifact on
+# every smoke leg below. We deliberately do NOT rebuild per distro — an
+# AppImage built on Fedora/Arch is not what we actually ship to users, so
+# testing a differently-built binary would prove nothing about the real
+# release artifact.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libpipewire-0.3-dev \
+            libdbus-1-dev \
+            pkg-config \
+            gettext \
+            curl
+
+      - name: Fetch vendor binaries
+        run: bash scripts/fetch-vendors.sh
+
+      - name: Compile locale files
+        run: make mo
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: bash scripts/build-appimage.sh
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanmic-appimage
+          path: build/CleanMic-x86_64.AppImage
+          retention-days: 7
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 24.04 — hosted runner, current LTS, no container needed.
+          - name: ubuntu-24.04
+            runner: ubuntu-24.04
+            container: null
+            family: ubuntu
+            gui: true
+            canary: false
+
+          # Ubuntu 26.04 — GitHub does not yet publish a hosted `ubuntu-26.04`
+          # runner label as of authoring time. Falling back to running a
+          # `container: ubuntu:26.04` job on top of an ubuntu-24.04 runner so
+          # we still exercise 26.04's userspace (glibc, libfuse2t64 rename,
+          # etc. — see scripts/build-appimage.sh's uruntime pin comment).
+          # Once `ubuntu-26.04` ships as a hosted label, swap this leg to use
+          # it directly and drop the container.
+          - name: ubuntu-26.04
+            runner: ubuntu-24.04
+            container: 'ubuntu:26.04'
+            family: ubuntu
+            gui: true
+            canary: false
+
+          - name: fedora
+            runner: ubuntu-24.04
+            container: 'fedora:latest'
+            family: fedora
+            gui: false
+            canary: false
+
+          # Arch is a rolling-release canary, not a gate: its libs can drift
+          # out from under us on any given day for reasons that have nothing
+          # to do with our code. continue-on-error keeps it informative
+          # (surfaces upstream breakage early) without blocking merges/tags.
+          - name: arch
+            runner: ubuntu-24.04
+            container: 'archlinux:latest'
+            family: arch
+            gui: false
+            canary: true
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    continue-on-error: ${{ matrix.canary }}
+    name: smoke (${{ matrix.name }})
+    steps:
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cleanmic-appimage
+
+      - name: Install runtime dependencies (Ubuntu)
+        if: matrix.family == 'ubuntu'
+        run: |
+          apt-get update -qq || sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libgtk-4-1 libadwaita-1-0 libpipewire-0.3-0 xvfb \
+            || DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+            libgtk-4-1 libadwaita-1-0 libpipewire-0.3-0 xvfb
+
+      - name: Install runtime dependencies (Fedora)
+        if: matrix.family == 'fedora'
+        run: dnf install -y gtk4 libadwaita pipewire-libs
+
+      - name: Install runtime dependencies (Arch)
+        if: matrix.family == 'arch'
+        run: pacman -Sy --noconfirm gtk4 libadwaita libpipewire
+
+      - name: Make AppImage executable
+        run: chmod +x CleanMic-x86_64.AppImage
+
+      # No FUSE in CI containers (and often not on hosted runners either), so
+      # we never rely on `--appimage-extract-and-run` / FUSE mounting. Instead
+      # extract the squashfs contents to a plain directory and run AppRun
+      # directly from there — this works identically everywhere.
+      - name: Extract AppImage (no FUSE)
+        run: ./CleanMic-x86_64.AppImage --appimage-extract
+
+      - name: Assert AppRun --version exits 0
+        run: ./squashfs-root/AppRun --version
+
+      - name: Assert ldd reports no missing libraries
+        run: |
+          if ldd squashfs-root/usr/bin/cleanmic | grep -q 'not found'; then
+            echo "Missing shared libraries detected:"
+            ldd squashfs-root/usr/bin/cleanmic | grep 'not found'
+            exit 1
+          fi
+          echo "ldd clean — all linked libraries resolved."
+
+      - name: Headless GUI launch smoke (Ubuntu only)
+        if: matrix.gui == true
+        run: |
+          set +e
+          xvfb-run -a ./squashfs-root/AppRun &
+          APP_PID=$!
+          # PipeWire is not present in this smoke environment; the app must
+          # not hard-crash without it. Give it a few seconds to start, then
+          # kill it. Still running (or already exited 0) after the window
+          # counts as PASS; a crash/non-zero exit during the window is a
+          # finding.
+          sleep 5
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "GUI process is alive after 5s -- PASS"
+            kill "$APP_PID" 2>/dev/null
+            wait "$APP_PID" 2>/dev/null
+            exit 0
+          fi
+          wait "$APP_PID"
+          STATUS=$?
+          if [ "$STATUS" -ne 0 ]; then
+            echo "GUI process exited early with status $STATUS -- FAIL"
+            exit 1
+          fi
+          echo "GUI process exited 0 before the window closed -- PASS"
