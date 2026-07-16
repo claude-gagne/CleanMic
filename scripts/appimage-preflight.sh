@@ -67,7 +67,18 @@ if [ -z "$MISSING" ]; then
 fi
 
 # ── Distro detection -> fixed install command (never eval os-release values) ─
-OS_RELEASE="${PREFLIGHT_OS_RELEASE:-/etc/os-release}"
+# Honor the test override first; otherwise prefer /etc/os-release, falling
+# back to /usr/lib/os-release per os-release(5) for minimal/container images
+# that ship only the latter without the usual symlink (IN-03).
+if [ -n "${PREFLIGHT_OS_RELEASE:-}" ]; then
+    OS_RELEASE="$PREFLIGHT_OS_RELEASE"
+elif [ -f /etc/os-release ]; then
+    OS_RELEASE=/etc/os-release
+elif [ -f /usr/lib/os-release ]; then
+    OS_RELEASE=/usr/lib/os-release
+else
+    OS_RELEASE=/etc/os-release
+fi
 
 ID_VAL=""
 ID_LIKE_VAL=""
