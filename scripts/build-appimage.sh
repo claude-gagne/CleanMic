@@ -100,6 +100,19 @@ else
     warn "Run: curl -L -o vendor/libdeep_filter_ladspa.so <url>"
 fi
 
+# ── Step 3c: Ship the third-party license notice ────────────────────────────
+# MIT/Apache-2.0 require the license/copyright notice to accompany binary
+# redistribution, not just live in the git repo (D-02). This is REQUIRED
+# (unlike the optional .so above) — the notice must legally accompany the
+# bundled binary, so a missing source fails the build rather than warning.
+info "Bundling third-party license notice..."
+THIRD_PARTY_NOTICE="$PROJECT_ROOT/THIRD-PARTY-LICENSES.md"
+if [ ! -f "$THIRD_PARTY_NOTICE" ]; then
+    error "Required file not found: $THIRD_PARTY_NOTICE (must accompany the bundled DeepFilterNet binary)"
+fi
+mkdir -p "$APPDIR/usr/share/doc/cleanmic"
+cp "$THIRD_PARTY_NOTICE" "$APPDIR/usr/share/doc/cleanmic/THIRD-PARTY-LICENSES.md"
+
 # ── Step 4: Copy desktop file and icons ──────────────────────────────────────
 info "Installing desktop file and icons..."
 
