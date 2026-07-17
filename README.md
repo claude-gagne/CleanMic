@@ -180,6 +180,8 @@ CleanMic stands on excellent open-source work:
 
 The **Khip** engine is supported as a user-supplied backend; its library is not bundled or redistributed.
 
+See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for the full license text and provenance record of the third-party binary CleanMic bundles (the DeepFilterNet LADSPA plugin).
+
 **Demo audio** — the before/after demo uses real recordings under CC0 / public domain:
 
 - Speech — [*Hans Brinker* (LibriVox), chapter 1, read by Mark F. Smith](https://archive.org/details/hans_brinker_mfs_librivox) — public domain
