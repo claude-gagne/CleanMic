@@ -56,7 +56,7 @@ if [ -f "$DEEPFILTER_OUT" ]; then
 else
     info "Downloading DeepFilterNet v${DEEPFILTER_VERSION} LADSPA plugin (~50 MB)..."
     if command -v curl &>/dev/null; then
-        curl -L -o "$DEEPFILTER_OUT" "$DEEPFILTER_URL"
+        curl -fL -o "$DEEPFILTER_OUT" "$DEEPFILTER_URL"
     elif command -v wget &>/dev/null; then
         wget -O "$DEEPFILTER_OUT" "$DEEPFILTER_URL"
     else
