@@ -83,6 +83,57 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
+# Case 3 (WR-01/WR-02 regression): a download that fails partway through
+# (simulated network drop) must NOT leave a partial file at the final vendor
+# path, and must NOT leave a leftover .tmp file behind either. Exercises the
+# temp-then-rename + trap cleanup logic without any real network access, by
+# shimming `curl` in PATH with a fake that writes partial garbage then exits
+# non-zero (mirroring what a dropped connection looks like to the script).
+# ─────────────────────────────────────────────────────────────────────────
+CASE3_VENDOR="$SANDBOX/case3-vendor"
+CASE3_BIN="$SANDBOX/case3-bin"
+mkdir -p "$CASE3_VENDOR" "$CASE3_BIN"
+
+cat > "$CASE3_BIN/curl" <<'FAKE_CURL'
+#!/usr/bin/env bash
+# Fake curl: simulate a connection drop partway through -- write partial
+# bytes to the -o target, then exit non-zero, WITHOUT ever touching the
+# final vendor path directly (the real curl only ever sees the .tmp path).
+for ((i = 1; i <= $#; i++)); do
+    if [ "${!i}" = "-o" ]; then
+        j=$((i + 1))
+        printf 'partial garbage, connection dropped\n' > "${!j}"
+        break
+    fi
+done
+exit 1
+FAKE_CURL
+chmod +x "$CASE3_BIN/curl"
+
+set +e
+CASE3_OUTPUT="$(VENDOR_DIR="$CASE3_VENDOR" PATH="$CASE3_BIN:$PATH" bash "$FETCH_SCRIPT" 2>&1)"
+CASE3_EXIT=$?
+set -e
+
+if [ "$CASE3_EXIT" -ne 0 ]; then
+    pass "case3: dropped connection makes fetch-vendors.sh exit non-zero"
+else
+    fail "case3: expected non-zero exit for a dropped connection, got 0"
+fi
+
+if [ ! -f "$CASE3_VENDOR/libdeep_filter_ladspa.so" ]; then
+    pass "case3: no partial file left at the final vendor path"
+else
+    fail "case3: expected no file at final vendor path after a dropped connection, but found one"
+fi
+
+if [ ! -f "$CASE3_VENDOR/libdeep_filter_ladspa.so.tmp" ]; then
+    pass "case3: no leftover .tmp file left behind"
+else
+    fail "case3: expected the .tmp file to be cleaned up on failure, but it is still present"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────
 if [ "$FAIL_COUNT" -eq 0 ]; then

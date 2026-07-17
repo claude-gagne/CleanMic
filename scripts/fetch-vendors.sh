@@ -55,13 +55,21 @@ if [ -f "$DEEPFILTER_OUT" ]; then
     info "Checksum verified."
 else
     info "Downloading DeepFilterNet v${DEEPFILTER_VERSION} LADSPA plugin (~50 MB)..."
+    DEEPFILTER_TMP="$DEEPFILTER_OUT.tmp"
+    trap 'rm -f "$DEEPFILTER_TMP"' EXIT
     if command -v curl &>/dev/null; then
-        curl -fL -o "$DEEPFILTER_OUT" "$DEEPFILTER_URL"
+        curl -fL -o "$DEEPFILTER_TMP" "$DEEPFILTER_URL"
     elif command -v wget &>/dev/null; then
-        wget -O "$DEEPFILTER_OUT" "$DEEPFILTER_URL"
+        wget -O "$DEEPFILTER_TMP" "$DEEPFILTER_URL"
     else
         error "Neither curl nor wget found. Cannot download."
     fi
+    # Download completed successfully -- move into place before verifying, so
+    # an interrupted/killed download (Ctrl-C, network drop, disk full,
+    # OOM-kill) never leaves a partial file at the real vendor path. Mirrors
+    # the uruntime temp-then-rename pattern in build-appimage.sh.
+    mv "$DEEPFILTER_TMP" "$DEEPFILTER_OUT"
+    trap - EXIT
     chmod 755 "$DEEPFILTER_OUT"
     info "Saved to $DEEPFILTER_OUT ($(du -h "$DEEPFILTER_OUT" | cut -f1))"
     info "Verifying checksum..."
