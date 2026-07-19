@@ -5,6 +5,8 @@
 //! "Strength" slider (0.0..=1.0) is mapped per-engine to internal DSP parameters.
 
 pub mod deepfilter;
+#[cfg(feature = "dpdfnet-experimental")]
+pub mod dpdfnet_experimental;
 pub mod khip;
 pub mod rnnoise;
 

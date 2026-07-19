@@ -13,6 +13,10 @@ tray = ["dep:ksni"]
 rnnoise = ["dep:nnnoiseless"]
 deepfilter = ["dep:nnnoiseless"]
 updater = ["dep:ureq", "dep:semver"]
+# Throwaway/experimental real-time DPDFNet adapter (D-07) — never in `default`.
+# Not registered in EngineType/create_engine; exists only to feed real-pipeline
+# measurements to Plan 06's ship-gate decision. See src/engine/dpdfnet_experimental.rs.
+dpdfnet-experimental = ["dep:ort"]
 
 [dependencies]
 # Core (always available)
@@ -43,6 +47,25 @@ ksni = { version = "0.2", optional = true }
 # Optional: Update checker
 ureq = { version = "3", optional = true, features = ["json"] }
 semver = { version = "1", optional = true }
+
+# Optional, gated behind dpdfnet-experimental — checkpoint:human-verify approved
+# (see .planning/phases/15-full-model-evaluation-conditional-dpdfnet-integration/
+# 15-LICENSING-EVIDENCE.md, "ort Rust crate (Plan 05 — checkpoint approved)").
+# default-features = false avoids `download-binaries` (which would fetch a
+# prebuilt ONNX Runtime archive at build time); we only want `load-dynamic`,
+# which dlopens the system/local libonnxruntime.so at runtime instead,
+# mirroring the khip/deepfilter dlopen pattern. `api-24` is required explicitly
+# because ort compiles OrtApi struct field access against a specific C API
+# version — without it, code paths compiled unconditionally under
+# `feature = "load-dynamic"` (e.g. ep/vitis.rs) reference struct fields that
+# don't exist at the (otherwise unset) baseline API level. ONNX Runtime's
+# GetApi() is backward-compatible (a newer runtime serves older API version
+# requests), so requesting api-24 against the pinned v1.27.0 .so is expected
+# to work — verified empirically in Task 2/3, not assumed.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = [
+    "load-dynamic",
+    "api-24",
+] }
 
 [dev-dependencies]
 tempfile = "3"
