@@ -39,7 +39,9 @@ mod dpdfnet_experimental_switch {
     const BUDGET_MICROS: u128 = 10_000;
 
     fn default_ort_dylib_path() -> PathBuf {
-        PathBuf::from("/tmp/opencode/cleanmic-dpdfnet-reference/hushmic/assets/lib/libonnxruntime.so")
+        PathBuf::from(
+            "/tmp/opencode/cleanmic-dpdfnet-reference/hushmic/assets/lib/libonnxruntime.so",
+        )
     }
 
     fn default_model_path(variant: &str) -> PathBuf {
@@ -196,8 +198,12 @@ mod dpdfnet_experimental_switch {
         let p99_idx = (((latencies_us.len() as f64) * 0.99) as usize)
             .min(latencies_us.len().saturating_sub(1));
         let p99_latency_us = latencies_us.get(p99_idx).copied().unwrap_or(0);
-        let avg_latency_us = latencies_us.iter().sum::<u128>() as f64 / latencies_us.len().max(1) as f64;
-        let over_budget_count = latencies_us.iter().filter(|&&us| us > BUDGET_MICROS).count();
+        let avg_latency_us =
+            latencies_us.iter().sum::<u128>() as f64 / latencies_us.len().max(1) as f64;
+        let over_budget_count = latencies_us
+            .iter()
+            .filter(|&&us| us > BUDGET_MICROS)
+            .count();
 
         let cpu_seconds = match (cpu_before, cpu_after) {
             (Some((u0, s0)), Some((u1, s1))) => {
@@ -344,7 +350,12 @@ mod dpdfnet_experimental_switch {
             }
         }
 
-        write_evidence_file(&switching_note, &failure_note, &sustained, &sustained_skip_notes);
+        write_evidence_file(
+            &switching_note,
+            &failure_note,
+            &sustained,
+            &sustained_skip_notes,
+        );
     }
 
     fn write_evidence_file(
@@ -367,7 +378,9 @@ mod dpdfnet_experimental_switch {
         doc.push_str(switching_note);
         doc.push_str("\n\n");
 
-        doc.push_str("## 2. Forced ONNX Runtime init failure + production fallback-chain regression\n\n");
+        doc.push_str(
+            "## 2. Forced ONNX Runtime init failure + production fallback-chain regression\n\n",
+        );
         doc.push_str(failure_note);
         doc.push('\n');
 
@@ -472,7 +485,11 @@ mod dpdfnet_experimental_switch {
         if let Some(parent) = out_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(&out_path, doc)
-            .unwrap_or_else(|e| panic!("failed to write DPDF-01 evidence file {}: {e}", out_path.display()));
+        std::fs::write(&out_path, doc).unwrap_or_else(|e| {
+            panic!(
+                "failed to write DPDF-01 evidence file {}: {e}",
+                out_path.display()
+            )
+        });
     }
 }

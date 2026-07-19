@@ -95,10 +95,7 @@ pub fn validate_dylib_path(path: &Path) -> Result<()> {
     }
     for component in path.components() {
         if let std::path::Component::ParentDir = component {
-            bail!(
-                "ORT_DYLIB_PATH contains '..' traversal: {}",
-                path.display()
-            );
+            bail!("ORT_DYLIB_PATH contains '..' traversal: {}", path.display());
         }
     }
     anyhow::ensure!(
@@ -224,7 +221,10 @@ impl NoiseEngine for DpdfnetExperimentalEngine {
         // khip's OPENBLAS/OMP/FFTW_NUM_THREADS env vars, applied here via
         // the session builder's own thread-count options instead (ONNX
         // Runtime does not read those env vars itself).
-        let builder = ort_ctx(Session::builder(), "failed to create ONNX Runtime session builder")?;
+        let builder = ort_ctx(
+            Session::builder(),
+            "failed to create ONNX Runtime session builder",
+        )?;
         let builder = ort_ctx(
             builder.with_intra_threads(1),
             "failed to set intra-op thread count",
@@ -296,8 +296,8 @@ impl NoiseEngine for DpdfnetExperimentalEngine {
         // docs. `input.len()` is expected to be BLOCK_SIZE (480); handle any
         // other length defensively by copying only what fits.
         let n = input.len().min(BLOCK_SIZE);
-        for k in 0..n {
-            self.spec_in[2 * k] = input[k];
+        for (k, &sample) in input.iter().enumerate().take(n) {
+            self.spec_in[2 * k] = sample;
             self.spec_in[2 * k + 1] = 0.0;
         }
         for k in n..FREQ_BINS {
