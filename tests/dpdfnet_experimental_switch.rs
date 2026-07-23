@@ -350,12 +350,14 @@ mod dpdfnet_experimental_switch {
             }
         }
 
-        write_evidence_file(
-            &switching_note,
-            &failure_note,
-            &sustained,
-            &sustained_skip_notes,
-        );
+        if std::env::var_os("CLEANMIC_EVAL_WRITE_EVIDENCE").is_some() {
+            write_evidence_file(
+                &switching_note,
+                &failure_note,
+                &sustained,
+                &sustained_skip_notes,
+            );
+        }
     }
 
     fn write_evidence_file(
