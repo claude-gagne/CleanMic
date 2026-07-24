@@ -1,0 +1,165 @@
+diff --git a/crates/dpdfnet-ladspa/examples/golden_probe.rs b/crates/dpdfnet-ladspa/examples/golden_probe.rs
+new file mode 100644
+index 0000000..ae2fe2e
+--- /dev/null
++++ b/crates/dpdfnet-ladspa/examples/golden_probe.rs
+@@ -0,0 +1,159 @@
++//! Deterministic golden-vector probe for the pinned HushMic DPDFNet renderer.
++//!
++//! Test-only executable interface added by
++//! `scripts/patches/dpdfnet-golden-probe.patch` (CleanMic Phase 15.1, Plan 01)
++//! so `scripts/generate-dpdfnet-goldens.py` can regenerate reproducible
++//! reference behavior offline. Deliberately built as a *separate* example next
++//! to `enhance.rs`: it reconstructs the exact `Engine::process_hop` sequence
++//! hop-by-hop using the crate's already-`pub` `stft`/`model`/`attn` modules so
++//! it can expose the per-hop input spectrum and the post-attenuation-blend
++//! enhanced spectrum, which `Engine` itself keeps private. This file changes
++//! nothing about `engine.rs`, `stft.rs`, `model.rs`, or `attn.rs` — it is
++//! purely a new, additive, test-only binary target.
++//!
++//! Never installed into or invoked by CleanMic itself; consumed only by the
++//! offline, network-denied golden generator.
++//!
++//! Usage:
++//!   golden_probe <model.onnx> <input.wav> <output.json> <attn_db>
++//!
++//! `input.wav` must be a 48 kHz mono PCM16 or float WAV whose sample count is
++//! an exact positive multiple of `HOP` (480); every whole hop is processed in
++//! order. Output is a single JSON object written atomically (temp file +
++//! rename) containing, for every hop: the interleaved re/im input spectrum
++//! (`FREQ_BINS * 2` = 962 values), the interleaved re/im enhanced spectrum
++//! (same shape, captured *after* `AttnLimiter::apply`, mirroring the value
++//! `Synthesis::add_frame` actually consumes), and the 480 enhanced output
++//! samples — plus the model's metadata-derived initial recurrent state and
++//! the final recurrent state after the last hop, both emitted in full so the
++//! offline generator (not this probe) computes their SHA-256 identity and
++//! decides how much of each to retain in the compact golden file.
++
++use dpdfnet_ladspa::attn::AttnLimiter;
++use dpdfnet_ladspa::model::Model;
++use dpdfnet_ladspa::stft::{Analysis, Synthesis, FREQ_BINS, HOP, N_FFT, SPEC_LEN};
++use std::path::Path;
++
++fn read_wav_mono_f32(path: &str) -> Vec<f32> {
++    let mut r = hound::WavReader::open(path).expect("open input wav");
++    let spec = r.spec();
++    assert_eq!(spec.sample_rate, 48_000, "fixture must be 48 kHz");
++    assert_eq!(spec.channels, 1, "fixture must be mono");
++    match spec.sample_format {
++        hound::SampleFormat::Float => r.samples::<f32>().map(|x| x.unwrap()).collect(),
++        hound::SampleFormat::Int => {
++            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
++            r.samples::<i32>()
++                .map(|x| x.unwrap() as f32 / max)
++                .collect()
++        }
++    }
++}
++
++/// Renders an `f32` slice as a JSON array using Rust's own `Debug` float
++/// formatting, which is deterministic (no locale, no randomness) and always
++/// round-trips exactly back to the same bit pattern via `f32::from_str`.
++fn json_f32_array(values: &[f32]) -> String {
++    let mut s = String::with_capacity(values.len() * 12 + 2);
++    s.push('[');
++    for (i, v) in values.iter().enumerate() {
++        if i > 0 {
++            s.push(',');
++        }
++        s.push_str(&format!("{v:?}"));
++    }
++    s.push(']');
++    s
++}
++
++fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    if args.len() != 5 {
++        eprintln!("usage: golden_probe <model.onnx> <input.wav> <output.json> <attn_db>");
++        std::process::exit(2);
++    }
++    let model_path = &args[1];
++    let input_wav = &args[2];
++    let output_json = &args[3];
++    let attn_db: f32 = args[4].parse().expect("attn_db must be a float");
++
++    let samples = read_wav_mono_f32(input_wav);
++    assert!(
++        !samples.is_empty() && samples.len() % HOP == 0,
++        "fixture sample count must be a nonzero multiple of HOP ({HOP})"
++    );
++    let hops = samples.len() / HOP;
++
++    let mut model = Model::load(Path::new(model_path)).unwrap_or_else(|e| panic!("model load ({model_path}): {e}"));
++    let mut analysis = Analysis::new();
++    let mut synthesis = Synthesis::new();
++    let mut attn = AttnLimiter::new();
++    attn.set_db(attn_db);
++
++    let state_size = model.state_size;
++    let initial_state = model.init_state.clone();
++    let mut state = initial_state.clone();
++    let mut state_out = vec![0f32; state_size];
++
++    let mut hop_records: Vec<String> = Vec::with_capacity(hops);
++    let mut hop_in = [0f32; HOP];
++    let mut spec = [0f32; SPEC_LEN];
++    let mut spec_e = [0f32; SPEC_LEN];
++    let mut out_hop = [0f32; HOP];
++
++    for h in 0..hops {
++        hop_in.copy_from_slice(&samples[h * HOP..(h + 1) * HOP]);
++        analysis.push_hop(&hop_in, &mut spec);
++        let input_spectrum = spec; // capture the input spectrum before model.run mutates spec_e
++        model
++            .run(&spec, &state, &mut spec_e, &mut state_out)
++            .unwrap_or_else(|e| panic!("model.run failed at hop {h}: {e}"));
++        std::mem::swap(&mut state, &mut state_out);
++        attn.apply(&spec, &mut spec_e); // same order as Engine::process_hop
++        synthesis.add_frame(&spec_e, &mut out_hop);
++
++        for v in input_spectrum
++            .iter()
++            .chain(spec_e.iter())
++            .chain(out_hop.iter())
++        {
++            assert!(v.is_finite(), "non-finite value produced at hop {h}");
++        }
++
++        hop_records.push(format!(
++            "{{\"index\":{h},\"input_spectrum\":{},\"enhanced_spectrum\":{},\"output\":{}}}",
++            json_f32_array(&input_spectrum),
++            json_f32_array(&spec_e),
++            json_f32_array(&out_hop),
++        ));
++    }
++
++    let json = format!(
++        concat!(
++            "{{",
++            "\"n_fft\":{n_fft},",
++            "\"hop\":{hop},",
++            "\"freq_bins\":{freq_bins},",
++            "\"sample_rate\":48000,",
++            "\"attn_db\":{attn_db},",
++            "\"state_size\":{state_size},",
++            "\"initial_state\":{initial_state},",
++            "\"final_state\":{final_state},",
++            "\"hops\":[{hop_records}]",
++            "}}"
++        ),
++        n_fft = N_FFT,
++        hop = HOP,
++        freq_bins = FREQ_BINS,
++        attn_db = attn_db,
++        state_size = state_size,
++        initial_state = json_f32_array(&initial_state),
++        final_state = json_f32_array(&state),
++        hop_records = hop_records.join(","),
++    );
++
++    let tmp = format!("{output_json}.tmp");
++    std::fs::write(&tmp, &json).expect("write temp json");
++    std::fs::rename(&tmp, output_json).expect("atomic rename json");
++    eprintln!("[golden_probe] wrote {output_json} ({hops} hops, state_size={state_size})");
++}
