@@ -270,7 +270,11 @@ run_report() {
         return 1
     fi
 
-    local extract_root
+    # Deliberately NOT `local` -- the EXIT trap fires after this function
+    # returns (at global script scope), and a `local` variable would already
+    # be out of scope by then, making `rm -rf "$extract_root"` fail with
+    # "unbound variable" under `set -u` (same class of bug Plan 01 already
+    # fixed in fetch-vendors.sh's `stage` variable).
     extract_root="$(mktemp -d)"
     trap 'rm -rf "$extract_root"' EXIT
 
