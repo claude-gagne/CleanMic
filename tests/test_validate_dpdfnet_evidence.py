@@ -452,6 +452,69 @@ class IncompletePackageTest(unittest.TestCase):
             validator.validate_record(path, "package_delta", expect_variant=None, check_hashes=False, now=NOW)
 
 
+class OwnerDecisionCheckpointTest(unittest.TestCase):
+    """D-04: --require-owner-decision must fail closed on a PENDING checkpoint
+    and accept an explicit APPROVED/REJECTED owner decision (Phase 15.1 Plan 07
+    Task 3)."""
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tempdir.name)
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_pending_checkpoint_passes_without_the_flag(self) -> None:
+        record = _valid_package_delta()
+        self.assertEqual(record["material_increase_checkpoint"]["status"], "PENDING")
+        path = _write(self.directory, "pending.json", record)
+        validator.validate_record(
+            path, "package_delta", expect_variant=None, check_hashes=False, now=NOW, require_owner_decision=False
+        )
+
+    def test_pending_checkpoint_rejected_when_flag_passed(self) -> None:
+        record = _valid_package_delta()
+        path = _write(self.directory, "still-pending.json", record)
+        with self.assertRaisesRegex(validator.EvidenceValidationError, "PENDING.*--require-owner-decision"):
+            validator.validate_record(
+                path, "package_delta", expect_variant=None, check_hashes=False, now=NOW, require_owner_decision=True
+            )
+
+    def test_approved_checkpoint_accepted_when_flag_passed(self) -> None:
+        record = _valid_package_delta()
+        record["material_increase_checkpoint"]["status"] = "APPROVED"
+        record["material_increase_checkpoint"]["rationale"] = "Owner accepted: not material."
+        path = _write(self.directory, "approved.json", record)
+        validator.validate_record(
+            path, "package_delta", expect_variant=None, check_hashes=False, now=NOW, require_owner_decision=True
+        )
+
+    def test_rejected_checkpoint_also_accepted_when_flag_passed(self) -> None:
+        # REJECTED is still an explicit owner decision (not a silent PENDING);
+        # --require-owner-decision only demands the decision was MADE, not
+        # which way it went.
+        record = _valid_package_delta()
+        record["material_increase_checkpoint"]["status"] = "REJECTED"
+        record["material_increase_checkpoint"]["rationale"] = "Owner rejected: re-plan required."
+        path = _write(self.directory, "rejected.json", record)
+        validator.validate_record(
+            path, "package_delta", expect_variant=None, check_hashes=False, now=NOW, require_owner_decision=True
+        )
+
+    def test_cli_require_owner_decision_flag_exits_nonzero_on_pending(self) -> None:
+        record = _valid_package_delta()
+        path = _write(self.directory, "cli-pending.json", record)
+        exit_code = validator.main(["--package", str(path), "--require-owner-decision"])
+        self.assertEqual(exit_code, 1)
+
+    def test_cli_require_owner_decision_flag_exits_zero_on_approved(self) -> None:
+        record = _valid_package_delta()
+        record["material_increase_checkpoint"]["status"] = "APPROVED"
+        path = _write(self.directory, "cli-approved.json", record)
+        exit_code = validator.main(["--package", str(path), "--require-owner-decision"])
+        self.assertEqual(exit_code, 0)
+
+
 class HashVerificationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()

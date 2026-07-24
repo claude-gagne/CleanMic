@@ -344,7 +344,9 @@ def _validate_default_evidence(instance: dict[str, Any], *, expect_variant: str 
                     raise EvidenceValidationError(f"microphone_paths.{path}.{key} does not exist: {clip_path}")
 
 
-def _validate_package_delta(instance: dict[str, Any], *, check_hashes: bool, now: datetime) -> None:
+def _validate_package_delta(
+    instance: dict[str, Any], *, check_hashes: bool, now: datetime, require_owner_decision: bool = False
+) -> None:
     _check_source_commit(instance["source_commit"])
     _check_freshness(instance["evaluated_at"], instance["freshness_window_days"], now, field="package_delta")
 
@@ -370,6 +372,16 @@ def _validate_package_delta(instance: dict[str, Any], *, check_hashes: bool, now
     checkpoint = instance["material_increase_checkpoint"]
     _reject_placeholder(checkpoint["owner"], "material_increase_checkpoint.owner")
 
+    # D-04: the owner's explicit materiality + accept/reject/re-plan decision
+    # is a hard gate before this record can be treated as final -- a PENDING
+    # checkpoint status is never sufficient once --require-owner-decision is
+    # passed (Task 3's own verify command in 15.1-07-PLAN.md).
+    if require_owner_decision and checkpoint["status"] == "PENDING":
+        raise EvidenceValidationError(
+            "material_increase_checkpoint.status is PENDING -- --require-owner-decision requires an "
+            "explicit APPROVED or REJECTED owner decision (D-04), never left silently PENDING"
+        )
+
 
 def validate_record(
     path: Path,
@@ -378,6 +390,7 @@ def validate_record(
     expect_variant: str | None,
     check_hashes: bool,
     now: datetime,
+    require_owner_decision: bool = False,
 ) -> dict[str, Any]:
     schema = load_schema()
     instance = load_json_strict(path)
@@ -397,7 +410,9 @@ def validate_record(
     elif record_kind == "default_evidence":
         _validate_default_evidence(instance, expect_variant=expect_variant, check_hashes=check_hashes, now=now)
     elif record_kind == "package_delta":
-        _validate_package_delta(instance, check_hashes=check_hashes, now=now)
+        _validate_package_delta(
+            instance, check_hashes=check_hashes, now=now, require_owner_decision=require_owner_decision
+        )
     else:  # pragma: no cover - guarded by validate_structure already
         raise EvidenceValidationError(f"unknown record type: {record_kind}")
 
@@ -412,6 +427,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check-hashes", action="store_true")
     parser.add_argument("--now", default=None, help="ISO-8601 timestamp to use as 'now' (defaults to current UTC time)")
     parser.add_argument("--package", type=Path, default=None, help="alias for --file --record-type package_delta")
+    parser.add_argument(
+        "--require-owner-decision",
+        action="store_true",
+        help="package_delta only: fail unless material_increase_checkpoint.status is APPROVED or REJECTED (D-04)",
+    )
     args = parser.parse_args(argv)
 
     if args.package is not None:
@@ -430,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
             expect_variant=args.expect_variant,
             check_hashes=args.check_hashes,
             now=now,
+            require_owner_decision=args.require_owner_decision,
         )
     except EvidenceValidationError as error:
         print(f"validate-dpdfnet-evidence: FAILED: {error}", file=sys.stderr)
