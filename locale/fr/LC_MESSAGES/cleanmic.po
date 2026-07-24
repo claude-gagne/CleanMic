@@ -230,15 +230,33 @@ msgstr "Léger, faible consommation CPU"
 msgid "User-supplied, adaptive"
 msgstr "Fourni par l'utilisateur, adaptatif"
 
-# Phase 15.1 Plan 04: Engine subtitle — DPDFNet-2 (not yet shown in the
-# selector; real wording lands with Plan 05/06's selector registration)
-msgid "DPDFNet, lighter"
-msgstr "DPDFNet, plus léger"
+# Phase 15.1 Plan 06: Engine subtitle — DPDFNet-2 (window + tray selector).
+# Per D-06: relative PROCESSOR USE only, never a quality-hierarchy claim —
+# replaces Plan 04's now-removed "DPDFNet, lighter" placeholder wording.
+msgid "DPDFNet, lower processor use"
+msgstr "DPDFNet, utilisation processeur plus faible"
 
-# Phase 15.1 Plan 04: Engine subtitle — DPDFNet-8 (not yet shown in the
-# selector; real wording lands with Plan 05/06's selector registration)
-msgid "DPDFNet, higher quality"
-msgstr "DPDFNet, qualité supérieure"
+# Phase 15.1 Plan 06: Engine subtitle — DPDFNet-8 (window + tray selector).
+# Per D-06: replaces Plan 04's "DPDFNet, higher quality" placeholder, which
+# implied an unsupported quality ranking.
+msgid "DPDFNet, higher processor use"
+msgstr "DPDFNet, utilisation processeur plus élevée"
+
+# Phase 15.1 Plan 06: Generic unavailable-row title suffix (window + tray),
+# e.g. "DPDFNet-2 (unavailable)". Never used for Khip, which keeps its own
+# more actionable "Khip (not installed)" copy above.
+msgid "(unavailable)"
+msgstr "(indisponible)"
+
+# Phase 15.1 Plan 06: Unavailable-row subtitle — engine's Cargo feature was
+# not compiled into this build (src/ui/window.rs, src/tray.rs).
+msgid "Not included in this build"
+msgstr "Non inclus dans cette version"
+
+# Phase 15.1 Plan 06: Unavailable-row subtitle — engine's bundled runtime/
+# model asset could not be found at runtime (src/ui/window.rs, src/tray.rs).
+msgid "Required files not found"
+msgstr "Fichiers requis introuvables"
 
 # 260508-k7q: Notification title — fired on first hidden autostart launch (src/app.rs)
 msgid "CleanMic is running"

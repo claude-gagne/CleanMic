@@ -2064,7 +2064,13 @@ fn run_with_gui(
                 // handles late-removal via the D-02 fallback chain).
                 if !khip_detected.get() && engine::is_engine_available(EngineType::Khip) {
                     khip_detected.set(true);
-                    handles_timer_slow.engine_selector.set_khip_available(true);
+                    handles_timer_slow.engine_selector.set_engine_availability(
+                        EngineType::Khip,
+                        engine::EngineAvailability {
+                            available: true,
+                            reason: engine::AvailabilityReason::Available,
+                        },
+                    );
                     log::info!(
                         "Khip: library detected at runtime — engine selector now enabled"
                     );

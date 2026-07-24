@@ -11,7 +11,9 @@
 //!     │   ├── AdwComboRow    — microphone picker
 //!     │   └── AdwSwitchRow   — enable / disable
 //!     ├── AdwPreferencesGroup "Noise Processing"
-//!     │   └── AdwActionRow×3 — engine selector (radio-grouped: RNNoise / DeepFilterNet / Khip)
+//!     │   └── AdwActionRow×5 — engine selector (radio-grouped, fixed order
+//!     │                        per D-07: RNNoise / DeepFilterNet / DPDFNet-2
+//!     │                        / DPDFNet-8 / Khip)
 //!     ├── AdwPreferencesGroup "Strength"
 //!     │   └── AdwComboRow    — strength picker (Light / Balanced / Strong)
 //!     ├── AdwPreferencesGroup "Levels"
@@ -25,7 +27,8 @@
 //! Only compiled when the `gui` feature is enabled (gated on the `pub mod
 //! window` declaration in `src/ui/mod.rs`).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -81,28 +84,36 @@ pub struct WindowHandles {
     /// The update notification banner at the top of the window.
     /// Revealed when a new version is available (per D-05, D-08).
     pub update_banner: Banner,
+    /// Flag set while a programmatic engine switch (either a user row click
+    /// handled in `build_engine_selector`, or a full state sync in
+    /// [`update_from_state`](WindowHandles::update_from_state)) is
+    /// restoring the newly-active engine's own remembered strength (D-13)
+    /// into `strength_row`. Without this guard, `ComboRow::set_selected`
+    /// fires `notify::selected` unconditionally, re-emitting a spurious
+    /// `UiEvent::StrengthChanged` for a value the user never picked — mirrors
+    /// the existing `device_updating` guard pattern.
+    pub strength_updating: Rc<Cell<bool>>,
 }
 
 // Type alias for the SwitchRow closure parameter.
 type SwitchRowRef = SwitchRow;
 
-use crate::engine::EngineType;
+use crate::config::Config;
+use crate::engine::{AvailabilityReason, EngineAvailability, EngineType};
 use crate::tr;
 use crate::ui::{DeviceInfo, UiEvent, UiState};
 
 // ── Engine selector helpers ───────────────────────────────────────────────────
 
 /// Display name for an engine (used as the row title in the selector).
+///
+/// Untranslated proper nouns (matches `EngineType::short_name`'s established
+/// convention) — RNNoise/DeepFilterNet/DPDFNet-2/DPDFNet-8/Khip are product
+/// names, not prose, per D-05.
 fn engine_label(engine: EngineType) -> &'static str {
     match engine {
         EngineType::RNNoise => "RNNoise",
         EngineType::DeepFilterNet => "DeepFilterNet",
-        // Selector-row registration (ordering, availability, disabled-row
-        // presentation per D-05/D-07/D-08) is a later phase's job (Phase
-        // 15.1 Plans 05/06) — these two arms exist only so `EngineType`
-        // remains exhaustively matched everywhere now that the engine layer
-        // (this plan) registers both variants; DPDFNet-2/8 are not yet added
-        // to `engines` below, so these rows are not shown today.
         EngineType::Dpdfnet2 => "DPDFNet-2",
         EngineType::Dpdfnet8 => "DPDFNet-8",
         EngineType::Khip => "Khip",
@@ -111,18 +122,85 @@ fn engine_label(engine: EngineType) -> &'static str {
 
 /// Subtitle describing what the engine does, shown below the row title.
 ///
-/// Kept short so it fits in a single AdwActionRow subtitle line.
+/// Kept short so it fits in a single AdwActionRow subtitle line. Per D-06,
+/// the DPDFNet-2/DPDFNet-8 subtitles communicate only relative PROCESSOR USE
+/// — never a Light/Quality label or an unsupported sound-quality ranking,
+/// since the phase's evaluation never established one.
 fn engine_subtitle(engine: EngineType) -> String {
     // Per 08.3 D-01: wrap engine subtitles in tr!() for i18n coverage.
     match engine {
         EngineType::RNNoise => tr!("Lightweight, low CPU"),
         EngineType::DeepFilterNet => tr!("High quality (default)"),
-        // See `engine_label`'s doc comment: real selector-row wording (D-06)
-        // lands with Plan 05/06's selector registration, not this plan.
-        EngineType::Dpdfnet2 => tr!("DPDFNet, lighter"),
-        EngineType::Dpdfnet8 => tr!("DPDFNet, higher quality"),
+        EngineType::Dpdfnet2 => tr!("DPDFNet, lower processor use"),
+        EngineType::Dpdfnet8 => tr!("DPDFNet, higher processor use"),
         EngineType::Khip => tr!("User-supplied, adaptive"),
     }
+}
+
+/// Resolve `engine`'s truthful availability from `state.availability`,
+/// falling back to "available" when the map has no entry for it (e.g. a
+/// `UiState` constructed before the app layer populates the map — matches
+/// the historical unconditional-enable behavior for engines that predate
+/// per-engine availability tracking).
+fn resolve_availability(state: &UiState, engine: EngineType) -> EngineAvailability {
+    state
+        .availability
+        .get(&engine)
+        .copied()
+        .unwrap_or(EngineAvailability {
+            available: true,
+            reason: AvailabilityReason::Available,
+        })
+}
+
+/// Compute the row title and subtitle for `engine` given its truthful
+/// availability (T-15.1-07/D-08). When available, returns the engine's
+/// normal label/subtitle. When unavailable, the row stays visible with a
+/// translated unavailable title and a reason-specific subtitle — it is
+/// never hidden and never silently re-enabled.
+///
+/// Khip keeps its existing, more actionable "not installed — copy the
+/// library" copy (a user-fixable local install step). The other engines use
+/// a shared generic "{name} (unavailable)" pattern, since a missing Cargo
+/// feature or a missing bundled DPDFNet asset is not something the user can
+/// fix by copying a file.
+fn engine_row_text(engine: EngineType, availability: EngineAvailability) -> (String, String) {
+    if availability.available {
+        return (engine_label(engine).to_owned(), engine_subtitle(engine));
+    }
+    if engine == EngineType::Khip {
+        return (
+            tr!("Khip (not installed)"),
+            tr!("Not detected — copy libkhip.so to ~/.local/lib/"),
+        );
+    }
+    let title = format!("{} {}", engine.short_name(), tr!("(unavailable)"));
+    let subtitle = match availability.reason {
+        AvailabilityReason::FeatureDisabled => tr!("Not included in this build"),
+        // RuntimeMissing and the impossible Available-with-available=false
+        // case both fall back to the same generic, non-user-actionable copy.
+        _ => tr!("Required files not found"),
+    };
+    (title, subtitle)
+}
+
+/// Whether a row's "became active" toggle should be allowed to dispatch
+/// `UiEvent::EngineChanged` (T-15.1-10). Refuses when the engine is
+/// currently unavailable OR a programmatic selection (`set_engine`/
+/// `set_engine_availability`) is in flight. Extracted as a pure function so
+/// the decision itself is unit-testable without constructing GTK widgets —
+/// the real `connect_toggled` closure in `build_engine_selector` calls this
+/// with its own live `available`/`updating` reads.
+fn should_dispatch_engine_change(available: bool, updating: bool) -> bool {
+    available && !updating
+}
+
+/// Compute the strength `ComboRow` level index that reflects `engine`'s own
+/// remembered normalized strength (D-13). Used to restore the strength row
+/// immediately when the user switches engines, rather than showing the
+/// previously-active engine's level until the next full state sync.
+fn restore_strength_level_index_for_engine(config: &Config, engine: EngineType) -> u32 {
+    strength_to_level_index(config.strength_for(engine))
 }
 
 /// Engine selector built from a list of AdwActionRow + radio-grouped CheckButton
@@ -133,9 +211,9 @@ fn engine_subtitle(engine: EngineType) -> String {
 /// rendering, not GtkDropDown's selection model, so users could still pick
 /// "Khip (not installed)" with no effect (silent early-return in the handler).
 ///
-/// This selector uses `set_sensitive(false)` on the Khip row when
-/// `khip_available=false`, matching the tray's `enabled` flag semantics in
-/// `src/tray.rs:240`.
+/// This selector uses `set_sensitive(false)` on any row whose engine is
+/// currently unavailable, matching the tray's `enabled` flag semantics in
+/// `src/tray.rs`.
 #[derive(Clone)]
 pub struct EngineSelector {
     /// The AdwPreferencesGroup that holds all engine rows. Add this to the page.
@@ -148,13 +226,14 @@ pub struct EngineSelector {
     /// instead of emitting a spurious `UiEvent::EngineChanged`. Mirror of the
     /// existing `device_updating` pattern (window.rs:216-219, 235-237, 702-705).
     updating: Rc<Cell<bool>>,
-    /// Live ground-truth flag for Khip availability. Captured by Rc into
-    /// each row's `connect_toggled` closure so the per-row "is Khip
-    /// available?" filter reflects runtime detection (set_khip_available),
-    /// not just the construction-time value of `state.khip_available`.
-    /// Per parent todo Option E (260427-cgu): hot-detect Khip without
-    /// requiring an app relaunch.
-    khip_available: Rc<Cell<bool>>,
+    /// Live per-engine availability map, keyed by `EngineType` (D-02/D-08).
+    /// Captured by `Rc` into each row's `connect_toggled` closure so the
+    /// per-row "is this engine available?" filter reflects runtime
+    /// detection (`set_engine_availability`), not just the construction-time
+    /// value of `state.availability`. Generalizes the previous Khip-only
+    /// `khip_available: Rc<Cell<bool>>` field (per parent todo Option E,
+    /// 260427-cgu, extended to every engine by this plan).
+    availability: Rc<RefCell<BTreeMap<EngineType, EngineAvailability>>>,
 }
 
 impl EngineSelector {
@@ -185,16 +264,17 @@ impl EngineSelector {
 
     /// Set sensitivity on every row at once. Used by the health-check path
     /// (`src/app.rs`) to disable engine selection when the audio thread
-    /// dies (D-15). Per-engine availability (Khip) is set at construction
-    /// time and is **independent** of this — calling `set_all_sensitive(true)`
-    /// after the audio thread is restored does NOT undo Khip's
-    /// per-row disabled state, because we read each CheckButton's current
-    /// sensitivity (the construction-time source of truth) before re-enabling.
+    /// dies (D-15). Per-engine availability is set at construction time (and
+    /// updated by `set_engine_availability`) and is **independent** of
+    /// this — calling `set_all_sensitive(true)` after the audio thread is
+    /// restored does NOT undo an unavailable engine's per-row disabled
+    /// state, because we read each CheckButton's current sensitivity (the
+    /// availability-driven source of truth) before re-enabling.
     pub fn set_all_sensitive(&self, sensitive: bool) {
         for (_engine, row, check) in &self.rows {
-            // Khip row stays disabled if it was disabled at construction time
-            // (khip_available=false). Re-enabling the row here would let the
-            // user pick an engine that cannot init — bug we're fixing.
+            // A row stays disabled if its engine is currently unavailable.
+            // Re-enabling the row here would let the user pick an engine
+            // that cannot init — bug we're fixing.
             let allow = if sensitive {
                 check.is_sensitive()
             } else {
@@ -204,57 +284,41 @@ impl EngineSelector {
         }
     }
 
-    /// Mark Khip as available at runtime, after construction-time detection
-    /// returned false but a subsequent re-poll succeeded. Called from the
-    /// 1500ms UI tick in src/app.rs once `engine::is_engine_available` flips
-    /// to true.
+    /// Update a single engine's availability at runtime (T-15.1-07/
+    /// T-15.1-08), after construction-time detection reported it unavailable
+    /// but a later re-poll succeeded — or, defensively, the reverse.
+    /// Generalizes the previous Khip-only `set_khip_available` (per parent
+    /// todo Option E, 260427-cgu) so every engine can be hot-updated from a
+    /// single shared method, e.g. the 1500ms Khip re-detection tick in
+    /// `src/app.rs`.
     ///
-    /// One-way only in practice: this method intentionally has no callers
-    /// flipping it back to `false`. The parent todo (260427-cgu, Option E)
-    /// calls out that we leave khip_available=true for the rest of the session
-    /// even if the user removes the library — engine init will fail cleanly
-    /// via the D-02 fallback chain if they try to switch to Khip after
-    /// deletion.
+    /// Effects:
+    ///   1. The shared `availability` map is updated so the per-row
+    ///      `connect_toggled` closure's live truth check reflects the change.
+    ///   2. The row's title/subtitle flip via `engine_row_text`.
+    ///   3. The row and its CheckButton's `sensitive` flag flip to match.
     ///
-    /// Effects when flipped to `true`:
-    ///   1. The internal `khip_available` cell flips so the per-row
-    ///      connect_toggled closure stops swallowing user clicks on the
-    ///      Khip row.
-    ///   2. The Khip row's title flips from "Khip (not installed)" to
-    ///      plain "Khip", giving the user a clear visual signal.
-    ///   3. Both the Khip ActionRow and its CheckButton flip to
-    ///      sensitive=true, so the row becomes clickable.
-    ///
-    /// Does NOT fire `UiEvent::EngineChanged`: the row state is mutated
-    /// without touching its CheckButton.is_active() flag, so no
-    /// connect_toggled handler runs (mirrors the existing `updating` guard
-    /// pattern used by `set_engine`).
-    pub fn set_khip_available(&self, available: bool) {
-        // Idempotent — the timer calls this exactly once on flip, but the
-        // defensive guard makes the method safe to call from any future path.
-        if self.khip_available.get() == available {
-            return;
+    /// Does NOT fire `UiEvent::EngineChanged`: the row's
+    /// `CheckButton::is_active` state is untouched, so no `connect_toggled`
+    /// handler runs (mirrors the existing `updating` guard pattern used by
+    /// `set_engine`).
+    pub fn set_engine_availability(&self, engine: EngineType, availability: EngineAvailability) {
+        // Idempotent — safe to call from any path, even redundantly.
+        {
+            let mut map = self.availability.borrow_mut();
+            if map.get(&engine).copied() == Some(availability) {
+                return;
+            }
+            map.insert(engine, availability);
         }
-        self.khip_available.set(available);
 
-        // Find the Khip row and flip the visible state.
-        for (engine, row, check) in &self.rows {
-            if *engine == EngineType::Khip {
-                if available {
-                    row.set_title(engine_label(EngineType::Khip));
-                    row.set_subtitle(&engine_subtitle(EngineType::Khip));
-                    row.set_sensitive(true);
-                    check.set_sensitive(true);
-                } else {
-                    // Defensive — currently unreachable per the one-way
-                    // contract above. Kept symmetric so future callers
-                    // (e.g., a manual "Re-detect Khip" debug button) work
-                    // without a refactor.
-                    row.set_title(&tr!("Khip (not installed)"));
-                    row.set_subtitle(&tr!("Not detected — copy libkhip.so to ~/.local/lib/"));
-                    row.set_sensitive(false);
-                    check.set_sensitive(false);
-                }
+        for (e, row, check) in &self.rows {
+            if *e == engine {
+                let (title, subtitle) = engine_row_text(engine, availability);
+                row.set_title(&title);
+                row.set_subtitle(&subtitle);
+                row.set_sensitive(availability.available);
+                check.set_sensitive(availability.available);
                 return;
             }
         }
@@ -465,8 +529,21 @@ pub fn build_main_window(
     // EngineSelector owns its own AdwPreferencesGroup with one ActionRow per
     // engine plus radio-grouped CheckButtons. Replaces a ComboRow whose
     // list-factory disabling didn't actually prevent selection (UAT bug #3).
-    let engine_selector = build_engine_selector(state, event_tx.clone());
-    let strength_row = build_strength_row(state, event_tx.clone());
+    //
+    // strength_row is built first so a clone of it (plus the shared
+    // strength_updating guard) can be threaded into build_engine_selector —
+    // switching engines restores the newly-active engine's own remembered
+    // strength (D-13) immediately, rather than waiting for the next full
+    // state sync.
+    let strength_updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let strength_row = build_strength_row(state, event_tx.clone(), strength_updating.clone());
+    let engine_selector = build_engine_selector(
+        state,
+        event_tx.clone(),
+        config.clone(),
+        strength_row.clone(),
+        strength_updating.clone(),
+    );
 
     // The strength row stays in its own group so the radio-row group reads
     // cleanly as "pick one engine" (matches GNOME Sound Settings output-device
@@ -578,6 +655,7 @@ pub fn build_main_window(
         device_row,
         device_updating,
         update_banner,
+        strength_updating,
     }
 }
 
@@ -694,46 +772,44 @@ fn build_device_row(state: &UiState) -> ComboRow {
 /// `set_activatable(false)` on a `gtk4::ListItem` only affects rendering, not
 /// GtkDropDown's selection model, so users could still pick "Khip (not
 /// installed)" with no effect. Mirrors the tray's enabled-flag semantics.
-fn build_engine_selector(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> EngineSelector {
+///
+/// Rows are built in `EngineType::ALL`'s fixed order (D-07): RNNoise,
+/// DeepFilterNet, DPDFNet-2, DPDFNet-8, Khip. `config`/`strength_row`/
+/// `strength_updating` implement D-13: when the user picks a different
+/// engine row, the strength row is immediately updated to that engine's own
+/// remembered value under the shared guard, rather than the previously
+/// active engine's value lingering until the next full state sync.
+fn build_engine_selector(
+    state: &UiState,
+    event_tx: mpsc::Sender<UiEvent>,
+    config: Rc<RefCell<Config>>,
+    strength_row: ComboRow,
+    strength_updating: Rc<Cell<bool>>,
+) -> EngineSelector {
     let group = PreferencesGroup::new();
     group.set_title(&tr!("Noise Processing"));
 
     let updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    // Live khip-available cell shared with each row's connect_toggled closure
-    // and with `set_khip_available()`. Seeded from the construction-time
-    // detection so behavior is identical to the previous frozen-by-value
-    // capture when no runtime flip occurs (per 260427-cgu Option E).
-    let khip_available: Rc<Cell<bool>> = Rc::new(Cell::new(state.khip_available));
+    // Live per-engine availability map shared with each row's
+    // connect_toggled closure and with `set_engine_availability()`. Seeded
+    // from the construction-time state so behavior is identical to the
+    // previous frozen-by-value capture when no runtime flip occurs (per
+    // 260427-cgu Option E, generalized to every engine by this plan).
+    let availability: Rc<RefCell<BTreeMap<EngineType, EngineAvailability>>> =
+        Rc::new(RefCell::new(state.availability.clone()));
     let mut rows: Vec<(EngineType, libadwaita::ActionRow, gtk4::CheckButton)> =
-        Vec::with_capacity(3);
-
-    let engines = [
-        EngineType::RNNoise,
-        EngineType::DeepFilterNet,
-        EngineType::Khip,
-    ];
+        Vec::with_capacity(EngineType::ALL.len());
 
     // Build the radio group: first CheckButton is the group leader; subsequent
     // ones are joined via set_group(Some(&group_leader)).
     let mut group_leader: Option<gtk4::CheckButton> = None;
 
-    for engine in engines {
+    for engine in EngineType::ALL {
         let row = libadwaita::ActionRow::new();
 
-        // Title: "Khip (not installed)" when unavailable, else the plain label.
-        // Subtitle: the per-engine description (already i18n-wrapped via tr!()
-        // in engine_subtitle()).
-        let title = if engine == EngineType::Khip && !state.khip_available {
-            tr!("Khip (not installed)")
-        } else {
-            engine_label(engine).to_owned()
-        };
+        let engine_availability = resolve_availability(state, engine);
+        let (title, subtitle) = engine_row_text(engine, engine_availability);
         row.set_title(&title);
-        let subtitle = if engine == EngineType::Khip && !state.khip_available {
-            tr!("Not detected — copy libkhip.so to ~/.local/lib/")
-        } else {
-            engine_subtitle(engine)
-        };
         row.set_subtitle(&subtitle);
 
         let check = gtk4::CheckButton::new();
@@ -748,11 +824,11 @@ fn build_engine_selector(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> En
         // state.engine.
         check.set_active(engine == state.engine);
 
-        // Khip row: sensitive=false when not installed. Setting on the row
-        // makes the entire row visually disabled and unclickable; setting on
-        // the CheckButton too is belt-and-suspenders so a programmatic
-        // `set_active(true)` from a future bug also no-ops cleanly.
-        if engine == EngineType::Khip && !state.khip_available {
+        // An unavailable row: sensitive=false. Setting on the row makes the
+        // entire row visually disabled and unclickable; setting on the
+        // CheckButton too is belt-and-suspenders so a programmatic
+        // `set_active(true)` from a future bug also no-ops cleanly (D-08).
+        if !engine_availability.available {
             row.set_sensitive(false);
             check.set_sensitive(false);
         }
@@ -768,29 +844,47 @@ fn build_engine_selector(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> En
         {
             let tx = event_tx.clone();
             let updating_cb = updating.clone();
-            // Rc clone of the live cell so the runtime flip via
-            // EngineSelector::set_khip_available() is observable here. Before
-            // 260427-cgu this was a frozen-by-value `let khip_available =
-            // state.khip_available;` capture which prevented hot-detection.
-            let khip_available_cb = khip_available.clone();
+            // Rc clone of the live map so a runtime flip via
+            // EngineSelector::set_engine_availability() is observable here.
+            // Before 260427-cgu this was a frozen-by-value capture which
+            // prevented hot-detection.
+            let availability_cb = availability.clone();
+            let config_cb = config.clone();
+            let strength_row_cb = strength_row.clone();
+            let strength_updating_cb = strength_updating.clone();
             check.connect_toggled(move |btn| {
                 // Skip the "deactivating" half of the radio toggle — only the
                 // row gaining selection should send an event.
                 if !btn.is_active() {
                     return;
                 }
-                // Guard against programmatic mutations from set_engine().
-                if updating_cb.get() {
-                    return;
-                }
-                // Belt-and-suspenders: even if some future code path makes
-                // the unavailable Khip row sensitive, refuse to dispatch.
-                if engine == EngineType::Khip && !khip_available_cb.get() {
+                let available = availability_cb
+                    .borrow()
+                    .get(&engine)
+                    .map(|a| a.available)
+                    .unwrap_or(true);
+                // Guards against programmatic mutations from set_engine()/
+                // set_engine_availability() and against dispatching for a
+                // row that has become unavailable since construction
+                // (T-15.1-10) — even if some future code path leaves the
+                // row itself sensitive.
+                if !should_dispatch_engine_change(available, updating_cb.get()) {
                     return;
                 }
                 if tx.send(UiEvent::EngineChanged(engine)).is_err() {
                     log::warn!("UI event channel closed - EngineChanged dropped");
                 }
+
+                // D-13: restore THIS engine's own remembered strength into
+                // the shared strength row immediately, guarded so this
+                // programmatic restoration cannot re-emit
+                // UiEvent::StrengthChanged (mirrors `device_updating`).
+                let idx = restore_strength_level_index_for_engine(&config_cb.borrow(), engine);
+                strength_updating_cb.set(true);
+                if strength_row_cb.selected() != idx {
+                    strength_row_cb.set_selected(idx);
+                }
+                strength_updating_cb.set(false);
             });
         }
 
@@ -802,7 +896,7 @@ fn build_engine_selector(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> En
         group,
         rows,
         updating,
-        khip_available,
+        availability,
     }
 }
 
@@ -829,9 +923,17 @@ fn level_index_to_strength(index: u32) -> f32 {
 
 /// Build the 3-step strength `ComboRow` (Light / Balanced / Strong).
 ///
-/// Used by all engines — RNNoise, DeepFilterNet, and Khip all accept the same
-/// normalized values, which each engine maps to its own internal parameters.
-fn build_strength_row(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> ComboRow {
+/// Used by all five engines — each accepts the same normalized values, which
+/// it maps to its own internal parameters. `updating` guards programmatic
+/// restoration (D-13, e.g. an engine-row click or `update_from_state`) so
+/// `ComboRow::set_selected`'s unconditional `notify::selected` signal never
+/// re-emits a spurious `UiEvent::StrengthChanged` for a value the user never
+/// picked — mirrors the `device_updating` guard pattern.
+fn build_strength_row(
+    state: &UiState,
+    event_tx: mpsc::Sender<UiEvent>,
+    updating: Rc<Cell<bool>>,
+) -> ComboRow {
     let row = ComboRow::new();
     row.set_title(&tr!("Strength"));
 
@@ -843,6 +945,9 @@ fn build_strength_row(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> Combo
     row.set_selected(strength_to_level_index(state.strength));
 
     row.connect_selected_notify(move |r| {
+        if updating.get() {
+            return;
+        }
         let val = level_index_to_strength(r.selected());
         if event_tx.send(UiEvent::StrengthChanged(val)).is_err() {
             log::warn!("UI event channel closed - StrengthChanged dropped");
@@ -868,10 +973,13 @@ impl WindowHandles {
         // active, and uses a guard flag internally so it never re-emits EngineChanged.
         self.engine_selector.set_engine(state.engine);
 
-        // Strength level (3-step, same for all engines)
+        // Strength level (3-step, same for all engines). Guarded (D-13) so
+        // this programmatic sync cannot re-emit UiEvent::StrengthChanged.
         let level_idx = strength_to_level_index(state.strength);
         if self.strength_row.selected() != level_idx {
+            self.strength_updating.set(true);
             self.strength_row.set_selected(level_idx);
+            self.strength_updating.set(false);
         }
 
         // Enable/disable switch
@@ -952,4 +1060,250 @@ pub fn device_display_name<'a>(node: &'a str, devices: &'a [DeviceInfo]) -> &'a 
         .find(|d| d.name == node)
         .map(|d| d.description.as_str())
         .unwrap_or(node)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// GTK only permits initialization from a single OS thread ever, and this
+// crate's test binary already spends its one allowed `gtk4::init()` call in
+// `app::tests::quit_and_report_issue_actions_are_registered` (see
+// `src/ui/meters.rs`'s own documented precedent for why a second
+// GTK-widget-constructing test is not added here). Every test below is a
+// pure/helper test exercising the plain-data decision logic that the real
+// `connect_toggled`/`connect_selected_notify` closures delegate to — no
+// `ActionRow`/`CheckButton`/`ComboRow` is constructed.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::engine::AvailabilityReason;
+
+    // ── Fixed order and names (D-05/D-07) ───────────────────────────────────
+
+    #[test]
+    fn engine_selector_row_order_matches_d07() {
+        // The selector builds rows from EngineType::ALL directly — this
+        // pins that the constant itself is the fixed D-07 order the
+        // selector relies on.
+        assert_eq!(
+            EngineType::ALL,
+            [
+                EngineType::RNNoise,
+                EngineType::DeepFilterNet,
+                EngineType::Dpdfnet2,
+                EngineType::Dpdfnet8,
+                EngineType::Khip,
+            ]
+        );
+    }
+
+    #[test]
+    fn engine_label_names_match_d05_exactly() {
+        let names: Vec<&str> = EngineType::all().map(engine_label).collect();
+        assert_eq!(
+            names,
+            vec!["RNNoise", "DeepFilterNet", "DPDFNet-2", "DPDFNet-8", "Khip"]
+        );
+    }
+
+    // ── Subtitle wording — D-06 (no quality hierarchy claim) ────────────────
+
+    #[test]
+    fn dpdfnet_subtitles_communicate_processor_use_not_quality_per_d06() {
+        for engine in [EngineType::Dpdfnet2, EngineType::Dpdfnet8] {
+            let subtitle = engine_subtitle(engine).to_lowercase();
+            assert!(
+                !subtitle.contains("quality"),
+                "{engine:?} subtitle must not claim a quality ranking: {subtitle}"
+            );
+            assert!(
+                !subtitle.contains("light") && !subtitle.contains("strong"),
+                "{engine:?} subtitle must not reuse Light/Strong labels: {subtitle}"
+            );
+            assert!(
+                subtitle.contains("processor"),
+                "{engine:?} subtitle should describe relative processor use: {subtitle}"
+            );
+        }
+        // The two variants must still read as distinct from each other.
+        assert_ne!(
+            engine_subtitle(EngineType::Dpdfnet2),
+            engine_subtitle(EngineType::Dpdfnet8)
+        );
+    }
+
+    // ── engine_row_text — disabled-row behavior (D-08) ──────────────────────
+
+    #[test]
+    fn engine_row_text_available_engine_uses_normal_label_and_subtitle() {
+        let (title, subtitle) = engine_row_text(
+            EngineType::Dpdfnet2,
+            EngineAvailability {
+                available: true,
+                reason: AvailabilityReason::Available,
+            },
+        );
+        assert_eq!(title, "DPDFNet-2");
+        assert_eq!(subtitle, engine_subtitle(EngineType::Dpdfnet2));
+    }
+
+    #[test]
+    fn engine_row_text_unavailable_dpdfnet_variant_stays_visible_and_translated() {
+        for reason in [
+            AvailabilityReason::FeatureDisabled,
+            AvailabilityReason::RuntimeMissing,
+        ] {
+            let (title, subtitle) = engine_row_text(
+                EngineType::Dpdfnet8,
+                EngineAvailability {
+                    available: false,
+                    reason,
+                },
+            );
+            // Never hidden: the row keeps its product name in the title,
+            // plus a translated unavailable marker (D-08).
+            assert!(title.contains("DPDFNet-8"));
+            assert!(
+                !subtitle.is_empty(),
+                "unavailable subtitle must not be blank"
+            );
+            assert_ne!(
+                subtitle,
+                engine_subtitle(EngineType::Dpdfnet8),
+                "unavailable subtitle must differ from the normal one"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_row_text_khip_unavailable_keeps_existing_actionable_copy() {
+        let (title, subtitle) = engine_row_text(
+            EngineType::Khip,
+            EngineAvailability {
+                available: false,
+                reason: AvailabilityReason::RuntimeMissing,
+            },
+        );
+        assert_eq!(title, "Khip (not installed)");
+        assert_eq!(subtitle, "Not detected — copy libkhip.so to ~/.local/lib/");
+    }
+
+    #[test]
+    fn engine_row_text_dpdfnet_variants_are_independent() {
+        // D-02: one variant's unavailability never leaks into the other's
+        // row text.
+        let (title2, _) = engine_row_text(
+            EngineType::Dpdfnet2,
+            EngineAvailability {
+                available: false,
+                reason: AvailabilityReason::RuntimeMissing,
+            },
+        );
+        let (title8, _) = engine_row_text(
+            EngineType::Dpdfnet8,
+            EngineAvailability {
+                available: true,
+                reason: AvailabilityReason::Available,
+            },
+        );
+        assert!(title2.contains("DPDFNet-2"));
+        assert_eq!(title8, "DPDFNet-8");
+    }
+
+    // ── resolve_availability ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_availability_falls_back_to_available_when_map_has_no_entry() {
+        let state = UiState::default();
+        assert!(state.availability.is_empty());
+        let resolved = resolve_availability(&state, EngineType::Dpdfnet2);
+        assert!(resolved.available);
+    }
+
+    #[test]
+    fn resolve_availability_reads_the_populated_map_entry() {
+        let mut state = UiState::default();
+        state.availability.insert(
+            EngineType::Dpdfnet2,
+            EngineAvailability {
+                available: false,
+                reason: AvailabilityReason::RuntimeMissing,
+            },
+        );
+        let resolved = resolve_availability(&state, EngineType::Dpdfnet2);
+        assert!(!resolved.available);
+        assert_eq!(resolved.reason, AvailabilityReason::RuntimeMissing);
+    }
+
+    // ── should_dispatch_engine_change — no callback on unavailable/
+    //    programmatic rows (T-15.1-10) ───────────────────────────────────────
+
+    #[test]
+    fn should_dispatch_engine_change_truth_table() {
+        assert!(
+            should_dispatch_engine_change(true, false),
+            "available, not updating -> dispatch"
+        );
+        assert!(
+            !should_dispatch_engine_change(false, false),
+            "unavailable row must never dispatch even when not updating"
+        );
+        assert!(
+            !should_dispatch_engine_change(true, true),
+            "programmatic update in flight must never dispatch"
+        );
+        assert!(
+            !should_dispatch_engine_change(false, true),
+            "unavailable AND updating must never dispatch"
+        );
+    }
+
+    // ── restore_strength_level_index_for_engine — D-13 ──────────────────────
+
+    #[test]
+    fn restore_strength_level_index_for_engine_reads_each_engines_own_value() {
+        let mut config = Config::default();
+        config.set_strength_for(EngineType::RNNoise, 0.1); // Light
+        config.set_strength_for(EngineType::Dpdfnet2, 0.5); // Balanced
+        config.set_strength_for(EngineType::Dpdfnet8, 0.9); // Strong
+
+        assert_eq!(
+            restore_strength_level_index_for_engine(&config, EngineType::RNNoise),
+            0
+        );
+        assert_eq!(
+            restore_strength_level_index_for_engine(&config, EngineType::Dpdfnet2),
+            1
+        );
+        assert_eq!(
+            restore_strength_level_index_for_engine(&config, EngineType::Dpdfnet8),
+            2
+        );
+    }
+
+    #[test]
+    fn restore_strength_level_index_for_engine_does_not_mix_up_engines() {
+        // D-13: switching to engine A must never read engine B's strength.
+        let mut config = Config::default();
+        config.set_strength_for(EngineType::RNNoise, 0.05);
+        config.set_strength_for(EngineType::DeepFilterNet, 0.95);
+
+        let rnnoise_idx = restore_strength_level_index_for_engine(&config, EngineType::RNNoise);
+        let deepfilter_idx =
+            restore_strength_level_index_for_engine(&config, EngineType::DeepFilterNet);
+        assert_ne!(rnnoise_idx, deepfilter_idx);
+    }
+
+    // ── strength_to_level_index / level_index_to_strength (pre-existing,
+    //    now exercised alongside the new engine-restoration tests) ─────────
+
+    #[test]
+    fn strength_to_level_index_boundaries() {
+        assert_eq!(strength_to_level_index(0.0), 0);
+        assert_eq!(strength_to_level_index(0.32), 0);
+        assert_eq!(strength_to_level_index(0.33), 1);
+        assert_eq!(strength_to_level_index(0.66), 1);
+        assert_eq!(strength_to_level_index(0.67), 2);
+        assert_eq!(strength_to_level_index(1.0), 2);
+    }
 }
