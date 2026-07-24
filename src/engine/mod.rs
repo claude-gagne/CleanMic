@@ -9,6 +9,7 @@ pub mod deepfilter;
 pub mod dpdfnet;
 #[cfg(feature = "dpdfnet-experimental")]
 pub mod dpdfnet_experimental;
+pub mod dpdfnet_policy;
 pub mod khip;
 pub mod rnnoise;
 
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Variant order mirrors the intended selector/tray row order (D-07):
 /// RNNoise, DeepFilterNet, DPDFNet-2, DPDFNet-8, Khip.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EngineType {
     /// Lightweight baseline — links upstream librnnoise via FFI.
     RNNoise,
@@ -35,6 +36,41 @@ pub enum EngineType {
     Dpdfnet8,
     /// Advanced/experimental — dynamically loads user-supplied Khip library.
     Khip,
+}
+
+impl EngineType {
+    /// Every supported engine, in the stable, total order that mirrors the
+    /// intended selector/tray row order (D-07). Used by config serialization
+    /// (per-engine strength seeding), migration, and tests so no engine —
+    /// including Khip — is a special case requiring separate enumeration.
+    pub const ALL: [EngineType; 5] = [
+        EngineType::RNNoise,
+        EngineType::DeepFilterNet,
+        EngineType::Dpdfnet2,
+        EngineType::Dpdfnet8,
+        EngineType::Khip,
+    ];
+
+    /// Iterate every supported engine type in the stable order above.
+    pub fn all() -> impl Iterator<Item = EngineType> {
+        Self::ALL.into_iter()
+    }
+
+    /// Short, untranslated brand-name label (RNNoise/DeepFilterNet/DPDFNet-2/
+    /// DPDFNet-8/Khip are proper nouns, matching `window::engine_label`'s
+    /// established untranslated convention). Kept here — rather than only in
+    /// the `gui`-gated `src/ui/window.rs` — so non-GUI code (e.g. a fallback
+    /// notice built for `UiState`, added by Task 2) can name an engine
+    /// without depending on the `gui` feature.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            EngineType::RNNoise => "RNNoise",
+            EngineType::DeepFilterNet => "DeepFilterNet",
+            EngineType::Dpdfnet2 => "DPDFNet-2",
+            EngineType::Dpdfnet8 => "DPDFNet-8",
+            EngineType::Khip => "Khip",
+        }
+    }
 }
 
 /// Processing mode controlling the quality/CPU trade-off.
@@ -427,5 +463,42 @@ mod tests {
         assert!(!is_engine_available(EngineType::Dpdfnet8));
         assert!(create_engine(EngineType::Dpdfnet2).is_err());
         assert!(create_engine(EngineType::Dpdfnet8).is_err());
+    }
+
+    // ── EngineType::all() / total ordering (Task 1) ─────────────────────────
+
+    #[test]
+    fn engine_type_all_lists_every_variant_in_selector_order() {
+        let all: Vec<EngineType> = EngineType::all().collect();
+        assert_eq!(
+            all,
+            vec![
+                EngineType::RNNoise,
+                EngineType::DeepFilterNet,
+                EngineType::Dpdfnet2,
+                EngineType::Dpdfnet8,
+                EngineType::Khip,
+            ]
+        );
+    }
+
+    #[test]
+    fn engine_type_has_a_total_order() {
+        // Ord must agree with the declared ALL/all() order — used as
+        // BTreeMap keys by Config::strengths (and, once Task 2 lands,
+        // UiState::availability).
+        let all: Vec<EngineType> = EngineType::all().collect();
+        let mut sorted = all.clone();
+        sorted.sort();
+        assert_eq!(all, sorted, "EngineType::all() must already be sorted");
+    }
+
+    #[test]
+    fn engine_type_short_names_are_distinct_proper_nouns() {
+        let names: Vec<&str> = EngineType::all().map(EngineType::short_name).collect();
+        assert_eq!(
+            names,
+            vec!["RNNoise", "DeepFilterNet", "DPDFNet-2", "DPDFNet-8", "Khip"]
+        );
     }
 }

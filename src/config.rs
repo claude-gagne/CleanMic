@@ -4,13 +4,53 @@
 //! monitor state, autostart) in TOML format under the XDG config directory
 //! (`~/.config/cleanmic/config.toml`).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::engine::dpdfnet_policy::{self, Dpdfnet2DefaultDecision};
 use crate::engine::{EngineType, ProcessingMode};
+
+/// Provisional initial normalized strength for DPDFNet-2 (D-14) — a distinct
+/// constant, never the legacy 0.5 default and never copied from another
+/// engine's setting. Pending a future validation/freeze plan.
+const DPDFNET2_DEFAULT_STRENGTH: f32 = 0.6;
+
+/// Provisional initial normalized strength for DPDFNet-8 (D-14) — its own
+/// distinct constant, independent of DPDFNet-2's.
+const DPDFNET8_DEFAULT_STRENGTH: f32 = 0.55;
+
+/// Each engine's independent initial normalized strength (D-14). RNNoise,
+/// DeepFilterNet, and Khip keep the historical 0.5 "Balanced" default;
+/// DPDFNet-2/DPDFNet-8 get distinct provisional constants pending future
+/// blind-listening validation and freeze into a permanent value.
+fn default_strength_for(engine: EngineType) -> f32 {
+    match engine {
+        EngineType::RNNoise | EngineType::DeepFilterNet | EngineType::Khip => 0.5,
+        EngineType::Dpdfnet2 => DPDFNET2_DEFAULT_STRENGTH,
+        EngineType::Dpdfnet8 => DPDFNET8_DEFAULT_STRENGTH,
+    }
+}
+
+/// Build a fully-populated per-engine strength map from each engine's own
+/// default (used by `Config::default()`).
+fn default_strengths_map() -> BTreeMap<EngineType, f32> {
+    EngineType::all()
+        .map(|engine| (engine, default_strength_for(engine)))
+        .collect()
+}
+
+/// Clamp to `0.0..=1.0` and replace non-finite values with the safe midpoint
+/// — never trust a hand-edited or corrupted TOML float at the DSP boundary.
+fn sanitize_strength(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.5;
+    }
+    value.clamp(0.0, 1.0)
+}
 
 /// Application configuration, persisted as TOML.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,8 +63,37 @@ pub struct Config {
     /// Active noise suppression engine.
     pub engine: EngineType,
 
-    /// Normalized suppression strength (0.0..=1.0).
-    pub strength: f32,
+    /// Per-engine remembered normalized suppression strength (0.0..=1.0),
+    /// keyed by `EngineType` (D-13). Switching engines restores this map's
+    /// value for the newly-selected engine rather than sharing one global
+    /// strength across every engine. Always fully populated for all five
+    /// engines after `load`/`load_from` (see their seeding pass); use
+    /// [`Config::strength_for`]/[`Config::set_strength_for`] rather than
+    /// indexing this map directly.
+    ///
+    /// Explicit `default = "BTreeMap::new"` overrides the struct-level
+    /// `#[serde(default)]` behavior (which would otherwise fill a missing
+    /// field from `Config::default()`'s ALREADY-FULLY-POPULATED map) so a
+    /// genuinely absent `[strengths]` table deserializes to an EMPTY map —
+    /// the signal `Config::seed_missing_strengths` uses to detect "legacy or
+    /// fresh file with no per-engine table at all" versus "new-format file
+    /// with some engines present".
+    #[serde(default = "BTreeMap::new")]
+    pub strengths: BTreeMap<EngineType, f32>,
+
+    /// Legacy pre-D-13 single global strength value. Retained ONLY so old
+    /// `config.toml` files (which persisted a single top-level
+    /// `strength = <float>`) still deserialize correctly; never written by
+    /// `save`/`save_to` again — `strengths` is the sole authoritative
+    /// persisted form going forward. Consumed once by `load_from`'s seeding
+    /// pass (`Config::seed_missing_strengths`) and cleared to `None`
+    /// immediately after; not part of the public API (`pub(crate)` only so
+    /// that other in-crate modules' `Config { .., ..Config::default() }`
+    /// functional-update-syntax construction sites — which require every
+    /// field to be visible, not just the ones named explicitly — keep
+    /// compiling).
+    #[serde(rename = "strength", skip_serializing)]
+    pub(crate) legacy_strength: Option<f32>,
 
     /// Processing mode (quality vs. CPU trade-off).
     pub mode: ProcessingMode,
@@ -67,6 +136,15 @@ pub struct Config {
     /// notification fires for that version. Prevents repeated notifications
     /// on every launch. Per D-06, D-12.
     pub last_seen_update_version: Option<String>,
+
+    /// Whether the one-time DPDFNet-2 default migration (D-10) has already
+    /// run on this config. Sticky once `true` — the migration must never
+    /// repeat, even if the user later deliberately switches back to
+    /// DeepFilterNet. Only meaningful once
+    /// [`dpdfnet_policy::DPDFNET2_DEFAULT_DECISION`] is `Pass`; while
+    /// `Pending`/`Fail`, this field may still be observed but is never used
+    /// to gate a migration attempt that could not happen anyway (D-12).
+    pub dpdfnet_default_migration_complete: bool,
 }
 
 impl Default for Config {
@@ -81,7 +159,8 @@ impl Default for Config {
             // automatically if the LADSPA library is missing, so users on
             // systems without the DF plugin still get noise suppression.
             engine: EngineType::DeepFilterNet,
-            strength: 0.5,
+            strengths: default_strengths_map(),
+            legacy_strength: None,
             mode: ProcessingMode::Balanced,
             monitor_enabled: false,
             enabled: true,
@@ -91,6 +170,7 @@ impl Default for Config {
             tray_absent_notified: false,
             autostart_hidden_notified: false,
             last_seen_update_version: None,
+            dpdfnet_default_migration_complete: false,
         }
     }
 }
@@ -126,7 +206,11 @@ impl Config {
             .with_context(|| format!("failed to read config at {}", path.display()))?;
 
         match toml::from_str::<Self>(&contents) {
-            Ok(config) => Ok(config),
+            Ok(mut config) => {
+                config.seed_missing_strengths();
+                config.apply_dpdfnet2_migration(dpdfnet_policy::DPDFNET2_DEFAULT_DECISION);
+                Ok(config)
+            }
             Err(err) => {
                 log::warn!(
                     "corrupt or invalid config at {}: {}; using defaults",
@@ -136,6 +220,92 @@ impl Config {
                 Ok(Self::default())
             }
         }
+    }
+
+    /// Return the remembered normalized strength for `engine` (0.0..=1.0).
+    ///
+    /// Always returns a finite, clamped value: falls back to this engine's
+    /// own default (never another engine's, never a blind 0.5) if somehow
+    /// still absent — this should not happen for a `Config` produced by
+    /// `load`/`load_from` (whose seeding pass fills every engine), but keeps
+    /// this accessor infallible for `Config`s built directly (e.g. tests,
+    /// `Config::default()` callers who mutate `strengths` by hand).
+    pub fn strength_for(&self, engine: EngineType) -> f32 {
+        self.strengths
+            .get(&engine)
+            .copied()
+            .map(sanitize_strength)
+            .unwrap_or_else(|| default_strength_for(engine))
+    }
+
+    /// Store a clamped, finite normalized strength for `engine` (D-13).
+    /// Switching to a different engine later restores this exact value via
+    /// [`Config::strength_for`] rather than sharing one global strength.
+    pub fn set_strength_for(&mut self, engine: EngineType, value: f32) {
+        self.strengths.insert(engine, sanitize_strength(value));
+    }
+
+    /// Fill in every `EngineType`'s strength after deserialization,
+    /// preferring already-persisted new-format values and falling back to
+    /// the legacy global scalar only for a config that had none at all.
+    ///
+    /// Two cases:
+    /// - `strengths` is empty (legacy pre-D-13 file, or a config with no
+    ///   per-engine table whatsoever): seed RNNoise/DeepFilterNet/Khip from
+    ///   the legacy scalar (if the file had one) so an upgrade doesn't
+    ///   silently reset a deliberately-tuned strength; DPDFNet-2/DPDFNet-8
+    ///   ALWAYS get their own separately-validated constants (D-14), never
+    ///   the legacy scalar and never copied from another engine.
+    /// - `strengths` is non-empty (new-format file, possibly hand-edited or
+    ///   from a partial/older build with fewer engines): fill only
+    ///   genuinely-missing engines with THAT engine's own default; never
+    ///   copy another already-present engine's persisted value.
+    ///
+    /// Every value is defensively clamped/sanitized afterward regardless of
+    /// which branch ran, since a hand-edited TOML file could still contain a
+    /// NaN/inf/out-of-range float.
+    fn seed_missing_strengths(&mut self) {
+        if self.strengths.is_empty() {
+            let legacy = self.legacy_strength.map(sanitize_strength);
+            for engine in EngineType::all() {
+                let seeded = match engine {
+                    EngineType::RNNoise | EngineType::DeepFilterNet | EngineType::Khip => {
+                        legacy.unwrap_or(0.5)
+                    }
+                    EngineType::Dpdfnet2 => DPDFNET2_DEFAULT_STRENGTH,
+                    EngineType::Dpdfnet8 => DPDFNET8_DEFAULT_STRENGTH,
+                };
+                self.strengths.insert(engine, seeded);
+            }
+        } else {
+            for engine in EngineType::all() {
+                self.strengths
+                    .entry(engine)
+                    .or_insert_with(|| default_strength_for(engine));
+            }
+        }
+        for value in self.strengths.values_mut() {
+            *value = sanitize_strength(*value);
+        }
+        self.legacy_strength = None;
+    }
+
+    /// Apply the D-10 one-time conditional DPDFNet-2 default migration using
+    /// the given `decision`. `load_from` always calls this with the real
+    /// [`dpdfnet_policy::DPDFNET2_DEFAULT_DECISION`] constant (`Pending`
+    /// until a future plan approves default evidence, per D-12); exposed
+    /// with an explicit `decision` parameter — rather than hardcoding the
+    /// constant internally — so tests can exercise the
+    /// `Pass`/`Fail`/`Pending` branches without flipping the real product
+    /// constant.
+    pub fn apply_dpdfnet2_migration(&mut self, decision: Dpdfnet2DefaultDecision) {
+        let (engine, complete) = dpdfnet_policy::migrate_engine_for_decision(
+            self.engine,
+            self.dpdfnet_default_migration_complete,
+            decision,
+        );
+        self.engine = engine;
+        self.dpdfnet_default_migration_complete = complete;
     }
 
     /// Returns `true` if no config file exists on disk (first run).
@@ -192,30 +362,27 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.input_device, None);
         assert_eq!(cfg.engine, EngineType::DeepFilterNet);
-        assert!((cfg.strength - 0.5).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::DeepFilterNet) - 0.5).abs() < f32::EPSILON);
         assert_eq!(cfg.mode, ProcessingMode::Balanced);
         assert!(!cfg.monitor_enabled);
         assert!(cfg.enabled);
         assert!(!cfg.autostart);
+        assert!(!cfg.dpdfnet_default_migration_complete);
     }
 
     #[test]
     fn roundtrip_save_then_load() {
         let (_tmp, path) = temp_config_path();
-        let original = Config {
+        let mut original = Config {
             input_device: Some("alsa_input.usb-Blue_Yeti".into()),
             engine: EngineType::RNNoise,
-            strength: 0.8,
             mode: ProcessingMode::MaxQuality,
             monitor_enabled: true,
             enabled: false,
             autostart: true,
-            khip_library_path: None,
-            tray_hint_shown: false,
-            tray_absent_notified: false,
-            autostart_hidden_notified: false,
-            last_seen_update_version: None,
+            ..Config::default()
         };
+        original.set_strength_for(EngineType::RNNoise, 0.8);
         original.save_to(&path).expect("save failed");
         let loaded = Config::load_from(&path).expect("load failed");
         assert_eq!(original, loaded);
@@ -242,12 +409,20 @@ mod tests {
     fn loading_partial_file_fills_defaults() {
         let (_tmp, path) = temp_config_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Only set engine and strength; all other fields should come from defaults.
+        // Only set engine and the legacy scalar strength; all other fields
+        // should come from defaults.
         fs::write(&path, "engine = \"RNNoise\"\nstrength = 0.9\n").unwrap();
 
         let cfg = Config::load_from(&path).expect("load failed");
         assert_eq!(cfg.engine, EngineType::RNNoise);
-        assert!((cfg.strength - 0.9).abs() < f32::EPSILON);
+        // Legacy scalar seeds RNNoise/DeepFilterNet/Khip (D-14).
+        assert!((cfg.strength_for(EngineType::RNNoise) - 0.9).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::DeepFilterNet) - 0.9).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::Khip) - 0.9).abs() < f32::EPSILON);
+        // DPDFNet-2/8 must NEVER inherit the legacy scalar (D-14) — they get
+        // their own distinct constants, neither of which is 0.9 or 0.5.
+        assert!((cfg.strength_for(EngineType::Dpdfnet2) - 0.9).abs() > f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::Dpdfnet8) - 0.9).abs() > f32::EPSILON);
         // Remaining fields should be defaults.
         assert_eq!(cfg.mode, ProcessingMode::Balanced);
         assert!(!cfg.monitor_enabled);
@@ -297,5 +472,185 @@ mod tests {
 
         assert!(dir.exists());
         assert!(path.exists());
+    }
+
+    // ── Per-engine strength (D-13/D-14, Task 1) ─────────────────────────────
+
+    #[test]
+    fn all_five_engines_have_finite_clamped_default_strengths() {
+        let cfg = Config::default();
+        for engine in EngineType::all() {
+            let s = cfg.strength_for(engine);
+            assert!(s.is_finite(), "{engine:?} default strength not finite");
+            assert!((0.0..=1.0).contains(&s), "{engine:?} default out of range");
+        }
+    }
+
+    #[test]
+    fn dpdfnet_default_strengths_are_distinct_from_legacy_and_each_other() {
+        let cfg = Config::default();
+        let dpdfnet2 = cfg.strength_for(EngineType::Dpdfnet2);
+        let dpdfnet8 = cfg.strength_for(EngineType::Dpdfnet8);
+        // D-14: never automatically 0.5, never copied from another engine.
+        assert!((dpdfnet2 - 0.5).abs() > f32::EPSILON);
+        assert!((dpdfnet8 - 0.5).abs() > f32::EPSILON);
+        assert!((dpdfnet2 - dpdfnet8).abs() > f32::EPSILON);
+    }
+
+    #[test]
+    fn set_strength_for_then_strength_for_round_trips_per_engine() {
+        let mut cfg = Config::default();
+        cfg.set_strength_for(EngineType::RNNoise, 0.2);
+        cfg.set_strength_for(EngineType::DeepFilterNet, 0.9);
+        cfg.set_strength_for(EngineType::Dpdfnet2, 0.33);
+        cfg.set_strength_for(EngineType::Dpdfnet8, 0.77);
+        cfg.set_strength_for(EngineType::Khip, 0.11);
+
+        assert!((cfg.strength_for(EngineType::RNNoise) - 0.2).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::DeepFilterNet) - 0.9).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::Dpdfnet2) - 0.33).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::Dpdfnet8) - 0.77).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::Khip) - 0.11).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_strength_for_clamps_out_of_range_and_sanitizes_non_finite() {
+        let mut cfg = Config::default();
+        cfg.set_strength_for(EngineType::RNNoise, 5.0);
+        assert!((cfg.strength_for(EngineType::RNNoise) - 1.0).abs() < f32::EPSILON);
+
+        cfg.set_strength_for(EngineType::RNNoise, -5.0);
+        assert!((cfg.strength_for(EngineType::RNNoise) - 0.0).abs() < f32::EPSILON);
+
+        cfg.set_strength_for(EngineType::RNNoise, f32::NAN);
+        assert!((cfg.strength_for(EngineType::RNNoise) - 0.5).abs() < f32::EPSILON);
+
+        cfg.set_strength_for(EngineType::RNNoise, f32::INFINITY);
+        assert!((cfg.strength_for(EngineType::RNNoise) - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn new_format_strengths_table_round_trips_all_five_engines() {
+        let (_tmp, path) = temp_config_path();
+        let mut original = Config::default();
+        for (i, engine) in EngineType::all().enumerate() {
+            original.set_strength_for(engine, i as f32 / 10.0);
+        }
+        original.save_to(&path).expect("save failed");
+
+        let loaded = Config::load_from(&path).expect("load failed");
+        for engine in EngineType::all() {
+            assert!(
+                (loaded.strength_for(engine) - original.strength_for(engine)).abs() < f32::EPSILON,
+                "{engine:?} strength did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_new_format_table_fills_missing_engines_from_own_default_not_a_copy() {
+        let (_tmp, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // New-format table present but only RNNoise is set — simulates a
+        // hand-edited or partially-upgraded file. DeepFilterNet/Dpdfnet2/
+        // Dpdfnet8/Khip must be filled from THEIR OWN defaults, not RNNoise's
+        // persisted 0.95.
+        fs::write(&path, "engine = \"RNNoise\"\n[strengths]\nRNNoise = 0.95\n").unwrap();
+
+        let cfg = Config::load_from(&path).expect("load failed");
+        assert!((cfg.strength_for(EngineType::RNNoise) - 0.95).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::DeepFilterNet) - 0.5).abs() < f32::EPSILON);
+        assert!(
+            (cfg.strength_for(EngineType::Dpdfnet2) - DPDFNET2_DEFAULT_STRENGTH).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (cfg.strength_for(EngineType::Dpdfnet8) - DPDFNET8_DEFAULT_STRENGTH).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn hand_edited_out_of_range_new_format_values_are_sanitized_on_load() {
+        let (_tmp, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "engine = \"RNNoise\"\n[strengths]\nRNNoise = 42.0\nDeepFilterNet = -3.0\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).expect("load failed");
+        assert!((cfg.strength_for(EngineType::RNNoise) - 1.0).abs() < f32::EPSILON);
+        assert!((cfg.strength_for(EngineType::DeepFilterNet) - 0.0).abs() < f32::EPSILON);
+    }
+
+    // ── Conditional DPDFNet-2 default migration (D-10/D-12, Task 1) ─────────
+
+    #[test]
+    fn pending_decision_never_migrates_on_load() {
+        let (_tmp, path) = temp_config_path();
+        let original = Config {
+            engine: EngineType::DeepFilterNet,
+            ..Config::default()
+        };
+        original.save_to(&path).expect("save failed");
+
+        // `load_from` always uses the real (Pending) product constant.
+        let loaded = Config::load_from(&path).expect("load failed");
+        assert_eq!(loaded.engine, EngineType::DeepFilterNet);
+        assert!(!loaded.dpdfnet_default_migration_complete);
+    }
+
+    #[test]
+    fn pass_decision_migrates_deepfilternet_selection_exactly_once() {
+        let mut cfg = Config {
+            engine: EngineType::DeepFilterNet,
+            ..Config::default()
+        };
+        cfg.apply_dpdfnet2_migration(Dpdfnet2DefaultDecision::Pass);
+        assert_eq!(cfg.engine, EngineType::Dpdfnet2);
+        assert!(cfg.dpdfnet_default_migration_complete);
+
+        // A deliberate switch back to DeepFilterNet after migration must NOT
+        // be re-migrated even if `apply_dpdfnet2_migration(Pass)` is called
+        // again (D-10's "exactly once" marker).
+        cfg.engine = EngineType::DeepFilterNet;
+        cfg.apply_dpdfnet2_migration(Dpdfnet2DefaultDecision::Pass);
+        assert_eq!(
+            cfg.engine,
+            EngineType::DeepFilterNet,
+            "already-migrated config must not re-migrate a deliberate re-selection"
+        );
+    }
+
+    #[test]
+    fn fail_decision_never_migrates() {
+        let mut cfg = Config {
+            engine: EngineType::DeepFilterNet,
+            ..Config::default()
+        };
+        cfg.apply_dpdfnet2_migration(Dpdfnet2DefaultDecision::Fail);
+        assert_eq!(cfg.engine, EngineType::DeepFilterNet);
+        // `Fail`, like `Pending`, never migrates AND never marks the
+        // per-config marker complete — only `Pass` ever spends this config's
+        // one migration chance (see `dpdfnet_policy::migrate_engine_for_decision`).
+        assert!(!cfg.dpdfnet_default_migration_complete);
+    }
+
+    #[test]
+    fn migration_marker_persists_across_save_and_load() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = Config {
+            engine: EngineType::DeepFilterNet,
+            ..Config::default()
+        };
+        cfg.apply_dpdfnet2_migration(Dpdfnet2DefaultDecision::Pass);
+        assert_eq!(cfg.engine, EngineType::Dpdfnet2);
+        cfg.save_to(&path).expect("save failed");
+
+        let loaded = Config::load_from(&path).expect("load failed");
+        assert!(loaded.dpdfnet_default_migration_complete);
+        assert_eq!(loaded.engine, EngineType::Dpdfnet2);
     }
 }

@@ -167,7 +167,11 @@ impl UiState {
         Self {
             active: config.enabled,
             engine: config.engine,
-            strength: config.strength,
+            // D-13 (Config side landed in Task 1): read the ACTIVE engine's
+            // own remembered strength rather than the removed global
+            // scalar. Task 2 extends this further (requested-vs-active
+            // divergence, availability, fallback notice).
+            strength: config.strength_for(config.engine),
             mode: config.mode,
             input_device: config.input_device.clone(),
             monitor_enabled: config.monitor_enabled,
@@ -206,20 +210,16 @@ mod tests {
 
     #[test]
     fn ui_state_from_config_copies_fields() {
-        let config = Config {
+        let mut config = Config {
             input_device: Some("alsa_input.usb-Blue_Yeti".into()),
             engine: EngineType::RNNoise,
-            strength: 0.8,
             mode: ProcessingMode::MaxQuality,
             monitor_enabled: true,
             enabled: false,
             autostart: true,
-            khip_library_path: None,
-            tray_hint_shown: false,
-            tray_absent_notified: false,
-            autostart_hidden_notified: false,
-            last_seen_update_version: None,
+            ..Config::default()
         };
+        config.set_strength_for(EngineType::RNNoise, 0.8);
 
         let state = UiState::from_config(&config);
 

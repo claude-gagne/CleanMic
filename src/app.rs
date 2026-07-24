@@ -496,15 +496,17 @@ fn handle_ui_event(
                     actual_type
                 );
             }
-            // Apply current strength to the new engine before handing it off.
-            eng.set_strength(config.strength);
+            // Apply the ACTUAL engine's own remembered strength (D-13) —
+            // never the previously-active engine's value and never a shared
+            // global.
+            eng.set_strength(config.strength_for(actual_type));
             pipeline.set_engine(eng);
             config.engine = actual_type;
             log::info!("Engine changed to {:?}", actual_type);
         }
         UiEvent::StrengthChanged(strength) => {
             pipeline.set_strength(strength);
-            config.strength = strength;
+            config.set_strength_for(config.engine, strength);
             log::info!("Strength changed to {:.2}", strength);
         }
         UiEvent::DeviceChanged(device) => {
@@ -872,14 +874,16 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
     // Apply the persisted strength and mode before handing the engine to
     // the audio thread. Otherwise the engine runs at its constructor
     // defaults until the user nudges a control, which silently overrides
-    // whatever the UI was showing at launch.
-    eng.set_strength(config.strength);
+    // whatever the UI was showing at launch. Uses the ACTUAL engine's own
+    // remembered strength (D-13) — never the requested engine's value when
+    // a fallback occurred.
+    eng.set_strength(config.strength_for(actual_type));
     eng.set_mode(config.mode);
     pipeline.set_engine(eng);
     log::info!(
         "Engine set to {:?} (strength={:.2}, mode={:?})",
         actual_type,
-        config.strength,
+        config.strength_for(actual_type),
         config.mode,
     );
 
@@ -1580,7 +1584,9 @@ fn run_with_gui(
                     // prevent feedback loops.
                     sync_engine_selector_timer.set_engine(cfg.engine);
 
-                    let level_idx = strength_to_level_index(cfg.strength);
+                    // D-13: show the ACTIVE engine's own remembered
+                    // strength, not a shared global.
+                    let level_idx = strength_to_level_index(cfg.strength_for(cfg.engine));
                     if sync_strength_timer.selected() != level_idx {
                         sync_strength_timer.set_selected(level_idx);
                     }
