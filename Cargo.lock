@@ -307,6 +307,7 @@ dependencies = [
  "nnnoiseless",
  "ort",
  "pipewire",
+ "realfft",
  "semver",
  "serde",
  "serde_json",

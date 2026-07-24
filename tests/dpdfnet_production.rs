@@ -327,6 +327,19 @@ mod dpdfnet_production {
             .map(|i| 0.3 * (i as f32 * 0.37).sin() + 0.1 * (i as f32 * 1.9).cos())
             .collect();
         let mut output = vec![0f32; HOP];
+
+        // Warm up BEFORE the recorded sweep: the attenuation limiter only
+        // starts blending in the delayed noisy-floor reference once its ring
+        // has accumulated more than NOISY_FRAME_OFFSET (4) hops -- comparing
+        // an unprimed step (pure enhanced, no noisy blend at any dB) against
+        // a primed step (real blending) is an apples-to-oranges non-monotonic
+        // artifact of ring warm-up, not a real strength-curve reversal. Prime
+        // both the recurrent model state and the attn ring here so every
+        // step below is measured in the same (fully primed) steady state.
+        for _ in 0..8 {
+            engine.process(&input, &mut output);
+        }
+
         let mut prior_energy: Option<f32> = None;
         for step in 0..=10 {
             let strength = step as f32 / 10.0;
@@ -415,7 +428,15 @@ mod dpdfnet_production {
         if let Some(mut healthy) = build_engine("dpdfnet8") {
             let input = vec![0.02f32; HOP];
             let mut output = vec![0f32; HOP];
-            healthy.process(&input, &mut output);
+            // The pinned golden vectors show exactly two hops (960 samples)
+            // of legitimate near-zero output while the model's recurrent
+            // state converges (see `DpdfnetEngine::latency_frames` docs) --
+            // process past that warm-up before asserting non-silence, so
+            // this isolation check exercises steady-state behavior rather
+            // than mistaking correct warm-up silence for a broken engine.
+            for _ in 0..8 {
+                healthy.process(&input, &mut output);
+            }
             assert!(
                 output.iter().any(|v| *v != 0.0) || input.iter().all(|v| *v == 0.0),
                 "DPDFNet-8 must remain fully functional even though DPDFNet-2 failed to init"

@@ -5,6 +5,8 @@
 //! "Strength" slider (0.0..=1.0) is mapped per-engine to internal DSP parameters.
 
 pub mod deepfilter;
+#[cfg(feature = "dpdfnet")]
+pub mod dpdfnet;
 #[cfg(feature = "dpdfnet-experimental")]
 pub mod dpdfnet_experimental;
 pub mod khip;
@@ -14,12 +16,23 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// The type of noise suppression engine.
+///
+/// Variant order mirrors the intended selector/tray row order (D-07):
+/// RNNoise, DeepFilterNet, DPDFNet-2, DPDFNet-8, Khip.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum EngineType {
     /// Lightweight baseline — links upstream librnnoise via FFI.
     RNNoise,
     /// High-quality default — wraps DeepFilterNet via libdf.
     DeepFilterNet,
+    /// Production DPDFNet, lighter/faster variant (D-01). Never default in
+    /// this phase (D-09 gates any future default change).
+    #[serde(rename = "Dpdfnet2")]
+    Dpdfnet2,
+    /// Production DPDFNet, larger/higher-capacity variant (D-01). Never
+    /// default-eligible (D-09) — user-selectable only.
+    #[serde(rename = "Dpdfnet8")]
+    Dpdfnet8,
     /// Advanced/experimental — dynamically loads user-supplied Khip library.
     Khip,
 }
@@ -77,8 +90,67 @@ pub fn is_engine_available(engine: EngineType) -> bool {
     match engine {
         EngineType::RNNoise => cfg!(feature = "rnnoise"),
         EngineType::DeepFilterNet => cfg!(feature = "deepfilter"),
+        EngineType::Dpdfnet2 => dpdfnet_is_available(EngineType::Dpdfnet2),
+        EngineType::Dpdfnet8 => dpdfnet_is_available(EngineType::Dpdfnet8),
         EngineType::Khip => khip::KhipEngine::is_available(),
     }
+}
+
+/// Resolve a bundled DPDFNet variant's model path, restricted to
+/// `$APPDIR/usr/share/cleanmic/models` (T-15.1-03) — the stricter allowlist
+/// the shipping factory applies on top of [`dpdfnet::DpdfnetEngine`]'s own
+/// general absolute/no-traversal/regular-file validation. Returns an error
+/// (never panics) when `APPDIR` is unset or the file is missing, so a
+/// dev/test environment without an AppImage degrades to "unavailable"
+/// rather than a hard failure.
+#[cfg(feature = "dpdfnet")]
+fn dpdfnet_model_path(variant: dpdfnet::DpdfnetVariant) -> Result<std::path::PathBuf> {
+    let appdir = std::env::var_os("APPDIR")
+        .ok_or_else(|| anyhow::anyhow!("APPDIR is not set; DPDFNet requires the AppImage runtime"))?;
+    let path = std::path::PathBuf::from(appdir)
+        .join("usr/share/cleanmic/models")
+        .join(variant.model_filename());
+    anyhow::ensure!(
+        path.is_file(),
+        "DPDFNet model not found at {}",
+        path.display()
+    );
+    Ok(path)
+}
+
+#[cfg(feature = "dpdfnet")]
+fn dpdfnet_is_available(engine: EngineType) -> bool {
+    let variant = match engine {
+        EngineType::Dpdfnet2 => dpdfnet::DpdfnetVariant::Dpdfnet2,
+        EngineType::Dpdfnet8 => dpdfnet::DpdfnetVariant::Dpdfnet8,
+        _ => return false,
+    };
+    dpdfnet_model_path(variant).is_ok() && dpdfnet::is_dylib_available()
+}
+
+#[cfg(not(feature = "dpdfnet"))]
+fn dpdfnet_is_available(_engine: EngineType) -> bool {
+    false
+}
+
+/// Construct the requested DPDFNet variant's production engine (feature
+/// `dpdfnet`). A failure here (missing model/runtime, bad session) never
+/// touches the other variant's state (D-02) — this function only ever
+/// resolves and constructs the ONE requested variant.
+#[cfg(feature = "dpdfnet")]
+fn create_dpdfnet_engine(engine_type: EngineType) -> Result<Box<dyn NoiseEngine>> {
+    let variant = match engine_type {
+        EngineType::Dpdfnet2 => dpdfnet::DpdfnetVariant::Dpdfnet2,
+        EngineType::Dpdfnet8 => dpdfnet::DpdfnetVariant::Dpdfnet8,
+        _ => unreachable!("create_dpdfnet_engine called with a non-DPDFNet engine type"),
+    };
+    let model_path = dpdfnet_model_path(variant)?;
+    Ok(Box::new(dpdfnet::DpdfnetEngine::new(variant, model_path)))
+}
+
+#[cfg(not(feature = "dpdfnet"))]
+fn create_dpdfnet_engine(_engine_type: EngineType) -> Result<Box<dyn NoiseEngine>> {
+    anyhow::bail!("DPDFNet support is not compiled in (missing `dpdfnet` feature)")
 }
 
 /// Create and initialize a noise engine of the given type.
@@ -89,6 +161,8 @@ pub fn create_engine(engine_type: EngineType) -> Result<Box<dyn NoiseEngine>> {
     let mut engine: Box<dyn NoiseEngine> = match engine_type {
         EngineType::RNNoise => Box::new(rnnoise::RNNoiseEngine::new()),
         EngineType::DeepFilterNet => Box::new(deepfilter::DeepFilterEngine::new()),
+        EngineType::Dpdfnet2 => create_dpdfnet_engine(EngineType::Dpdfnet2)?,
+        EngineType::Dpdfnet8 => create_dpdfnet_engine(EngineType::Dpdfnet8)?,
         EngineType::Khip => Box::new(khip::KhipEngine::new()),
     };
     engine.init(48_000)?;
@@ -135,6 +209,12 @@ pub fn create_engine_with_fallback(preferred: EngineType) -> (Box<dyn NoiseEngin
             EngineType::RNNoise,
         ],
         EngineType::DeepFilterNet => &[EngineType::DeepFilterNet, EngineType::RNNoise],
+        // D-02: a DPDFNet variant's failure must not fall back to the OTHER
+        // DPDFNet variant (they are independently gated, not interchangeable
+        // quality tiers) — fall back to DeepFilterNet/RNNoise instead, same
+        // as DeepFilterNet's own chain.
+        EngineType::Dpdfnet2 => &[EngineType::Dpdfnet2, EngineType::DeepFilterNet, EngineType::RNNoise],
+        EngineType::Dpdfnet8 => &[EngineType::Dpdfnet8, EngineType::DeepFilterNet, EngineType::RNNoise],
         EngineType::RNNoise => &[EngineType::RNNoise],
     };
     for &engine_type in chain {
@@ -206,6 +286,8 @@ mod tests {
         for engine_type in [
             EngineType::RNNoise,
             EngineType::DeepFilterNet,
+            EngineType::Dpdfnet2,
+            EngineType::Dpdfnet8,
             EngineType::Khip,
         ] {
             #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -282,5 +364,32 @@ mod tests {
         }
         let engine = create_engine(EngineType::Khip);
         assert!(engine.is_err());
+    }
+
+    /// Without the `dpdfnet` feature, both DPDFNet variants must fail to
+    /// construct rather than silently degrade — mirrors
+    /// `create_engine_deepfilter_fails_without_feature`.
+    #[cfg(not(feature = "dpdfnet"))]
+    #[test]
+    fn create_engine_dpdfnet_fails_without_feature() {
+        assert!(create_engine(EngineType::Dpdfnet2).is_err());
+        assert!(create_engine(EngineType::Dpdfnet8).is_err());
+    }
+
+    /// D-02: DPDFNet-2 and DPDFNet-8 must be independently gated — one
+    /// variant being unavailable (no bundled model/`APPDIR`) must not affect
+    /// `is_engine_available`'s report for the other.
+    #[cfg(feature = "dpdfnet")]
+    #[test]
+    fn dpdfnet_variants_are_independently_reported_unavailable_without_appdir() {
+        // SAFETY: test-only; no other test in this binary reads/writes APPDIR
+        // concurrently with this assertion.
+        unsafe {
+            std::env::remove_var("APPDIR");
+        }
+        assert!(!is_engine_available(EngineType::Dpdfnet2));
+        assert!(!is_engine_available(EngineType::Dpdfnet8));
+        assert!(create_engine(EngineType::Dpdfnet2).is_err());
+        assert!(create_engine(EngineType::Dpdfnet8).is_err());
     }
 }

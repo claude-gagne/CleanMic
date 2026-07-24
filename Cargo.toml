@@ -17,6 +17,11 @@ updater = ["dep:ureq", "dep:semver"]
 # Not registered in EngineType/create_engine; exists only to feed real-pipeline
 # measurements to Plan 06's ship-gate decision. See src/engine/dpdfnet_experimental.rs.
 dpdfnet-experimental = ["dep:ort"]
+# Production DPDFNet-2/8 engine (Phase 15.1, Plan 04 — D-01/D-02). Registered
+# in EngineType/create_engine. Requires the owner-approved `realfft` crate
+# (15.1-02-SUMMARY.md, "approved realfft 3.5.0") in addition to `ort`.
+# See src/engine/dpdfnet.rs.
+dpdfnet = ["dep:ort", "dep:realfft"]
 
 [dependencies]
 # Core (always available)
@@ -66,6 +71,13 @@ ort = { version = "2.0.0-rc.12", optional = true, default-features = false, feat
     "load-dynamic",
     "api-24",
 ] }
+
+# Real FFT for the production DPDFNet adapter's 960-point Vorbis-windowed
+# analysis/synthesis (Plan 04). Owner-approved 2026-07-24
+# (.planning/phases/15.1-dpdfnet-production-integration-and-engine-selection/
+# 15.1-02-SUMMARY.md, verbatim: "approved realfft 3.5.0"). Pinned to exactly
+# 3.5.0 per that approval — not a caret range.
+realfft = { version = "=3.5.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
