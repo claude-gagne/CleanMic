@@ -1094,7 +1094,7 @@ fn run_with_gui(
             config.engine,
             config.mode,
             config.monitor_enabled,
-            engine::is_engine_available(EngineType::Khip),
+            engine::all_engine_availability(),
         );
         Some(Arc::new(Mutex::new(state)))
     } else {

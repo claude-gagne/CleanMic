@@ -12,7 +12,9 @@
 //! feature.  The actual `ksni::Tray` implementation lives behind
 //! `#[cfg(feature = "tray")]`.
 
-use crate::engine::{EngineType, ProcessingMode};
+use std::collections::BTreeMap;
+
+use crate::engine::{AvailabilityReason, EngineAvailability, EngineType, ProcessingMode};
 use gettextrs::gettext;
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -38,20 +40,48 @@ pub enum TrayCommand {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
+/// Default per-engine availability seed for [`TrayState::default`] — RNNoise
+/// and DeepFilterNet are treated as normally compiled-in/available (matching
+/// this crate's historical assumption before per-engine availability
+/// tracking existed); Khip and both DPDFNet variants require an external
+/// runtime probe, so they default to unavailable until real construction
+/// (`src/app.rs`) overwrites this with [`crate::engine::all_engine_availability`].
+fn default_tray_availability() -> BTreeMap<EngineType, EngineAvailability> {
+    use AvailabilityReason::{Available, RuntimeMissing};
+    EngineType::all()
+        .map(|engine| {
+            let available = matches!(engine, EngineType::RNNoise | EngineType::DeepFilterNet);
+            (
+                engine,
+                EngineAvailability {
+                    available,
+                    reason: if available { Available } else { RuntimeMissing },
+                },
+            )
+        })
+        .collect()
+}
+
 /// Snapshot of the state reflected in the tray icon and its menu.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrayState {
     /// Whether the audio pipeline is currently active.
     pub active: bool,
-    /// Currently selected engine.
+    /// Currently selected engine — the truthful ACTIVE engine (T-15.1-07),
+    /// never a merely-requested one that failed to initialize (D-11).
     pub engine: EngineType,
     /// Currently selected processing mode.
     pub mode: ProcessingMode,
     /// Whether the monitor output is enabled.
     pub monitor_enabled: bool,
-    /// Whether the Khip library is installed on this system.
-    /// When `false` the "Advanced" engine entry is grayed out.
-    pub khip_available: bool,
+    /// Independent per-engine availability/reason map (D-02/D-08),
+    /// superseding the previous Khip-only `khip_available: bool` special
+    /// case. Populated from [`crate::engine::all_engine_availability`].
+    /// Each unavailable entry keeps its submenu row visible but disabled
+    /// (T-15.1-10) — never hidden, never silently interchangeable with
+    /// another engine's result (one variant's unavailability never implies
+    /// anything about another's, D-02).
+    pub availability: BTreeMap<EngineType, EngineAvailability>,
     /// Whether the audio thread is alive and processing.
     /// When `false` (dead thread), menu items that require audio are grayed out.
     pub audio_available: bool,
@@ -66,7 +96,7 @@ impl Default for TrayState {
             engine: EngineType::DeepFilterNet,
             mode: ProcessingMode::Balanced,
             monitor_enabled: false,
-            khip_available: false,
+            availability: default_tray_availability(),
             audio_available: true,
             update_available: None,
         }
@@ -80,14 +110,14 @@ impl TrayState {
         engine: EngineType,
         mode: ProcessingMode,
         monitor_enabled: bool,
-        khip_available: bool,
+        availability: BTreeMap<EngineType, EngineAvailability>,
     ) -> Self {
         Self {
             active,
             engine,
             mode,
             monitor_enabled,
-            khip_available,
+            availability,
             audio_available: true,
             update_available: None,
         }
@@ -117,9 +147,16 @@ impl TrayState {
         self
     }
 
-    /// Update Khip availability and return `&mut self` for chaining.
-    pub fn set_khip_available(&mut self, available: bool) -> &mut Self {
-        self.khip_available = available;
+    /// Replace the per-engine availability map wholesale and return `&mut
+    /// self` for chaining. Generalizes the previous Khip-only
+    /// `set_khip_available` (D-02/D-08) — callers rebuild the map from
+    /// [`crate::engine::all_engine_availability`] rather than flipping a
+    /// single boolean.
+    pub fn set_availability(
+        &mut self,
+        availability: BTreeMap<EngineType, EngineAvailability>,
+    ) -> &mut Self {
+        self.availability = availability;
         self
     }
 
@@ -195,6 +232,38 @@ impl MenuItem {
     }
 }
 
+/// Resolve `engine`'s truthful availability from `state.availability`,
+/// falling back to "available" when the map has no entry for it (mirrors
+/// `src/ui/window.rs`'s `resolve_availability` — kept as an independent copy
+/// here since `window` is gated behind the `gui` feature and this module
+/// must stay buildable/testable without it).
+fn resolve_tray_availability(state: &TrayState, engine: EngineType) -> EngineAvailability {
+    state
+        .availability
+        .get(&engine)
+        .copied()
+        .unwrap_or(EngineAvailability {
+            available: true,
+            reason: AvailabilityReason::Available,
+        })
+}
+
+/// Compute the tray submenu label for `engine`, given its truthful
+/// availability (D-02/D-08). When available, returns the untranslated
+/// proper-noun product name (`EngineType::short_name`). When unavailable,
+/// the entry stays visible with a translated unavailable label — never
+/// hidden. Mirrors `src/ui/window.rs`'s `engine_row_text` wording so the two
+/// surfaces read consistently.
+fn engine_menu_label(engine: EngineType, availability: EngineAvailability) -> String {
+    if availability.available {
+        return engine.short_name().to_owned();
+    }
+    if engine == EngineType::Khip {
+        return gettext("Khip (not installed)");
+    }
+    format!("{} {}", engine.short_name(), gettext("(unavailable)"))
+}
+
 /// Build the context-menu model for the given `TrayState`.
 ///
 /// This is pure data — no GTK or D-Bus types — so it can be called in tests
@@ -217,30 +286,22 @@ pub fn build_menu(state: &TrayState) -> Vec<MenuItem> {
     );
 
     // ── Engine submenu ────────────────────────────────────────────────────
-    let engine_children = vec![
-        MenuItem::check(
-            "RNNoise",
-            state.engine == EngineType::RNNoise,
-            state.audio_available,
-            TrayCommand::SetEngine(EngineType::RNNoise),
-        ),
-        MenuItem::check(
-            "DeepFilterNet",
-            state.engine == EngineType::DeepFilterNet,
-            state.audio_available,
-            TrayCommand::SetEngine(EngineType::DeepFilterNet),
-        ),
-        MenuItem::check(
-            if state.khip_available {
-                "Khip".to_owned()
-            } else {
-                gettext("Khip (not installed)")
-            },
-            state.engine == EngineType::Khip,
-            state.khip_available && state.audio_available,
-            TrayCommand::SetEngine(EngineType::Khip),
-        ),
-    ];
+    // Fixed D-07 order (RNNoise, DeepFilterNet, DPDFNet-2, DPDFNet-8, Khip),
+    // built from EngineType::ALL so the tray can never drift out of sync
+    // with the window selector's row order. Each engine's checked/enabled
+    // state is independently derived from its own availability entry
+    // (D-02) — one variant's unavailability never disables another's row.
+    let engine_children: Vec<MenuItem> = EngineType::all()
+        .map(|engine| {
+            let availability = resolve_tray_availability(state, engine);
+            MenuItem::check(
+                engine_menu_label(engine, availability),
+                state.engine == engine,
+                availability.available && state.audio_available,
+                TrayCommand::SetEngine(engine),
+            )
+        })
+        .collect();
     let engine_submenu = MenuItem::Submenu {
         label: gettext("Engine"),
         children: engine_children,
@@ -509,6 +570,34 @@ mod tests {
     use super::*;
     use crate::engine::{EngineType, ProcessingMode};
 
+    /// Build an availability map with every engine available, except the
+    /// ones explicitly listed as unavailable — convenience for tests that
+    /// only care about one or two engines' state.
+    fn availability_with_unavailable(
+        unavailable: &[EngineType],
+    ) -> BTreeMap<EngineType, EngineAvailability> {
+        EngineType::all()
+            .map(|engine| {
+                let available = !unavailable.contains(&engine);
+                (
+                    engine,
+                    EngineAvailability {
+                        available,
+                        reason: if available {
+                            AvailabilityReason::Available
+                        } else {
+                            AvailabilityReason::RuntimeMissing
+                        },
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn all_available() -> BTreeMap<EngineType, EngineAvailability> {
+        availability_with_unavailable(&[])
+    }
+
     // ── TrayState ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -518,7 +607,10 @@ mod tests {
         assert_eq!(state.engine, EngineType::DeepFilterNet);
         assert_eq!(state.mode, ProcessingMode::Balanced);
         assert!(!state.monitor_enabled);
-        assert!(!state.khip_available);
+        assert_eq!(state.availability.len(), 5);
+        assert!(!state.availability[&EngineType::Khip].available);
+        assert!(state.availability[&EngineType::RNNoise].available);
+        assert!(state.availability[&EngineType::DeepFilterNet].available);
     }
 
     #[test]
@@ -528,13 +620,13 @@ mod tests {
             EngineType::RNNoise,
             ProcessingMode::LowCpu,
             true,
-            true,
+            all_available(),
         );
         assert!(!state.active);
         assert_eq!(state.engine, EngineType::RNNoise);
         assert_eq!(state.mode, ProcessingMode::LowCpu);
         assert!(state.monitor_enabled);
-        assert!(state.khip_available);
+        assert!(state.availability[&EngineType::Khip].available);
     }
 
     #[test]
@@ -573,11 +665,11 @@ mod tests {
     }
 
     #[test]
-    fn tray_state_set_khip_available() {
+    fn tray_state_set_availability() {
         let mut state = TrayState::default();
-        assert!(!state.khip_available);
-        state.set_khip_available(true);
-        assert!(state.khip_available);
+        assert!(!state.availability[&EngineType::Khip].available);
+        state.set_availability(all_available());
+        assert!(state.availability[&EngineType::Khip].available);
     }
 
     #[test]
@@ -598,23 +690,25 @@ mod tests {
             .set_engine(EngineType::RNNoise)
             .set_mode(ProcessingMode::MaxQuality)
             .set_monitor_enabled(true)
-            .set_khip_available(true);
+            .set_availability(all_available());
 
         assert!(!state.active);
         assert_eq!(state.engine, EngineType::RNNoise);
         assert_eq!(state.mode, ProcessingMode::MaxQuality);
         assert!(state.monitor_enabled);
-        assert!(state.khip_available);
+        assert!(state.availability[&EngineType::Khip].available);
     }
 
     // ── TrayCommand ───────────────────────────────────────────────────────────
 
     #[test]
     fn tray_command_variants_constructible() {
-        let cmds = vec![
+        let cmds = [
             TrayCommand::Toggle,
             TrayCommand::SetEngine(EngineType::RNNoise),
             TrayCommand::SetEngine(EngineType::DeepFilterNet),
+            TrayCommand::SetEngine(EngineType::Dpdfnet2),
+            TrayCommand::SetEngine(EngineType::Dpdfnet8),
             TrayCommand::SetEngine(EngineType::Khip),
             TrayCommand::ToggleMonitor,
             TrayCommand::OpenWindow,
@@ -623,9 +717,9 @@ mod tests {
         ];
         // Just verify they can be constructed and compared.
         assert_eq!(cmds[0], TrayCommand::Toggle);
-        assert_eq!(cmds[4], TrayCommand::ToggleMonitor);
-        assert_eq!(cmds[5], TrayCommand::OpenWindow);
-        assert_eq!(cmds[6], TrayCommand::Quit);
+        assert_eq!(cmds[6], TrayCommand::ToggleMonitor);
+        assert_eq!(cmds[7], TrayCommand::OpenWindow);
+        assert_eq!(cmds[8], TrayCommand::Quit);
     }
 
     #[test]
@@ -687,12 +781,31 @@ mod tests {
     }
 
     #[test]
-    fn menu_engine_submenu_has_three_items() {
-        let state = TrayState::default();
+    fn menu_engine_submenu_has_five_items_in_d07_order() {
+        let mut state = TrayState::default();
+        state.set_availability(all_available());
         let menu = build_menu(&state);
 
         if let MenuItem::Submenu { children, .. } = &menu[1] {
-            assert_eq!(children.len(), 3, "engine submenu should have 3 entries");
+            assert_eq!(children.len(), 5, "engine submenu should have 5 entries");
+            let commands: Vec<&TrayCommand> = children
+                .iter()
+                .map(|c| match c {
+                    MenuItem::Check { command, .. } => command,
+                    other => panic!("expected Check item, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                commands,
+                vec![
+                    &TrayCommand::SetEngine(EngineType::RNNoise),
+                    &TrayCommand::SetEngine(EngineType::DeepFilterNet),
+                    &TrayCommand::SetEngine(EngineType::Dpdfnet2),
+                    &TrayCommand::SetEngine(EngineType::Dpdfnet8),
+                    &TrayCommand::SetEngine(EngineType::Khip),
+                ],
+                "engine submenu must mirror the window selector's fixed D-07 order"
+            );
         } else {
             panic!("expected engine submenu at index 1");
         }
@@ -721,15 +834,39 @@ mod tests {
     }
 
     #[test]
-    fn menu_khip_grayed_out_when_unavailable() {
+    fn menu_checkmark_reflects_actual_active_engine_not_requested() {
+        // T-15.1-09: the checkmark must follow `state.engine` (the
+        // truthful ACTIVE engine) — this test picks an engine that would
+        // be a plausible "requested" value to make sure nothing in
+        // build_menu re-derives the checkmark from anything else.
         let mut state = TrayState::default();
-        state.set_khip_available(false);
+        state.set_engine(EngineType::DeepFilterNet); // fallback landed here
         let menu = build_menu(&state);
 
         if let MenuItem::Submenu { children, .. } = &menu[1] {
-            // Khip is the third child.
             assert!(
-                matches!(&children[2], MenuItem::Check { enabled: false, .. }),
+                matches!(&children[1], MenuItem::Check { checked: true, .. }),
+                "DeepFilterNet (the active engine) should be checked" // i18n-ignore
+            );
+            assert!(
+                matches!(&children[2], MenuItem::Check { checked: false, .. }),
+                "DPDFNet-2 (the merely-requested, failed engine) must not be checked" // i18n-ignore
+            );
+        } else {
+            panic!("expected engine submenu");
+        }
+    }
+
+    #[test]
+    fn menu_khip_grayed_out_when_unavailable() {
+        let mut state = TrayState::default();
+        state.set_availability(availability_with_unavailable(&[EngineType::Khip]));
+        let menu = build_menu(&state);
+
+        if let MenuItem::Submenu { children, .. } = &menu[1] {
+            // Khip is the fifth (last) child per D-07 order.
+            assert!(
+                matches!(&children[4], MenuItem::Check { enabled: false, .. }),
                 "Khip should be disabled when unavailable"
             );
         } else {
@@ -740,14 +877,58 @@ mod tests {
     #[test]
     fn menu_khip_enabled_when_available() {
         let mut state = TrayState::default();
-        state.set_khip_available(true);
+        state.set_availability(all_available());
         let menu = build_menu(&state);
 
         if let MenuItem::Submenu { children, .. } = &menu[1] {
             assert!(
-                matches!(&children[2], MenuItem::Check { enabled: true, .. }),
+                matches!(&children[4], MenuItem::Check { enabled: true, .. }),
                 "Khip should be enabled when available"
             );
+        } else {
+            panic!("expected engine submenu");
+        }
+    }
+
+    #[test]
+    fn menu_dpdfnet_variants_are_independently_disabled_per_d02() {
+        let mut state = TrayState::default();
+        // Only DPDFNet-2 unavailable; DPDFNet-8 stays available — proves
+        // one variant's disablement never leaks into the other's row.
+        state.set_availability(availability_with_unavailable(&[EngineType::Dpdfnet2]));
+        let menu = build_menu(&state);
+
+        if let MenuItem::Submenu { children, .. } = &menu[1] {
+            assert!(
+                matches!(&children[2], MenuItem::Check { enabled: false, .. }),
+                "DPDFNet-2 should be disabled"
+            );
+            assert!(
+                matches!(&children[3], MenuItem::Check { enabled: true, .. }),
+                "DPDFNet-8 must remain enabled independently of DPDFNet-2 (D-02)"
+            );
+        } else {
+            panic!("expected engine submenu");
+        }
+    }
+
+    #[test]
+    fn menu_dpdfnet_unavailable_label_is_translated_and_visible() {
+        let mut state = TrayState::default();
+        state.set_availability(availability_with_unavailable(&[EngineType::Dpdfnet8]));
+        let menu = build_menu(&state);
+
+        if let MenuItem::Submenu { children, .. } = &menu[1] {
+            if let MenuItem::Check { label, enabled, .. } = &children[3] {
+                assert!(!enabled);
+                assert!(
+                    label.contains("DPDFNet-8"),
+                    "unavailable entry must keep the product name, never hide the row: {label}"
+                );
+                assert_ne!(label, "DPDFNet-8", "must carry an unavailable marker");
+            } else {
+                panic!("expected Check item for DPDFNet-8");
+            }
         } else {
             panic!("expected engine submenu");
         }
