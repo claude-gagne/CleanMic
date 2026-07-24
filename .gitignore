@@ -17,6 +17,10 @@
 # Downloaded packages
 *.deb
 
+# Python bytecode cache (Phase 15/15.1 evidence-validation tooling)
+__pycache__/
+*.pyc
+
 # Workflow / planning artifacts — MUST NEVER be committed (private state, leaked
 # previously and forced repo cleanup). Includes the .planning symlink to the
 # sibling private repo at ../CleanMic-planning.
