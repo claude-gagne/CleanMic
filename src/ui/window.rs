@@ -97,6 +97,14 @@ fn engine_label(engine: EngineType) -> &'static str {
     match engine {
         EngineType::RNNoise => "RNNoise",
         EngineType::DeepFilterNet => "DeepFilterNet",
+        // Selector-row registration (ordering, availability, disabled-row
+        // presentation per D-05/D-07/D-08) is a later phase's job (Phase
+        // 15.1 Plans 05/06) — these two arms exist only so `EngineType`
+        // remains exhaustively matched everywhere now that the engine layer
+        // (this plan) registers both variants; DPDFNet-2/8 are not yet added
+        // to `engines` below, so these rows are not shown today.
+        EngineType::Dpdfnet2 => "DPDFNet-2",
+        EngineType::Dpdfnet8 => "DPDFNet-8",
         EngineType::Khip => "Khip",
     }
 }
@@ -109,6 +117,10 @@ fn engine_subtitle(engine: EngineType) -> String {
     match engine {
         EngineType::RNNoise => tr!("Lightweight, low CPU"),
         EngineType::DeepFilterNet => tr!("High quality (default)"),
+        // See `engine_label`'s doc comment: real selector-row wording (D-06)
+        // lands with Plan 05/06's selector registration, not this plan.
+        EngineType::Dpdfnet2 => tr!("DPDFNet, lighter"),
+        EngineType::Dpdfnet8 => tr!("DPDFNet, higher quality"),
         EngineType::Khip => tr!("User-supplied, adaptive"),
     }
 }

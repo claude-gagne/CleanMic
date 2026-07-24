@@ -96,6 +96,31 @@ pub fn is_engine_available(engine: EngineType) -> bool {
     }
 }
 
+/// Point `ORT_DYLIB_PATH` at the bundled `$APPDIR/usr/lib/libonnxruntime.so`
+/// if it isn't already set (T-15.1-03: resolve only the AppImage-owned
+/// runtime, never a system fallback). Never clobbers an existing value — a
+/// developer/test override always wins. Without this, [`dpdfnet::DpdfnetEngine`]
+/// has no way to discover the bundled runtime at all in the real shipped
+/// AppImage, since it only reads the env var (mirrors
+/// `dpdfnet_experimental`'s established contract) and nothing in
+/// `src/app.rs`/AppRun sets it from `$APPDIR` today.
+#[cfg(feature = "dpdfnet")]
+fn dpdfnet_ensure_ort_dylib_env(appdir: &std::path::Path) {
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return;
+    }
+    let candidate = appdir.join("usr/lib/libonnxruntime.so");
+    if candidate.is_file() {
+        // SAFETY: called only from the single-threaded engine
+        // construction/availability-check path, before any DPDFNet session
+        // exists — mirrors `khip`'s established `env::set_var` usage in
+        // `KhipEngine::init` (src/engine/khip/mod.rs).
+        unsafe {
+            std::env::set_var("ORT_DYLIB_PATH", &candidate);
+        }
+    }
+}
+
 /// Resolve a bundled DPDFNet variant's model path, restricted to
 /// `$APPDIR/usr/share/cleanmic/models` (T-15.1-03) — the stricter allowlist
 /// the shipping factory applies on top of [`dpdfnet::DpdfnetEngine`]'s own
@@ -105,9 +130,12 @@ pub fn is_engine_available(engine: EngineType) -> bool {
 /// rather than a hard failure.
 #[cfg(feature = "dpdfnet")]
 fn dpdfnet_model_path(variant: dpdfnet::DpdfnetVariant) -> Result<std::path::PathBuf> {
-    let appdir = std::env::var_os("APPDIR")
-        .ok_or_else(|| anyhow::anyhow!("APPDIR is not set; DPDFNet requires the AppImage runtime"))?;
-    let path = std::path::PathBuf::from(appdir)
+    let appdir = std::env::var_os("APPDIR").ok_or_else(|| {
+        anyhow::anyhow!("APPDIR is not set; DPDFNet requires the AppImage runtime")
+    })?;
+    let appdir = std::path::PathBuf::from(appdir);
+    dpdfnet_ensure_ort_dylib_env(&appdir);
+    let path = appdir
         .join("usr/share/cleanmic/models")
         .join(variant.model_filename());
     anyhow::ensure!(
@@ -213,8 +241,16 @@ pub fn create_engine_with_fallback(preferred: EngineType) -> (Box<dyn NoiseEngin
         // DPDFNet variant (they are independently gated, not interchangeable
         // quality tiers) — fall back to DeepFilterNet/RNNoise instead, same
         // as DeepFilterNet's own chain.
-        EngineType::Dpdfnet2 => &[EngineType::Dpdfnet2, EngineType::DeepFilterNet, EngineType::RNNoise],
-        EngineType::Dpdfnet8 => &[EngineType::Dpdfnet8, EngineType::DeepFilterNet, EngineType::RNNoise],
+        EngineType::Dpdfnet2 => &[
+            EngineType::Dpdfnet2,
+            EngineType::DeepFilterNet,
+            EngineType::RNNoise,
+        ],
+        EngineType::Dpdfnet8 => &[
+            EngineType::Dpdfnet8,
+            EngineType::DeepFilterNet,
+            EngineType::RNNoise,
+        ],
         EngineType::RNNoise => &[EngineType::RNNoise],
     };
     for &engine_type in chain {

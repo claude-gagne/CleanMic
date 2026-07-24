@@ -230,6 +230,16 @@ msgstr "Léger, faible consommation CPU"
 msgid "User-supplied, adaptive"
 msgstr "Fourni par l'utilisateur, adaptatif"
 
+# Phase 15.1 Plan 04: Engine subtitle — DPDFNet-2 (not yet shown in the
+# selector; real wording lands with Plan 05/06's selector registration)
+msgid "DPDFNet, lighter"
+msgstr "DPDFNet, plus léger"
+
+# Phase 15.1 Plan 04: Engine subtitle — DPDFNet-8 (not yet shown in the
+# selector; real wording lands with Plan 05/06's selector registration)
+msgid "DPDFNet, higher quality"
+msgstr "DPDFNet, qualité supérieure"
+
 # 260508-k7q: Notification title — fired on first hidden autostart launch (src/app.rs)
 msgid "CleanMic is running"
 msgstr "CleanMic est en cours d'exécution"

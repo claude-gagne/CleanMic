@@ -205,9 +205,9 @@ impl Synthesis {
         // imaginary component -- per realfft's own documented contract the
         // transform is still performed correctly, so this is logged, not
         // treated as a processing failure.
-        if let Err(e) = self
-            .c2r
-            .process_with_scratch(&mut self.ifft_in, &mut self.ifft_out, &mut self.scratch)
+        if let Err(e) =
+            self.c2r
+                .process_with_scratch(&mut self.ifft_in, &mut self.ifft_out, &mut self.scratch)
         {
             log::debug!("DPDFNet inverse transform note: {e}");
         }
@@ -356,7 +356,9 @@ fn ensure_runtime(dylib_path: &Path) -> Result<()> {
 /// `model.rs::parse_csv_f32`, used to decode `erb_norm_init`/`spec_norm_init`
 /// custom ONNX metadata).
 fn parse_csv_f32(s: &str) -> Vec<f32> {
-    s.split(',').filter_map(|t| t.trim().parse::<f32>().ok()).collect()
+    s.split(',')
+        .filter_map(|t| t.trim().parse::<f32>().ok())
+        .collect()
 }
 
 /// Production DPDFNet-2 / DPDFNet-8 noise suppression engine.
@@ -482,8 +484,7 @@ impl NoiseEngine for DpdfnetEngine {
         // Determine state_size + metadata-derived initial recurrent state,
         // mirroring the pinned reference's `Model::load` exactly.
         let (state_size, init_state) = {
-            let meta =
-                ort_ctx(session.metadata(), "failed to read DPDFNet model metadata")?;
+            let meta = ort_ctx(session.metadata(), "failed to read DPDFNet model metadata")?;
             let state_size: usize = meta
                 .custom("state_size")
                 .and_then(|s| s.trim().parse().ok())

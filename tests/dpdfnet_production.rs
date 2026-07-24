@@ -30,8 +30,9 @@
 
 #[cfg(feature = "dpdfnet")]
 mod dpdfnet_production {
+    use cleanmic::audio::AudioPipeline;
     use cleanmic::engine::dpdfnet::{DpdfnetEngine, DpdfnetVariant};
-    use cleanmic::engine::{EngineType, NoiseEngine};
+    use cleanmic::engine::{self, EngineType, NoiseEngine};
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -444,6 +445,295 @@ mod dpdfnet_production {
             healthy.teardown();
         } else {
             eprintln!("[dpdfnet_production] SKIP: dpdfnet8 unavailable for isolation check");
+        }
+    }
+
+    // ── Plan 04 Task 2: factory isolation, real-pipeline switching, and ──
+    // ── sustained real-time evidence (D-01/D-02) ─────────────────────────
+
+    /// Restores an environment variable to its pre-test value on drop, even
+    /// if the test body panics mid-assertion. `--test-threads=1` (required
+    /// by this whole file) makes this safe: no other test mutates
+    /// `APPDIR`/`ORT_DYLIB_PATH` concurrently with this guard's lifetime.
+    struct EnvRestore {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: test-only cleanup; serial execution (--test-threads=1).
+            unsafe {
+                match &self.original {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var_os(key),
+            }
+        }
+    }
+
+    /// Exercises the REAL production `create_engine`/`is_engine_available`
+    /// factory (not a direct `DpdfnetEngine::new` call) against a
+    /// constructed fake `$APPDIR` that deliberately bundles only DPDFNet-8's
+    /// model, proving the factory-level D-02 isolation contract: DPDFNet-2's
+    /// resolution failure must never touch DPDFNet-8's availability or
+    /// construction.
+    #[test]
+    fn create_engine_factory_isolates_one_variant_failure_from_the_other() {
+        let ort_src = ort_dylib_path();
+        let m2 = model_path_for("dpdfnet2");
+        let m8 = model_path_for("dpdfnet8");
+        if !ort_src.is_file() || !m2.is_file() || !m8.is_file() {
+            eprintln!(
+                "[dpdfnet_production] SKIP: pinned assets unavailable for factory isolation check"
+            );
+            return;
+        }
+
+        let _restore_appdir = EnvRestore::capture("APPDIR");
+        let _restore_ort = EnvRestore::capture("ORT_DYLIB_PATH");
+
+        let tmp = tempfile::tempdir().expect("create fake AppDir tempdir");
+        let lib_dir = tmp.path().join("usr/lib");
+        let models_dir = tmp.path().join("usr/share/cleanmic/models");
+        std::fs::create_dir_all(&lib_dir).expect("create fake usr/lib");
+        std::fs::create_dir_all(&models_dir).expect("create fake usr/share/cleanmic/models");
+        std::fs::copy(&ort_src, lib_dir.join("libonnxruntime.so"))
+            .expect("stage fake ONNX Runtime");
+        // Only DPDFNet-8's model is bundled here; DPDFNet-2's is deliberately
+        // absent to force a real, factory-level construction failure.
+        std::fs::copy(&m8, models_dir.join("dpdfnet8_48khz_hr.onnx"))
+            .expect("stage fake dpdfnet8 model");
+
+        // SAFETY: test-only; serial (--test-threads=1); restored by the
+        // guards above regardless of how this test exits.
+        unsafe {
+            std::env::set_var("APPDIR", tmp.path());
+            std::env::remove_var("ORT_DYLIB_PATH"); // force the factory to derive it from APPDIR
+        }
+
+        assert!(
+            !engine::is_engine_available(EngineType::Dpdfnet2),
+            "dpdfnet2's model is deliberately absent from this fake AppDir"
+        );
+        assert!(
+            engine::create_engine(EngineType::Dpdfnet2).is_err(),
+            "the factory must fail closed for the missing variant, not silently substitute"
+        );
+
+        assert!(
+            engine::is_engine_available(EngineType::Dpdfnet8),
+            "dpdfnet8's model IS present in this fake AppDir"
+        );
+        let engine8 = engine::create_engine(EngineType::Dpdfnet8);
+        assert!(
+            engine8.is_ok(),
+            "DPDFNet-8's factory construction must succeed even though DPDFNet-2's failed: {:?}",
+            engine8.err().map(|e| e.to_string())
+        );
+    }
+
+    /// Real `AudioPipeline`/`AudioCommand::SetEngine` crossfade continuity
+    /// across both DPDFNet-to-existing-engine and DPDFNet-to-DPDFNet
+    /// switches, using the actual production `DpdfnetEngine` (not the
+    /// throwaway experimental adapter). Mirrors
+    /// `tests/dpdfnet_experimental_switch.rs`'s heartbeat-continuity
+    /// contract; in `AudioPipeline::new()`'s simulation mode input is
+    /// silence, so this proves the audio thread survives every crossfade
+    /// without deadlock/panic -- perceptual non-silent output on real audio
+    /// is covered directly on the engine by the golden/strength tests above.
+    #[test]
+    fn production_engines_survive_repeated_pipeline_switching() {
+        let (Some(mut e2), Some(mut e8)) = (build_engine("dpdfnet2"), build_engine("dpdfnet8"))
+        else {
+            eprintln!(
+                "[dpdfnet_production] SKIP: pinned assets unavailable for pipeline switching"
+            );
+            return;
+        };
+        // Warm both up so they are past the two-hop silent warm-up before
+        // being handed to the pipeline (does not affect the heartbeat
+        // assertion below, just keeps this test's intent explicit).
+        let input = vec![0.01f32; HOP];
+        let mut output = vec![0f32; HOP];
+        for _ in 0..4 {
+            e2.process(&input, &mut output);
+            e8.process(&input, &mut output);
+        }
+
+        let pipeline = AudioPipeline::new().expect("spawn real AudioPipeline");
+        pipeline.start();
+        std::thread::sleep(Duration::from_millis(30));
+        let hb0 = pipeline.heartbeat_count();
+
+        pipeline.set_engine(Box::new(e2));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            pipeline.is_cmd_channel_open(),
+            "audio thread must survive SetEngine(DPDFNet-2) crossfade without panicking"
+        );
+
+        pipeline.set_engine(Box::new(e8));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            pipeline.is_cmd_channel_open(),
+            "audio thread must survive DPDFNet-2 -> DPDFNet-8 crossfade without panicking"
+        );
+
+        // DPDFNet -> an existing (non-DPDFNet) engine and back, proving the
+        // crossfade path is not DPDFNet-specific.
+        let (rnnoise_engine, _actual) = engine::create_engine_with_fallback(EngineType::RNNoise);
+        pipeline.set_engine(rnnoise_engine);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            pipeline.is_cmd_channel_open(),
+            "audio thread must survive DPDFNet-8 -> RNNoise crossfade without panicking"
+        );
+
+        if let Some(back_to_d2) = build_engine("dpdfnet2") {
+            pipeline.set_engine(Box::new(back_to_d2));
+            std::thread::sleep(Duration::from_millis(80));
+            assert!(
+                pipeline.is_cmd_channel_open(),
+                "audio thread must survive RNNoise -> DPDFNet-2 crossfade without panicking"
+            );
+        }
+
+        let hb1 = pipeline.heartbeat_count();
+        assert!(
+            hb1 > hb0,
+            "audio thread heartbeat must keep advancing across every crossfade (no deadlock): {hb0} -> {hb1}"
+        );
+
+        pipeline.shutdown();
+    }
+
+    /// Read current process RSS (KiB) from `/proc/self/status`, used as
+    /// allocation evidence for the sustained run below (matches the
+    /// established convention in `tests/dpdfnet_experimental_switch.rs`:
+    /// this codebase has no custom global-allocator call counter, so a
+    /// near-zero RSS delta across a long warmed loop is the accepted proxy
+    /// for "no per-call allocation growth").
+    fn read_rss_kib() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status.lines().find_map(|line| {
+            line.strip_prefix("VmRSS:").and_then(|rest| {
+                rest.chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
+        })
+    }
+
+    /// A realistic (non-constant, multi-tone) 48 kHz mono signal -- avoids
+    /// the false confidence a literal-silence or single-tone input would
+    /// give the timing/allocation measurement below.
+    fn realistic_hop(hop_index: usize) -> [f32; HOP] {
+        let mut out = [0f32; HOP];
+        for (i, sample) in out.iter_mut().enumerate() {
+            let n = (hop_index * HOP + i) as f32;
+            let t = n / 48_000.0;
+            *sample = 0.25 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                + 0.08 * (2.0 * std::f32::consts::PI * 2500.0 * t).sin()
+                + 0.02 * (2.0 * std::f32::consts::PI * 6000.0 * t).cos();
+        }
+        out
+    }
+
+    /// A warmed, realistic (non-silent, multi-tone), single-thread sustained
+    /// run per variant, recording median/p99/max latency, real-time deadline
+    /// misses, and an RSS-based allocation-growth check. Independent
+    /// per-variant results (D-02) -- one variant's numbers never gate the
+    /// other's. "Underflow" in this direct-engine-call context (no ring
+    /// buffer / no PipeWire) reduces to "every call returns a full,
+    /// finite-length HOP block with no panic" -- ring-buffer-level underflow
+    /// is a `src/audio.rs`-level concern already covered by
+    /// `production_engines_survive_repeated_pipeline_switching`'s heartbeat
+    /// check above.
+    #[test]
+    fn warmed_sustained_realtime_evidence_per_variant() {
+        const ITERATIONS: usize = 6_000; // 6,000 * 10ms = 60s of simulated audio
+        const BUDGET: Duration = Duration::from_millis(10);
+
+        for variant in ["dpdfnet2", "dpdfnet8"] {
+            let Some(mut eng) = build_engine(variant) else {
+                eprintln!(
+                    "[dpdfnet_production] SKIP: {variant} unavailable for sustained evidence"
+                );
+                continue;
+            };
+
+            let mut output = vec![0f32; HOP];
+            // Warm up (allocator/session warmup + the two-hop DSP warm-up).
+            for h in 0..20 {
+                eng.process(&realistic_hop(h), &mut output);
+            }
+
+            let rss_before = read_rss_kib();
+            let mut latencies_us: Vec<u128> = Vec::with_capacity(ITERATIONS);
+            let mut deadline_misses = 0usize;
+            let mut block_overruns = 0usize;
+            let start = Instant::now();
+            for h in 0..ITERATIONS {
+                let hop = realistic_hop(h);
+                let t0 = Instant::now();
+                eng.process(&hop, &mut output);
+                let elapsed = t0.elapsed();
+                latencies_us.push(elapsed.as_micros());
+                if elapsed > BUDGET {
+                    deadline_misses += 1;
+                }
+                if output.len() != HOP || !output.iter().all(|v| v.is_finite()) {
+                    block_overruns += 1;
+                }
+            }
+            let wall = start.elapsed();
+            let rss_after = read_rss_kib();
+            eng.teardown();
+
+            latencies_us.sort_unstable();
+            let median_us = latencies_us[latencies_us.len() / 2];
+            let p99_idx = (((latencies_us.len() as f64) * 0.99) as usize)
+                .min(latencies_us.len().saturating_sub(1));
+            let p99_us = latencies_us[p99_idx];
+            let max_us = *latencies_us.last().unwrap();
+            let rss_delta_kib = match (rss_before, rss_after) {
+                (Some(b), Some(a)) => Some(a as i64 - b as i64),
+                _ => None,
+            };
+
+            eprintln!(
+                "[dpdfnet_production] {variant} sustained evidence: {ITERATIONS} hops in {wall:?}, \
+                 median={median_us}us p99={p99_us}us max={max_us}us deadline_misses={deadline_misses} \
+                 rss_delta={rss_delta_kib:?}KiB"
+            );
+
+            assert_eq!(
+                block_overruns, 0,
+                "{variant}: {block_overruns} hop(s) produced a wrong-length or non-finite block"
+            );
+            assert!(
+                deadline_misses * 20 < ITERATIONS, // < 5% of hops over the 10ms real-time budget
+                "{variant}: too many hops exceeded the 10ms real-time budget: \
+                 {deadline_misses}/{ITERATIONS} (max {max_us}us)"
+            );
+            if let Some(delta) = rss_delta_kib {
+                assert!(
+                    delta < 20_000, // generous bound: no unbounded per-call growth over 60s
+                    "{variant}: RSS grew by {delta} KiB over the sustained run -- possible per-call allocation"
+                );
+            }
         }
     }
 }
