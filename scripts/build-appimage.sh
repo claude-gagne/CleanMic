@@ -30,7 +30,6 @@ BUILD_DIR="$PROJECT_ROOT/build"
 APPDIR="$BUILD_DIR/AppDir"
 TOOLS_DIR="$BUILD_DIR/tools"
 BINARY="$PROJECT_ROOT/target/release/cleanmic"
-OUTPUT="$BUILD_DIR/CleanMic-x86_64.AppImage"
 APPIMAGETOOL="$TOOLS_DIR/appimagetool"
 APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
 
@@ -51,9 +50,123 @@ info()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m==> %s\033[0m\n' "$*"; }
 error() { printf '\033[1;31m==> %s\033[0m\n' "$*" >&2; exit 1; }
 
+# ── DPDFNet variant selector (Phase 15.1 Plan 07 — D-01/D-02/D-03/D-04) ─────
+# DPDFNET_VARIANTS picks which DPDFNet model asset set (if any) this build
+# bundles offline, independently of the other suppression engines:
+#   none      -- (default) no `dpdfnet` cargo feature, no models/runtime
+#                bundled. Identical to this script's pre-Phase-15.1 behavior
+#                and filename, so existing invocations/CI are unaffected.
+#   dpdfnet2  -- bundle only the DPDFNet-2 model + the one shared runtime.
+#   dpdfnet8  -- bundle only the DPDFNet-8 model + the one shared runtime.
+#   both      -- bundle both models + the one shared runtime.
+# The throwaway `dpdfnet-experimental` cargo feature is NEVER included in any
+# of these four package builds (measurement-only, never shipped).
+DPDFNET_VARIANTS="${DPDFNET_VARIANTS:-none}"
+BASE_FEATURES="gui,pipewire,tray,rnnoise,deepfilter,updater"
+
+# dpdfnet_variant_features <variant> -- pure, prints the cargo --features
+# value for the given variant.
+dpdfnet_variant_features() {
+    local variant="$1"
+    case "$variant" in
+        none) printf '%s' "$BASE_FEATURES" ;;
+        dpdfnet2|dpdfnet8|both) printf '%s,dpdfnet' "$BASE_FEATURES" ;;
+        *) return 1 ;;
+    esac
+}
+
+# dpdfnet_output_suffix <variant> -- pure, prints the AppImage output
+# filename suffix for the given variant. "none" is empty so the default
+# invocation keeps the exact pre-Phase-15.1 filename.
+dpdfnet_output_suffix() {
+    local variant="$1"
+    case "$variant" in
+        none) printf '' ;;
+        dpdfnet2) printf -- '-dpdfnet2' ;;
+        dpdfnet8) printf -- '-dpdfnet8' ;;
+        both) printf -- '-dpdfnet-both' ;;
+        *) return 1 ;;
+    esac
+}
+
+# dpdfnet_models_for_variant <variant> -- pure, prints the newline-separated
+# bundled model filename(s) for the given variant (nothing for "none").
+# Filenames match src/engine/dpdfnet.rs's DpdfnetVariant::model_filename().
+dpdfnet_models_for_variant() {
+    local variant="$1"
+    case "$variant" in
+        none) return 0 ;;
+        dpdfnet2) printf '%s\n' "dpdfnet2_48khz_hr.onnx" ;;
+        dpdfnet8) printf '%s\n' "dpdfnet8_48khz_hr.onnx" ;;
+        both) printf '%s\n%s\n' "dpdfnet2_48khz_hr.onnx" "dpdfnet8_48khz_hr.onnx" ;;
+        *) return 1 ;;
+    esac
+}
+
+# dpdfnet_bundle_assets <variant> <ref_dir> <appdir> -- copies the ONE shared
+# ONNX Runtime + the requested model(s) from an already offline-verified
+# DPDFNet reference tree into an AppDir. Fails closed (nonzero exit via
+# `error`) on any missing source file -- never partially bundles, never
+# searches/downloads at build OR runtime (T-15.1-11/T-15.1-12). Never
+# packages the golden probe, the `enhance` renderer, or checked-out
+# HushMic/DPDFNet source -- only the shared runtime + requested model(s).
+dpdfnet_bundle_assets() {
+    local variant="$1" ref_dir="$2" appdir="$3"
+    [ "$variant" = "none" ] && return 0
+
+    local runtime_src="$ref_dir/lib/libonnxruntime.so"
+    if [ ! -f "$runtime_src" ]; then
+        error "DPDFNet runtime not found at $runtime_src (run: bash scripts/fetch-vendors.sh --dpdfnet-reference)"
+    fi
+    mkdir -p "$appdir/usr/lib"
+    cp "$runtime_src" "$appdir/usr/lib/libonnxruntime.so"
+    info "  Bundled shared runtime: libonnxruntime.so"
+
+    mkdir -p "$appdir/usr/share/cleanmic/models"
+    local model_file model_src
+    while IFS= read -r model_file; do
+        [ -n "$model_file" ] || continue
+        model_src="$ref_dir/models/$model_file"
+        if [ ! -f "$model_src" ]; then
+            error "DPDFNet model not found at $model_src (run: bash scripts/fetch-vendors.sh --dpdfnet-reference)"
+        fi
+        cp "$model_src" "$appdir/usr/share/cleanmic/models/$model_file"
+        info "  Bundled model: $model_file"
+    done <<EOF
+$(dpdfnet_models_for_variant "$variant")
+EOF
+}
+
+case "$DPDFNET_VARIANTS" in
+    none|dpdfnet2|dpdfnet8|both) ;;
+    *) error "DPDFNET_VARIANTS must be one of: none, dpdfnet2, dpdfnet8, both (got: $DPDFNET_VARIANTS)" ;;
+esac
+
+# ── Test-only early exit ─────────────────────────────────────────────────────
+# Lets scripts/test-dpdfnet-appimage.sh `source` this file to reuse the pure
+# functions above (feature/suffix/model-set computation, plus the sandboxable
+# dpdfnet_bundle_assets) without running a real cargo build/AppImage
+# packaging pass. Never set by a normal build invocation.
+if [ "${BUILD_APPIMAGE_SOURCE_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+CARGO_FEATURES="$(dpdfnet_variant_features "$DPDFNET_VARIANTS")"
+OUTPUT="$BUILD_DIR/CleanMic-x86_64$(dpdfnet_output_suffix "$DPDFNET_VARIANTS").AppImage"
+DPDFNET_REF_DIR="${DPDFNET_REF_DIR:-$PROJECT_ROOT/vendor/dpdfnet-reference}"
+
+# ── Step 0: Offline re-verify the pinned DPDFNet reference assets ──────────
+# Only for DPDF-bearing builds (D-01/D-02/D-03). Never touches the network --
+# fails closed on missing/tampered/symlinked/hash-drifted assets before any
+# cargo build or AppDir work begins.
+if [ "$DPDFNET_VARIANTS" != "none" ]; then
+    info "DPDFNET_VARIANTS=$DPDFNET_VARIANTS -- verifying pinned DPDFNet reference assets offline..."
+    bash "$SCRIPT_DIR/fetch-vendors.sh" --verify-dpdfnet-reference
+fi
+
 # ── Step 1: Build release binary ────────────────────────────────────────────
-info "Building release binary..."
-(cd "$PROJECT_ROOT" && cargo build --release --all-features)
+info "Building release binary (features: $CARGO_FEATURES)..."
+(cd "$PROJECT_ROOT" && cargo build --release --features "$CARGO_FEATURES")
 
 if [ ! -f "$BINARY" ]; then
     error "Release binary not found at $BINARY"
@@ -112,6 +225,12 @@ if [ ! -f "$THIRD_PARTY_NOTICE" ]; then
 fi
 mkdir -p "$APPDIR/usr/share/doc/cleanmic"
 cp "$THIRD_PARTY_NOTICE" "$APPDIR/usr/share/doc/cleanmic/THIRD-PARTY-LICENSES.md"
+
+# ── Step 3d: Bundle the shared ONNX Runtime + requested DPDFNet model(s) ───
+if [ "$DPDFNET_VARIANTS" != "none" ]; then
+    info "Bundling DPDFNet shared runtime + model(s) (DPDFNET_VARIANTS=$DPDFNET_VARIANTS)..."
+    dpdfnet_bundle_assets "$DPDFNET_VARIANTS" "$DPDFNET_REF_DIR" "$APPDIR"
+fi
 
 # ── Step 4: Copy desktop file and icons ──────────────────────────────────────
 info "Installing desktop file and icons..."
