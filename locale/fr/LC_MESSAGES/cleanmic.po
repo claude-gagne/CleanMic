@@ -251,3 +251,9 @@ msgstr "La fenêtre a été masquée. Cliquez sur l'icône système pour la rouv
 # 260510-ec4: Hamburger menu — opens https://github.com/claude-gagne/CleanMic/issues/new (src/ui/window.rs)
 msgid "Report an issue"
 msgstr "Signaler un problème"
+
+# Phase 15.1 Plan 05: Engine fallback notice — D-11 (src/engine/mod.rs).
+# Followed by the truthfully-ACTIVE engine's untranslated proper-noun name
+# (e.g. "DeepFilterNet"), never the failed/requested engine's name.
+msgid "Unable to start the selected engine — using instead:"
+msgstr "Impossible de démarrer le moteur sélectionné — utilisation de :"

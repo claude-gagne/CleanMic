@@ -16,6 +16,8 @@ pub mod rnnoise;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::tr;
+
 /// The type of noise suppression engine.
 ///
 /// Variant order mirrors the intended selector/tray row order (D-07):
@@ -60,8 +62,8 @@ impl EngineType {
     /// DPDFNet-8/Khip are proper nouns, matching `window::engine_label`'s
     /// established untranslated convention). Kept here — rather than only in
     /// the `gui`-gated `src/ui/window.rs` — so non-GUI code (e.g. a fallback
-    /// notice built for `UiState`, added by Task 2) can name an engine
-    /// without depending on the `gui` feature.
+    /// notice built for `UiState`) can name an engine without depending on
+    /// the `gui` feature.
     pub fn short_name(self) -> &'static str {
         match self {
             EngineType::RNNoise => "RNNoise",
@@ -114,22 +116,123 @@ pub trait NoiseEngine: Send {
     fn teardown(&mut self);
 }
 
+/// Why an engine is or is not available, in machine-checkable form
+/// (T-15.1-07/T-15.1-08). Supersedes ad hoc booleans so no engine —
+/// including Khip, which previously had the only dedicated availability
+/// field (`UiState::khip_available`, `TrayState::khip_available`) — is a
+/// special case in the shared runtime-policy model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityReason {
+    /// The engine is compiled in and its runtime dependency (library/model)
+    /// was found — ready to construct.
+    Available,
+    /// The crate was built without this engine's Cargo feature; `init()`
+    /// would fail even though the `EngineType` variant itself always exists.
+    FeatureDisabled,
+    /// Compiled in, but the runtime library/model/dylib was not found on
+    /// this system (e.g. Khip not installed, DPDFNet model/runtime missing).
+    RuntimeMissing,
+}
+
+/// Truthful per-engine availability: a boolean plus the reason behind it.
+/// One variant's unavailability never implies anything about another's
+/// (D-02) — every [`engine_availability`] call resolves exactly one engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineAvailability {
+    pub available: bool,
+    pub reason: AvailabilityReason,
+}
+
+/// Resolve one engine's truthful availability and reason.
+///
+/// - RNNoise/DeepFilterNet: available iff their Cargo feature is compiled
+///   in (`init()` would otherwise fail at runtime even though the type
+///   exists).
+/// - DPDFNet-2/DPDFNet-8: available iff the `dpdfnet` feature is compiled in
+///   AND the bundled model/runtime resolve under `$APPDIR` — independently
+///   per variant (D-02); one variant's missing asset never affects the
+///   other's report.
+/// - Khip: available iff the user-supplied library was detected at runtime.
+pub fn engine_availability(engine: EngineType) -> EngineAvailability {
+    use AvailabilityReason::{Available, FeatureDisabled, RuntimeMissing};
+    match engine {
+        EngineType::RNNoise => {
+            let available = cfg!(feature = "rnnoise");
+            EngineAvailability {
+                available,
+                reason: if available {
+                    Available
+                } else {
+                    FeatureDisabled
+                },
+            }
+        }
+        EngineType::DeepFilterNet => {
+            let available = cfg!(feature = "deepfilter");
+            EngineAvailability {
+                available,
+                reason: if available {
+                    Available
+                } else {
+                    FeatureDisabled
+                },
+            }
+        }
+        EngineType::Dpdfnet2 | EngineType::Dpdfnet8 => {
+            if !cfg!(feature = "dpdfnet") {
+                return EngineAvailability {
+                    available: false,
+                    reason: FeatureDisabled,
+                };
+            }
+            let available = dpdfnet_is_available(engine);
+            EngineAvailability {
+                available,
+                reason: if available { Available } else { RuntimeMissing },
+            }
+        }
+        EngineType::Khip => {
+            let available = khip::KhipEngine::is_available();
+            EngineAvailability {
+                available,
+                reason: if available { Available } else { RuntimeMissing },
+            }
+        }
+    }
+}
+
+/// Independent five-engine availability map (D-02/D-08). Building this from
+/// [`engine_availability`] per [`EngineType::all`] guarantees one variant's
+/// failure can never leak into another's entry.
+pub fn all_engine_availability() -> std::collections::BTreeMap<EngineType, EngineAvailability> {
+    EngineType::all()
+        .map(|engine| (engine, engine_availability(engine)))
+        .collect()
+}
+
 /// Check whether a given engine type is available on this system.
 ///
-/// - RNNoise is available when the `rnnoise` feature is enabled.
-/// - DeepFilterNet is available when the `deepfilter` feature is enabled.
-/// - Khip is only available if the user has installed the library.
-///
-/// Without their respective features, RNNoise and DeepFilterNet still exist
-/// as types but `init()` will return an error at runtime.
+/// Thin boolean wrapper over [`engine_availability`], kept for existing
+/// call sites (`src/ui/window.rs`, `src/tray.rs`, and this module's own
+/// factory) that only need the yes/no answer.
 pub fn is_engine_available(engine: EngineType) -> bool {
-    match engine {
-        EngineType::RNNoise => cfg!(feature = "rnnoise"),
-        EngineType::DeepFilterNet => cfg!(feature = "deepfilter"),
-        EngineType::Dpdfnet2 => dpdfnet_is_available(EngineType::Dpdfnet2),
-        EngineType::Dpdfnet8 => dpdfnet_is_available(EngineType::Dpdfnet8),
-        EngineType::Khip => khip::KhipEngine::is_available(),
+    engine_availability(engine).available
+}
+
+/// Build a translated, human-readable fallback notice when `active` differs
+/// from `requested` (T-15.1-07, D-11). Returns `None` when no fallback
+/// occurred. The caller must never claim `requested` is active while this is
+/// `Some` — e.g. a migrated DPDFNet-2 selection that failed to initialize
+/// and fell back to DeepFilterNet.
+pub fn fallback_notice(requested: EngineType, active: EngineType) -> Option<String> {
+    if requested == active {
+        return None;
     }
+    Some(format!(
+        "{} {}",
+        tr!("Unable to start the selected engine — using instead:"),
+        active.short_name()
+    ))
 }
 
 /// Point `ORT_DYLIB_PATH` at the bundled `$APPDIR/usr/lib/libonnxruntime.so`
@@ -485,8 +588,7 @@ mod tests {
     #[test]
     fn engine_type_has_a_total_order() {
         // Ord must agree with the declared ALL/all() order — used as
-        // BTreeMap keys by Config::strengths (and, once Task 2 lands,
-        // UiState::availability).
+        // BTreeMap keys by Config::strengths and UiState::availability.
         let all: Vec<EngineType> = EngineType::all().collect();
         let mut sorted = all.clone();
         sorted.sort();
@@ -499,6 +601,65 @@ mod tests {
         assert_eq!(
             names,
             vec!["RNNoise", "DeepFilterNet", "DPDFNet-2", "DPDFNet-8", "Khip"]
+        );
+    }
+
+    // ── EngineAvailability / all_engine_availability (Task 2) ───────────────
+
+    #[test]
+    fn all_engine_availability_covers_every_engine_exactly_once() {
+        let map = all_engine_availability();
+        assert_eq!(map.len(), 5);
+        for engine in EngineType::all() {
+            assert!(map.contains_key(&engine), "{engine:?} missing from map");
+        }
+    }
+
+    #[test]
+    fn is_engine_available_matches_engine_availability_bool() {
+        for engine in EngineType::all() {
+            assert_eq!(
+                is_engine_available(engine),
+                engine_availability(engine).available
+            );
+        }
+    }
+
+    /// D-02: each DPDFNet variant gets its own independently-computed
+    /// `EngineAvailability` entry in the shared map — never derived from,
+    /// aliased to, or defaulted from the other variant's result.
+    #[test]
+    fn dpdfnet_variants_have_independent_availability_entries() {
+        let map = all_engine_availability();
+        let dpdfnet2 = map.get(&EngineType::Dpdfnet2).expect("Dpdfnet2 entry");
+        let dpdfnet8 = map.get(&EngineType::Dpdfnet8).expect("Dpdfnet8 entry");
+        // Both independently equal what a direct, single-engine call
+        // computes — i.e. the map is not a shared/aliased fallback value.
+        assert_eq!(*dpdfnet2, engine_availability(EngineType::Dpdfnet2));
+        assert_eq!(*dpdfnet8, engine_availability(EngineType::Dpdfnet8));
+    }
+
+    // ── fallback_notice (D-11) ───────────────────────────────────────────────
+
+    #[test]
+    fn fallback_notice_is_none_when_requested_equals_active() {
+        assert_eq!(
+            fallback_notice(EngineType::DeepFilterNet, EngineType::DeepFilterNet),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_notice_is_some_and_names_active_engine_when_they_differ() {
+        let notice =
+            fallback_notice(EngineType::Dpdfnet2, EngineType::DeepFilterNet).expect("some notice");
+        assert!(
+            notice.contains("DeepFilterNet"),
+            "notice must truthfully name the ACTIVE engine, got: {notice}"
+        );
+        assert!(
+            !notice.contains("DPDFNet-2"),
+            "notice must never claim the requested (failed) engine, got: {notice}"
         );
     }
 }

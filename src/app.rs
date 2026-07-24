@@ -863,13 +863,24 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
     // Set the engine from config using the full fallback chain (D-02).
     let engine_type = config.engine;
     let (mut eng, actual_type) = engine::create_engine_with_fallback(engine_type);
-    if actual_type != engine_type {
+    // Truthful requested-vs-active divergence for this startup (D-11,
+    // T-15.1-07) — e.g. a config that was migrated to DPDFNet-2 but whose
+    // model/runtime failed to initialize this session. `None` means no
+    // fallback occurred (the common case). Threaded into `run_with_gui` so
+    // the very first `UiState` never claims `engine_type` is active when
+    // `actual_type` is what's really running.
+    let startup_engine_fallback = if actual_type != engine_type {
+        Some((engine_type, actual_type))
+    } else {
+        None
+    };
+    if let Some((requested, actual)) = startup_engine_fallback {
         log::warn!(
             "{:?} engine unavailable — fell back to {:?}",
-            engine_type,
-            actual_type
+            requested,
+            actual
         );
-        config.engine = actual_type;
+        config.engine = actual;
     }
     // Apply the persisted strength and mode before handing the engine to
     // the audio thread. Otherwise the engine runs at its constructor
@@ -957,15 +968,18 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
             first_run,
             startup_no_input,
             launched_via_autostart,
+            startup_engine_fallback,
         )?;
     }
 
     #[cfg(not(feature = "gui"))]
     {
-        // `launched_via_autostart` is irrelevant in headless mode (no window
-        // to hide), so we accept-and-discard it via `let _ = ...` rather
-        // than threading it through the headless path.
+        // `launched_via_autostart` and `startup_engine_fallback` are
+        // irrelevant in headless mode (no window/UiState to hide or
+        // populate), so we accept-and-discard them via `let _ = ...` rather
+        // than threading them through the headless path.
         let _ = launched_via_autostart;
+        let _ = startup_engine_fallback;
         run_headless(config, pipeline, pw_manager)?;
     }
 
@@ -1029,6 +1043,14 @@ fn run_headless(
 /// `launched_via_autostart` propagates the CLI flag from `main.rs` so the
 /// GTK activate closure can apply the hide-if-tray policy (see
 /// [`should_hide_main_window_on_autostart`]).
+///
+/// `startup_engine_fallback` carries `Some((requested, actual))` when the
+/// engine `run()` resolved from `config.engine` at startup required a
+/// fallback substitution (D-11, T-15.1-07) — e.g. a migrated DPDFNet-2
+/// selection whose model/runtime failed to initialize this session. `None`
+/// is the common case (no fallback). Threaded through so the very first
+/// `UiState` reports the truthful active engine and a non-empty fallback
+/// notice rather than silently claiming `requested` is active.
 #[cfg(feature = "gui")]
 fn run_with_gui(
     mut config: Config,
@@ -1037,6 +1059,7 @@ fn run_with_gui(
     first_run: bool,
     startup_no_input: bool,
     launched_via_autostart: bool,
+    startup_engine_fallback: Option<(EngineType, EngineType)>,
 ) -> Result<()> {
     use gtk4::glib;
     use gtk4::prelude::*;
@@ -1235,6 +1258,19 @@ fn run_with_gui(
                 .collect();
             initial_state.khip_available =
                 engine::is_engine_available(EngineType::Khip);
+            // Independent five-engine availability/reason map (T-15.1-07/
+            // T-15.1-08), superseding the Khip-only special case above for
+            // any future consumer.
+            initial_state.availability = engine::all_engine_availability();
+            // Truthful requested-vs-active engine state (D-11): if a
+            // fallback occurred during this session's startup, surface both
+            // the original request and a translated notice rather than
+            // silently reporting the corrected `config.engine` as if it had
+            // been requested all along.
+            if let Some((requested, actual)) = startup_engine_fallback {
+                initial_state.requested_engine = requested;
+                initial_state.fallback_notice = engine::fallback_notice(requested, actual);
+            }
         }
 
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
@@ -2398,6 +2434,95 @@ mod tests {
             &current_capture_target_test,
         );
         assert_eq!(config.engine, EngineType::RNNoise);
+
+        drop(pipeline);
+    }
+
+    /// D-13: `StrengthChanged` stores the value under the CURRENTLY ACTIVE
+    /// engine, and a subsequent `EngineChanged` restores each engine's own
+    /// remembered strength rather than sharing one global value.
+    ///
+    /// Only exercises a genuine RNNoise <-> DeepFilterNet switch when
+    /// DeepFilterNet's bundled `libdeep_filter_ladspa.so` is actually
+    /// resolvable on this system — mirrors the existing skip pattern in
+    /// `create_engine_deepfilter_fails_when_unavailable` (this repo's own
+    /// precedent for dev/CI sandboxes that lack the bundled runtime lib).
+    /// Without that skip, `create_engine_with_fallback(DeepFilterNet)` would
+    /// silently fall through to RNNoise in such an environment, making the
+    /// "two DIFFERENT engines" premise of this test meaningless rather than
+    /// false — RNNoise's own per-engine remembered strength is still
+    /// asserted unconditionally below.
+    #[test]
+    fn handle_ui_event_strength_is_remembered_per_engine() {
+        let pipeline = AudioPipeline::new().unwrap();
+        let mut config = Config::default();
+        let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
+
+        // Start on RNNoise, set a distinctive strength. RNNoise (nnnoiseless,
+        // pure Rust) always succeeds under the `rnnoise` feature — no
+        // external runtime/model dependency — so this half is unconditional.
+        handle_ui_event(
+            UiEvent::EngineChanged(EngineType::RNNoise),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
+        handle_ui_event(
+            UiEvent::StrengthChanged(0.2),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
+        assert!((config.strength_for(EngineType::RNNoise) - 0.2).abs() < f32::EPSILON);
+
+        #[cfg(feature = "deepfilter")]
+        let deepfilter_actually_available = crate::engine::deepfilter::is_available();
+        #[cfg(not(feature = "deepfilter"))]
+        let deepfilter_actually_available = false;
+
+        if deepfilter_actually_available {
+            // Switch to DeepFilterNet and give it a DIFFERENT strength —
+            // must not disturb RNNoise's remembered value.
+            handle_ui_event(
+                UiEvent::EngineChanged(EngineType::DeepFilterNet),
+                &pipeline,
+                &mut config,
+                &mut pw,
+                &last_explicit_test,
+                &current_capture_target_test,
+            );
+            handle_ui_event(
+                UiEvent::StrengthChanged(0.9),
+                &pipeline,
+                &mut config,
+                &mut pw,
+                &last_explicit_test,
+                &current_capture_target_test,
+            );
+            assert!((config.strength_for(EngineType::DeepFilterNet) - 0.9).abs() < f32::EPSILON);
+            assert!(
+                (config.strength_for(EngineType::RNNoise) - 0.2).abs() < f32::EPSILON,
+                "switching engines must not disturb the previous engine's remembered strength"
+            );
+
+            // Switching back to RNNoise must restore ITS remembered value,
+            // not DeepFilterNet's.
+            handle_ui_event(
+                UiEvent::EngineChanged(EngineType::RNNoise),
+                &pipeline,
+                &mut config,
+                &mut pw,
+                &last_explicit_test,
+                &current_capture_target_test,
+            );
+        }
+        assert!((config.strength_for(EngineType::RNNoise) - 0.2).abs() < f32::EPSILON);
 
         drop(pipeline);
     }
