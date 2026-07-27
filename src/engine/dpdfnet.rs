@@ -381,6 +381,13 @@ pub struct DpdfnetEngine {
     /// Current normalized strength (0.0..=1.0), remembered so `init()` can
     /// re-apply it after (re)initialization.
     strength: f32,
+    /// Current processing mode (CPU/quality trade-off, D-03). Controls how
+    /// often [`Self::process`] runs the (expensive) ONNX inference step.
+    mode: ProcessingMode,
+    /// Hops processed since the mode was last set (or since construction).
+    /// Wraps naturally via `%` in [`Self::decimation_ratio`]'s modulo check;
+    /// overflow is harmless (only the remainder matters).
+    hop_counter: u32,
 }
 
 impl DpdfnetEngine {
@@ -403,6 +410,8 @@ impl DpdfnetEngine {
             spec_e: [0f32; SPEC_LEN],
             out_hop: [0f32; HOP],
             strength: 0.5,
+            mode: ProcessingMode::Balanced,
+            hop_counter: 0,
         }
     }
 
@@ -435,6 +444,21 @@ impl DpdfnetEngine {
             light + (balanced - light) * (s / 0.5)
         } else {
             balanced + (strong - balanced) * ((s - 0.5) / 0.5)
+        }
+    }
+
+    /// Map a [`ProcessingMode`] to the inference decimation ratio: ONNX
+    /// inference runs once every `decimation_ratio(mode)` hops, holding the
+    /// prior `spec_e` on the hops in between (D-03). `MaxQuality` == 1 means
+    /// every hop (today's unconditional behavior); `Balanced` == 2;
+    /// `LowCpu` == 4. **Provisional** starting values — confirmed/adjusted by
+    /// owner ear + the CPU-time sweep harness in 15.2-04, same discretionary
+    /// status as `strength_to_attn_db`'s anchors.
+    fn decimation_ratio(mode: ProcessingMode) -> u32 {
+        match mode {
+            ProcessingMode::MaxQuality => 1,
+            ProcessingMode::Balanced => 2,
+            ProcessingMode::LowCpu => 4,
         }
     }
 }
@@ -583,69 +607,79 @@ impl NoiseEngine for DpdfnetEngine {
         analysis.push_hop(&in_hop, &mut self.spec);
         let noisy_spec = self.spec;
 
-        let run_result: Result<()> = (|| {
-            let session = self
-                .session
-                .as_mut()
-                .ok_or_else(|| anyhow!("DPDFNet session not initialized"))?;
-            let spec_t = TensorRef::from_array_view(([1usize, 1, FREQ_BINS, 2], &self.spec[..]))
-                .context("failed to build spec tensor")?;
-            let state_t = TensorRef::from_array_view(([self.state.len()], &self.state[..]))
-                .context("failed to build state_in tensor")?;
-            let outputs = session
-                .run(ort::inputs! { "spec" => spec_t, "state_in" => state_t })
-                .context("Session::run failed")?;
+        // D-03 decimation gate: on a held hop, skip inference AND the
+        // recurrent state swap entirely — self.spec_e already holds the
+        // prior run's value, and self.state/self.state_out must stay
+        // byte-identical so the ONNX recurrent state never desyncs
+        // (RESEARCH.md Pitfall 1). This `if` wraps the WHOLE atomic
+        // inference+swap unit; never gate only `Session::run`.
+        if self.hop_counter % Self::decimation_ratio(self.mode) == 0 {
+            let run_result: Result<()> = (|| {
+                let session = self
+                    .session
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("DPDFNet session not initialized"))?;
+                let spec_t =
+                    TensorRef::from_array_view(([1usize, 1, FREQ_BINS, 2], &self.spec[..]))
+                        .context("failed to build spec tensor")?;
+                let state_t = TensorRef::from_array_view(([self.state.len()], &self.state[..]))
+                    .context("failed to build state_in tensor")?;
+                let outputs = session
+                    .run(ort::inputs! { "spec" => spec_t, "state_in" => state_t })
+                    .context("Session::run failed")?;
 
-            let (_, spec_e_out) = outputs
-                .get("spec_e")
-                .ok_or_else(|| anyhow!("model has no output named 'spec_e'"))?
-                .try_extract_tensor::<f32>()
-                .context("failed to extract spec_e output")?;
-            anyhow::ensure!(
-                spec_e_out.len() == SPEC_LEN,
-                "model output 'spec_e' has {} elements, expected {}",
-                spec_e_out.len(),
-                SPEC_LEN
-            );
-            anyhow::ensure!(
-                spec_e_out.iter().all(|v| v.is_finite()),
-                "model output 'spec_e' contains non-finite values"
-            );
-
-            let (_, state_out_slice) = outputs
-                .get("state_out")
-                .ok_or_else(|| anyhow!("model has no output named 'state_out'"))?
-                .try_extract_tensor::<f32>()
-                .context("failed to extract state_out output")?;
-            anyhow::ensure!(
-                state_out_slice.len() == self.state.len(),
-                "model output 'state_out' has {} elements, expected {}",
-                state_out_slice.len(),
-                self.state.len()
-            );
-            anyhow::ensure!(
-                state_out_slice.iter().all(|v| v.is_finite()),
-                "model output 'state_out' contains non-finite values"
-            );
-
-            self.spec_e.copy_from_slice(spec_e_out);
-            self.state_out.clear();
-            self.state_out.extend_from_slice(state_out_slice);
-            Ok(())
-        })();
-
-        match run_result {
-            Ok(()) => {
-                std::mem::swap(&mut self.state, &mut self.state_out);
-            }
-            Err(e) => {
-                log::warn!(
-                    "DPDFNet ({:?}): inference failed, degrading to a muted frame (prior state kept): {e}",
-                    self.variant
+                let (_, spec_e_out) = outputs
+                    .get("spec_e")
+                    .ok_or_else(|| anyhow!("model has no output named 'spec_e'"))?
+                    .try_extract_tensor::<f32>()
+                    .context("failed to extract spec_e output")?;
+                anyhow::ensure!(
+                    spec_e_out.len() == SPEC_LEN,
+                    "model output 'spec_e' has {} elements, expected {}",
+                    spec_e_out.len(),
+                    SPEC_LEN
                 );
-                self.spec_e = [0f32; SPEC_LEN];
+                anyhow::ensure!(
+                    spec_e_out.iter().all(|v| v.is_finite()),
+                    "model output 'spec_e' contains non-finite values"
+                );
+
+                let (_, state_out_slice) = outputs
+                    .get("state_out")
+                    .ok_or_else(|| anyhow!("model has no output named 'state_out'"))?
+                    .try_extract_tensor::<f32>()
+                    .context("failed to extract state_out output")?;
+                anyhow::ensure!(
+                    state_out_slice.len() == self.state.len(),
+                    "model output 'state_out' has {} elements, expected {}",
+                    state_out_slice.len(),
+                    self.state.len()
+                );
+                anyhow::ensure!(
+                    state_out_slice.iter().all(|v| v.is_finite()),
+                    "model output 'state_out' contains non-finite values"
+                );
+
+                self.spec_e.copy_from_slice(spec_e_out);
+                self.state_out.clear();
+                self.state_out.extend_from_slice(state_out_slice);
+                Ok(())
+            })();
+
+            match run_result {
+                Ok(()) => {
+                    std::mem::swap(&mut self.state, &mut self.state_out);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "DPDFNet ({:?}): inference failed, degrading to a muted frame (prior state kept): {e}",
+                        self.variant
+                    );
+                    self.spec_e = [0f32; SPEC_LEN];
+                }
             }
         }
+        self.hop_counter = self.hop_counter.wrapping_add(1);
 
         self.attn.apply(&noisy_spec, &mut self.spec_e);
         synthesis.add_frame(&self.spec_e, &mut self.out_hop);
@@ -676,8 +710,15 @@ impl NoiseEngine for DpdfnetEngine {
         );
     }
 
-    fn set_mode(&mut self, _mode: ProcessingMode) {
-        // No distinct quality/CPU trade-off knob for DPDFNet in this phase.
+    fn set_mode(&mut self, mode: ProcessingMode) {
+        self.mode = mode;
+        self.hop_counter = 0;
+        log::debug!(
+            "DPDFNet ({:?}): mode set to {:?} -> inference decimation ratio {}",
+            self.variant,
+            mode,
+            Self::decimation_ratio(mode)
+        );
     }
 
     fn latency_frames(&self) -> u32 {
@@ -859,5 +900,115 @@ mod tests {
         // is false; with a real pinned .so exported it is true. Both are
         // valid outcomes in different environments -- just confirm no panic.
         let _ = is_dylib_available();
+    }
+
+    // ── Decimation gate (D-03) ────────────────────────────────────────────
+
+    #[test]
+    fn decimation_ratio_values_match_d03_starting_points() {
+        assert_eq!(
+            DpdfnetEngine::decimation_ratio(ProcessingMode::MaxQuality),
+            1
+        );
+        assert_eq!(DpdfnetEngine::decimation_ratio(ProcessingMode::Balanced), 2);
+        assert_eq!(DpdfnetEngine::decimation_ratio(ProcessingMode::LowCpu), 4);
+    }
+
+    #[test]
+    fn decimation_gate_runs_exactly_ceil_n_over_ratio_times() {
+        // Mirrors the exact gating condition used in `process()`
+        // (`hop_counter % decimation_ratio(mode) == 0`) without needing a
+        // live model -- proves the counting math itself over N hops.
+        const N: u32 = 17;
+        for mode in [
+            ProcessingMode::MaxQuality,
+            ProcessingMode::Balanced,
+            ProcessingMode::LowCpu,
+        ] {
+            let ratio = DpdfnetEngine::decimation_ratio(mode);
+            let mut hop_counter: u32 = 0;
+            let mut inference_runs: u32 = 0;
+            for _ in 0..N {
+                if hop_counter % ratio == 0 {
+                    inference_runs += 1;
+                }
+                hop_counter = hop_counter.wrapping_add(1);
+            }
+            let expected = N.div_ceil(ratio);
+            assert_eq!(
+                inference_runs, expected,
+                "mode {mode:?}: expected {expected} inference runs over {N} hops, got {inference_runs}"
+            );
+        }
+    }
+
+    /// Resolve the vendor-staged reference model/runtime paths this repo
+    /// checks in for local dev/CI (mirrors `tests/dpdfnet_production.rs`'s
+    /// `build_engine` convention: honest skip if unavailable, never fabricate
+    /// a result).
+    fn build_test_engine(variant: DpdfnetVariant) -> Option<DpdfnetEngine> {
+        let name = match variant {
+            DpdfnetVariant::Dpdfnet2 => "dpdfnet2",
+            DpdfnetVariant::Dpdfnet8 => "dpdfnet8",
+        };
+        let model = std::env::var(format!("{}_MODEL_PATH", name.to_uppercase()))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(format!("vendor/dpdfnet-reference/models/{name}_48khz_hr.onnx"))
+            });
+        let dylib = std::env::var("ORT_DYLIB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("vendor/dpdfnet-reference/lib/libonnxruntime.so"));
+        if !model.is_file() || !dylib.is_file() {
+            return None;
+        }
+        if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+            // SAFETY: test-only; every caller in this module sets the
+            // identical value, and this crate's dpdfnet tests always run
+            // with `--test-threads=1`.
+            unsafe {
+                std::env::set_var("ORT_DYLIB_PATH", &dylib);
+            }
+        }
+        let mut engine = DpdfnetEngine::new(variant, model);
+        engine.init(48_000).ok()?;
+        Some(engine)
+    }
+
+    #[test]
+    fn decimation_holds_recurrent_state_on_skipped_hops() {
+        let Some(mut engine) = build_test_engine(DpdfnetVariant::Dpdfnet2) else {
+            eprintln!(
+                "[dpdfnet decimation] SKIP: pinned model/runtime unavailable in this environment"
+            );
+            return;
+        };
+
+        // LowCpu -> decimation_ratio == 4; set_mode resets hop_counter to 0.
+        engine.set_mode(ProcessingMode::LowCpu);
+
+        let input = [0.02f32; HOP];
+        let mut output = [0f32; HOP];
+
+        // Hop 0: hop_counter == 0 -> 0 % 4 == 0 -> runs inference.
+        engine.process(&input, &mut output);
+        let state_after_inference = engine.state.clone();
+
+        // Hops 1..=3: hop_counter in {1,2,3} -> all held (not divisible by
+        // 4). self.state must stay BYTE-IDENTICAL across every held hop --
+        // this is the single highest-risk correctness bug this phase guards
+        // against (RESEARCH.md Pitfall 1): gating only Session::run while
+        // leaving the state/state_out swap unconditional would silently
+        // desync the recurrent state even though this assertion would still
+        // (wrongly) look fine if the swap were skipped along with the run.
+        for hop in 1..=3u32 {
+            engine.process(&input, &mut output);
+            assert_eq!(
+                engine.state, state_after_inference,
+                "self.state must be byte-identical across held hop {hop} (D-03, RESEARCH Pitfall 1)"
+            );
+        }
+
+        engine.teardown();
     }
 }

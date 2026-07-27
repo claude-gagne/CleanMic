@@ -41,6 +41,9 @@ pub enum UiEvent {
     /// The user moved the strength slider to a new normalized value (0.0..=1.0).
     StrengthChanged(f32),
 
+    /// The user selected a different processing mode (CPU/quality trade-off). Per D-03/D-04.
+    ModeChanged(ProcessingMode),
+
     /// The user selected a different input device (PipeWire node name).
     DeviceChanged(String),
 
@@ -361,6 +364,16 @@ mod tests {
     fn ui_event_strength_changed() {
         let e = UiEvent::StrengthChanged(0.75);
         assert_eq!(e, UiEvent::StrengthChanged(0.75));
+    }
+
+    #[test]
+    fn ui_event_mode_changed() {
+        let e = UiEvent::ModeChanged(ProcessingMode::LowCpu);
+        assert_eq!(e, UiEvent::ModeChanged(ProcessingMode::LowCpu));
+        assert_ne!(
+            UiEvent::ModeChanged(ProcessingMode::LowCpu),
+            UiEvent::ModeChanged(ProcessingMode::MaxQuality)
+        );
     }
 
     #[test]

@@ -93,6 +93,24 @@ msgstr "Équilibrée"
 msgid "Strong"
 msgstr "Forte"
 
+# ── Mode picker (D-03/D-04) ───────────────────────────────────────────────────
+# Distinct control from Strength/Intensité above: Mode is the CPU/quality
+# trade-off, Strength is suppression aggressiveness. "Standard" (not
+# "Balanced") is used for the middle entry so this plain gettext msgid never
+# collides with Strength's own "Balanced" msgid above, which would otherwise
+# force an identical French translation for two different concepts.
+msgid "Mode"
+msgstr "Mode"
+
+msgid "Low CPU"
+msgstr "Faible consommation"
+
+msgid "Standard"
+msgstr "Standard"
+
+msgid "Max Quality"
+msgstr "Qualité maximale"
+
 # ── Levels group ──────────────────────────────────────────────────────────────
 msgid "Levels"
 msgstr "Niveaux"

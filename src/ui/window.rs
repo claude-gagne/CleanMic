@@ -69,6 +69,10 @@ pub struct WindowHandles {
     pub engine_selector: EngineSelector,
     /// The 3-step strength picker (Light / Balanced / Strong) — same for all engines.
     pub strength_row: ComboRow,
+    /// The processing mode picker (Low CPU / Balanced / Max Quality) — only
+    /// takes effect on the DPDFNet engines (D-03/D-04); distinct from
+    /// `strength_row`'s suppression-aggressiveness knob.
+    pub mode_row: ComboRow,
     /// The monitor toggle switch — updated on monitor state changes.
     pub monitor_row: SwitchRow,
     /// The header bar window title widget (title + subtitle).
@@ -93,13 +97,19 @@ pub struct WindowHandles {
     /// `UiEvent::StrengthChanged` for a value the user never picked — mirrors
     /// the existing `device_updating` guard pattern.
     pub strength_updating: Rc<Cell<bool>>,
+    /// Flag set while a programmatic mode sync (full state sync in
+    /// [`update_from_state`](WindowHandles::update_from_state)) is restoring
+    /// `mode_row`. Without this guard, `ComboRow::set_selected` fires
+    /// `notify::selected` unconditionally, re-emitting a spurious
+    /// `UiEvent::ModeChanged` — mirrors `strength_updating`.
+    pub mode_updating: Rc<Cell<bool>>,
 }
 
 // Type alias for the SwitchRow closure parameter.
 type SwitchRowRef = SwitchRow;
 
 use crate::config::Config;
-use crate::engine::{AvailabilityReason, EngineAvailability, EngineType};
+use crate::engine::{AvailabilityReason, EngineAvailability, EngineType, ProcessingMode};
 use crate::tr;
 use crate::ui::{DeviceInfo, UiEvent, UiState};
 
@@ -552,8 +562,18 @@ pub fn build_main_window(
     strength_group.set_title(&tr!("Strength"));
     strength_group.add(&strength_row);
 
+    // Mode picker — a distinct CPU/quality trade-off lever from Strength's
+    // suppression-aggressiveness knob (D-04). Its own group, same pattern as
+    // Strength.
+    let mode_updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let mode_row = build_mode_row(state, event_tx.clone(), mode_updating.clone());
+    let mode_group = PreferencesGroup::new();
+    mode_group.set_title(&tr!("Mode"));
+    mode_group.add(&mode_row);
+
     page.add(&engine_selector.group);
     page.add(&strength_group);
+    page.add(&mode_group);
 
     // ── Level meters group ────────────────────────────────────────────────────
     let levels_group = PreferencesGroup::new();
@@ -650,12 +670,14 @@ pub fn build_main_window(
         enable_row,
         engine_selector,
         strength_row,
+        mode_row,
         monitor_row,
         win_title,
         device_row,
         device_updating,
         update_banner,
         strength_updating,
+        mode_updating,
     }
 }
 
@@ -957,6 +979,63 @@ fn build_strength_row(
     row
 }
 
+// ── Mode level helpers (CPU/quality trade-off, D-03/D-04) ────────────────────
+
+/// Map a [`ProcessingMode`] to its `ComboRow` level index (0=Low CPU,
+/// 1=Balanced, 2=Max Quality).
+fn mode_to_level_index(mode: ProcessingMode) -> u32 {
+    match mode {
+        ProcessingMode::LowCpu => 0,
+        ProcessingMode::Balanced => 1,
+        ProcessingMode::MaxQuality => 2,
+    }
+}
+
+/// Map a `ComboRow` level index back to a [`ProcessingMode`].
+fn level_index_to_mode(index: u32) -> ProcessingMode {
+    match index {
+        0 => ProcessingMode::LowCpu,
+        2 => ProcessingMode::MaxQuality,
+        _ => ProcessingMode::Balanced,
+    }
+}
+
+/// Build the 3-step Mode `ComboRow` (Low CPU / Balanced / Max Quality).
+///
+/// Distinct from `build_strength_row` (D-04): Mode is a CPU/quality
+/// trade-off, Strength is suppression aggressiveness. Entries deliberately do
+/// NOT reuse Strength's Light/Balanced/Strong vocabulary — "Standard" (not
+/// "Balanced") is used for the middle entry so the plain (non-contextual)
+/// `tr!()`/gettext msgid never collides with Strength's own "Balanced"
+/// msgid, which would otherwise force an identical French translation for
+/// two different concepts. `updating` guards programmatic restoration
+/// exactly like `build_strength_row`'s `updating` parameter — without it,
+/// `ComboRow::set_selected` would re-emit a spurious `UiEvent::ModeChanged`
+/// on every programmatic sync.
+fn build_mode_row(state: &UiState, event_tx: mpsc::Sender<UiEvent>, updating: Rc<Cell<bool>>) -> ComboRow {
+    let row = ComboRow::new();
+    row.set_title(&tr!("Mode"));
+
+    let model = gtk4::StringList::new(&[]);
+    model.append(&tr!("Low CPU"));
+    model.append(&tr!("Standard"));
+    model.append(&tr!("Max Quality"));
+    row.set_model(Some(&model));
+    row.set_selected(mode_to_level_index(state.mode));
+
+    row.connect_selected_notify(move |r| {
+        if updating.get() {
+            return;
+        }
+        let val = level_index_to_mode(r.selected());
+        if event_tx.send(UiEvent::ModeChanged(val)).is_err() {
+            log::warn!("UI event channel closed - ModeChanged dropped");
+        }
+    });
+
+    row
+}
+
 // ── UI state synchronization ─────────────────────────────────────────────────
 
 impl WindowHandles {
@@ -980,6 +1059,15 @@ impl WindowHandles {
             self.strength_updating.set(true);
             self.strength_row.set_selected(level_idx);
             self.strength_updating.set(false);
+        }
+
+        // Mode (CPU/quality trade-off). Guarded (D-03/D-04) so this
+        // programmatic sync cannot re-emit UiEvent::ModeChanged.
+        let mode_idx = mode_to_level_index(state.mode);
+        if self.mode_row.selected() != mode_idx {
+            self.mode_updating.set(true);
+            self.mode_row.set_selected(mode_idx);
+            self.mode_updating.set(false);
         }
 
         // Enable/disable switch
@@ -1305,5 +1393,34 @@ mod tests {
         assert_eq!(strength_to_level_index(0.66), 1);
         assert_eq!(strength_to_level_index(0.67), 2);
         assert_eq!(strength_to_level_index(1.0), 2);
+    }
+
+    // ── mode_to_level_index / level_index_to_mode — D-03/D-04 ───────────────
+
+    #[test]
+    fn mode_to_level_index_round_trips() {
+        assert_eq!(mode_to_level_index(ProcessingMode::LowCpu), 0);
+        assert_eq!(mode_to_level_index(ProcessingMode::Balanced), 1);
+        assert_eq!(mode_to_level_index(ProcessingMode::MaxQuality), 2);
+
+        assert_eq!(level_index_to_mode(0), ProcessingMode::LowCpu);
+        assert_eq!(level_index_to_mode(1), ProcessingMode::Balanced);
+        assert_eq!(level_index_to_mode(2), ProcessingMode::MaxQuality);
+    }
+
+    #[test]
+    fn mode_entries_do_not_reuse_strength_vocabulary() {
+        // D-04: Mode must not reuse Strength's Light/Balanced/Strong labels —
+        // not even "Balanced", since the plain (non-contextual) tr!()/gettext
+        // msgid would otherwise force an identical French translation for
+        // two different concepts.
+        let strength_entries = ["Light", "Balanced", "Strong"]; // i18n-ignore
+        let mode_entries = ["Low CPU", "Standard", "Max Quality"]; // i18n-ignore
+        for entry in mode_entries {
+            assert!(
+                !strength_entries.contains(&entry),
+                "Mode entry {entry:?} must not reuse a Strength vocabulary word" // i18n-ignore
+            );
+        }
     }
 }

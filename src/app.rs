@@ -509,6 +509,13 @@ fn handle_ui_event(
             config.set_strength_for(config.engine, strength);
             log::info!("Strength changed to {:.2}", strength);
         }
+        UiEvent::ModeChanged(mode) => {
+            // Unlike `strengths` (per-engine BTreeMap), `Config.mode` is a
+            // single top-level field — no per-engine lookup needed.
+            pipeline.set_mode(mode);
+            config.mode = mode;
+            log::info!("Mode changed to {:?}", mode);
+        }
         UiEvent::DeviceChanged(device) => {
             pipeline.set_input_device(device.clone());
             match pw_manager.set_capture_target(Some(device.clone())) {
@@ -1649,7 +1656,10 @@ fn run_with_gui(
                 let is_quit = matches!(event, UiEvent::Quit);
                 let needs_debounce = matches!(
                     event,
-                    UiEvent::EngineChanged(_) | UiEvent::StrengthChanged(_) | UiEvent::DeviceChanged(_)
+                    UiEvent::EngineChanged(_)
+                        | UiEvent::StrengthChanged(_)
+                        | UiEvent::ModeChanged(_)
+                        | UiEvent::DeviceChanged(_)
                 );
                 let needs_immediate_save = matches!(
                     event,
@@ -2561,6 +2571,31 @@ mod tests {
             &current_capture_target_test,
         );
         assert!(config.enabled);
+
+        drop(pipeline);
+    }
+
+    /// handle_ui_event dispatches ModeChanged correctly — Config.mode is a
+    /// single top-level field (no per-engine map, unlike strengths).
+    #[test]
+    fn handle_ui_event_mode_changed() {
+        let pipeline = AudioPipeline::new().unwrap();
+        let mut config = Config::default();
+        let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
+
+        assert_eq!(config.mode, crate::engine::ProcessingMode::Balanced);
+
+        handle_ui_event(
+            UiEvent::ModeChanged(crate::engine::ProcessingMode::LowCpu),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
+        assert_eq!(config.mode, crate::engine::ProcessingMode::LowCpu);
 
         drop(pipeline);
     }
