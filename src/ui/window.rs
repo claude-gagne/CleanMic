@@ -1031,7 +1031,11 @@ fn mode_row_subtitle() -> String {
     tr!("Only affects the DPDFNet engines")
 }
 
-fn build_mode_row(state: &UiState, event_tx: mpsc::Sender<UiEvent>, updating: Rc<Cell<bool>>) -> ComboRow {
+fn build_mode_row(
+    state: &UiState,
+    event_tx: mpsc::Sender<UiEvent>,
+    updating: Rc<Cell<bool>>,
+) -> ComboRow {
     let row = ComboRow::new();
     row.set_title(&tr!("Mode"));
     row.set_subtitle(&mode_row_subtitle());

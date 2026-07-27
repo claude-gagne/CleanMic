@@ -613,7 +613,10 @@ impl NoiseEngine for DpdfnetEngine {
         // byte-identical so the ONNX recurrent state never desyncs
         // (RESEARCH.md Pitfall 1). This `if` wraps the WHOLE atomic
         // inference+swap unit; never gate only `Session::run`.
-        if self.hop_counter % Self::decimation_ratio(self.mode) == 0 {
+        if self
+            .hop_counter
+            .is_multiple_of(Self::decimation_ratio(self.mode))
+        {
             let run_result: Result<()> = (|| {
                 let session = self
                     .session
@@ -929,7 +932,7 @@ mod tests {
             let mut hop_counter: u32 = 0;
             let mut inference_runs: u32 = 0;
             for _ in 0..N {
-                if hop_counter % ratio == 0 {
+                if hop_counter.is_multiple_of(ratio) {
                     inference_runs += 1;
                 }
                 hop_counter = hop_counter.wrapping_add(1);
@@ -954,7 +957,9 @@ mod tests {
         let model = std::env::var(format!("{}_MODEL_PATH", name.to_uppercase()))
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                PathBuf::from(format!("vendor/dpdfnet-reference/models/{name}_48khz_hr.onnx"))
+                PathBuf::from(format!(
+                    "vendor/dpdfnet-reference/models/{name}_48khz_hr.onnx"
+                ))
             });
         let dylib = std::env::var("ORT_DYLIB_PATH")
             .map(PathBuf::from)
