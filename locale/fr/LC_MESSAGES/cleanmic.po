@@ -260,6 +260,17 @@ msgstr "DPDFNet, utilisation processeur plus faible"
 msgid "DPDFNet, higher processor use"
 msgstr "DPDFNet, utilisation processeur plus élevée"
 
+# Phase 15.2 Plan 02: DPDFNet-8 static weak-CPU caveat (D-02) — appended after
+# the subtitle above. Gentle, static note only: never a measured hardware
+# verdict, never an auto-switch — just points at the manual Low CPU Mode
+# remedy (D-03/D-04).
+msgid "May glitch on a slower processor — try Low CPU Mode"
+msgstr "Peut saccader sur un processeur plus lent — essayez le mode Faible consommation"
+
+# Phase 15.2 Plan 02: Mode row subtitle — D-04 engine-scope hint (window).
+msgid "Only affects the DPDFNet engines"
+msgstr "Affecte uniquement les moteurs DPDFNet"
+
 # Phase 15.1 Plan 06: Generic unavailable-row title suffix (window + tray),
 # e.g. "DPDFNet-2 (unavailable)". Never used for Khip, which keeps its own
 # more actionable "Khip (not installed)" copy above.

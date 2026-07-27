@@ -142,7 +142,14 @@ fn engine_subtitle(engine: EngineType) -> String {
         EngineType::RNNoise => tr!("Lightweight, low CPU"),
         EngineType::DeepFilterNet => tr!("High quality (default)"),
         EngineType::Dpdfnet2 => tr!("DPDFNet, lower processor use"),
-        EngineType::Dpdfnet8 => tr!("DPDFNet, higher processor use"),
+        // Per D-02: a static, gentle caveat only — never a measured
+        // hardware verdict, never an auto-switch, just a pointer to the
+        // manual remedy (the Low CPU Mode, D-03/D-04).
+        EngineType::Dpdfnet8 => format!(
+            "{} {}",
+            tr!("DPDFNet, higher processor use"),
+            tr!("May glitch on a slower processor — try Low CPU Mode")
+        ),
         EngineType::Khip => tr!("User-supplied, adaptive"),
     }
 }
@@ -1012,9 +1019,22 @@ fn level_index_to_mode(index: u32) -> ProcessingMode {
 /// exactly like `build_strength_row`'s `updating` parameter — without it,
 /// `ComboRow::set_selected` would re-emit a spurious `UiEvent::ModeChanged`
 /// on every programmatic sync.
+/// Engine-scope hint for the Mode row's subtitle: only `DpdfnetEngine`'s
+/// `process()` actually decimates inference on Mode (D-03);
+/// RNNoise/DeepFilterNet/Khip/the experimental adapter all keep `set_mode`
+/// as a behavioral no-op (RNNoise stores the value but every branch is
+/// documented as "no-op for now"). Extracted as a pure function so the
+/// wording is unit-testable without constructing a GTK widget (this test
+/// binary's single allowed `gtk4::init()` call is already spent — see the
+/// `Tests` section header comment below).
+fn mode_row_subtitle() -> String {
+    tr!("Only affects the DPDFNet engines")
+}
+
 fn build_mode_row(state: &UiState, event_tx: mpsc::Sender<UiEvent>, updating: Rc<Cell<bool>>) -> ComboRow {
     let row = ComboRow::new();
     row.set_title(&tr!("Mode"));
+    row.set_subtitle(&mode_row_subtitle());
 
     let model = gtk4::StringList::new(&[]);
     model.append(&tr!("Low CPU"));
@@ -1217,6 +1237,41 @@ mod tests {
         assert_ne!(
             engine_subtitle(EngineType::Dpdfnet2),
             engine_subtitle(EngineType::Dpdfnet8)
+        );
+    }
+
+    #[test]
+    fn dpdfnet8_subtitle_carries_a_gentle_static_weak_cpu_caveat_per_d02() {
+        let subtitle = engine_subtitle(EngineType::Dpdfnet8).to_lowercase();
+        // Points at the low-CPU Mode remedy...
+        assert!(
+            subtitle.contains("low cpu mode"),
+            "DPDFNet-8 subtitle must point to the Low CPU Mode remedy: {subtitle}"
+        );
+        // ...without asserting a measured hardware verdict (D-02: static,
+        // gentle note only — never a benchmarked/quantified claim).
+        assert!(
+            !subtitle.contains("quality")
+                && !subtitle.contains("benchmark")
+                && !subtitle.contains("measured"),
+            "DPDFNet-8 caveat must never claim a measured verdict: {subtitle}"
+        );
+        // The pre-existing D-06 processor-use wording must still be present.
+        assert!(subtitle.contains("processor"));
+    }
+
+    #[test]
+    fn mode_row_subtitle_conveys_dpdfnet_only_scope() {
+        // D-04 discretionary hint: the Mode row's subtitle should tell the
+        // user its DPDFNet-only scope, mirroring the same tr!() convention
+        // used everywhere else (no new dialog/toast subsystem). Tested via
+        // the extracted pure `mode_row_subtitle()` helper — no ComboRow is
+        // constructed here (this test binary's single allowed
+        // `gtk4::init()` call is already spent elsewhere).
+        let subtitle = mode_row_subtitle();
+        assert!(
+            subtitle.to_lowercase().contains("dpdfnet"),
+            "Mode row subtitle should convey its DPDFNet-only scope: {subtitle:?}" // i18n-ignore
         );
     }
 
