@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::audio::AudioPipeline;
+use crate::audio::{AudioPipeline, EngineFault, EngineFaultReport};
 use crate::config::Config;
 use crate::engine::{self, EngineType};
 use crate::instance_lock;
@@ -520,6 +520,71 @@ fn apply_engine_settings(
     eng.set_mode(config.mode);
 }
 
+/// A runtime engine fallback performed by [`handle_engine_fault`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeFallback {
+    /// The engine that failed at runtime.
+    pub from: EngineType,
+    /// The engine now running in its place.
+    pub to: EngineType,
+    /// Why `from` was replaced.
+    pub fault: EngineFault,
+}
+
+/// React to a runtime engine fault reported by the audio thread
+/// ([`AudioPipeline::poll_engine_fault`] only hands out reports about the
+/// engine that is still current): swap the failing engine for
+/// [`engine::runtime_fallback_engine`], configured exactly like any other
+/// swap, and make `config.engine` truthful so the engine selector and tray
+/// follow on the next sync tick. Unlike the startup/live-swap AVAILABILITY
+/// fallbacks (a missing library is permanent), an overload is transient, so
+/// this one is session-only: `config.runtime_fallback_from` keeps the
+/// user's choice and is what gets saved. Returns the fallback so the GUI can
+/// tell the user once; `None` when there is nothing lighter to switch to.
+fn handle_engine_fault(
+    report: EngineFaultReport,
+    pipeline: &AudioPipeline,
+    config: &mut Config,
+) -> Option<RuntimeFallback> {
+    let from = config.engine;
+    let Some(target) = engine::runtime_fallback_engine(from) else {
+        log::error!(
+            "{from:?} reported {:?} at runtime and there is no lighter engine to switch to",
+            report.fault
+        );
+        return None;
+    };
+    let (mut eng, to) = engine::create_engine_with_fallback(target);
+    apply_engine_settings(eng.as_mut(), config, to);
+    pipeline.set_engine(eng);
+    // Session-only: the file keeps the engine the user chose (Config::save_to).
+    if config.runtime_fallback_from.is_none() {
+        config.runtime_fallback_from = Some(from);
+    }
+    config.engine = to;
+    log::warn!("Engine fallback: {from:?} -> {to:?} ({:?})", report.fault);
+    Some(RuntimeFallback {
+        from,
+        to,
+        fault: report.fault,
+    })
+}
+
+/// Translated (title, body) of the one-time notification for a runtime
+/// engine fallback. Engine names are untranslated proper nouns substituted
+/// after the gettext lookup (same `%s` convention as the update banner).
+#[cfg(feature = "gui")]
+fn engine_fallback_notification_text(fallback: RuntimeFallback) -> (String, String) {
+    let title = gettextrs::gettext("Noise suppression switched to %s")
+        .replace("%s", fallback.to.short_name());
+    let body = match fallback.fault {
+        EngineFault::Overloaded => gettextrs::gettext("%s could not keep up on this computer, so CleanMic switched engines to keep your microphone working. You can switch back in the main window."),
+        EngineFault::Panicked => gettextrs::gettext("%s stopped working, so CleanMic switched engines to keep your microphone working. You can switch back in the main window."),
+    }
+    .replace("%s", fallback.from.short_name());
+    (title, body)
+}
+
 /// Dispatch a [`UiEvent`] to the audio pipeline and update config accordingly.
 ///
 /// `last_explicit` tracks the user's most recent explicit named-mic pick
@@ -558,6 +623,8 @@ fn handle_ui_event(
             apply_engine_settings(eng.as_mut(), config, actual_type);
             pipeline.set_engine(eng);
             config.engine = actual_type;
+            // An explicit pick ends any session-only runtime fallback.
+            config.runtime_fallback_from = None;
             let mode = config.mode;
             log::info!("Engine changed to {actual_type:?} (mode={mode:?})");
         }
@@ -1099,6 +1166,12 @@ fn run_headless(
     log::info!("CleanMic running headless — waiting for shutdown signal");
 
     while !is_shutdown_requested() {
+        if let Some(report) = pipeline.poll_engine_fault()
+            && handle_engine_fault(report, &pipeline, &mut config).is_some()
+            && let Err(e) = config.save()
+        {
+            log::warn!("Failed to save config after engine fallback: {e}");
+        }
         while let Ok(event) = ui_rx.try_recv() {
             handle_ui_event(
                 event,
@@ -1613,6 +1686,27 @@ fn run_with_gui(
             // --- Level meter refresh ---
             if let Some(report) = pipeline_timer.poll_levels() {
                 level_meters_timer.borrow_mut().update(report);
+            }
+
+            // --- Runtime engine fault -> lighter engine + one notification ---
+            // (dfn-panic-under-load) The audio thread already keeps the mic
+            // alive (dry passthrough) until this swap lands.
+            if let Some(fault) = pipeline_timer.poll_engine_fault() {
+                let fallback =
+                    handle_engine_fault(fault, &pipeline_timer, &mut config_timer.borrow_mut());
+                if let Some(fallback) = fallback {
+                    schedule_debounced_save(&config_timer, &pending_save_timer);
+                    if let Some(app_ref) = app_weak.upgrade() {
+                        let (title, body) = engine_fallback_notification_text(fallback);
+                        send_throttled_notification(
+                            &app_ref,
+                            &mut notification_throttle_timer.borrow_mut(),
+                            "engine-fallback",
+                            &title,
+                            &body,
+                        );
+                    }
+                }
             }
             {
                 let meters = level_meters_timer.borrow();
@@ -2401,6 +2495,130 @@ mod tests {
             assert_eq!(spy.mode, Some(mode), "mode not applied to swapped engine");
             assert_eq!(spy.strength, Some(0.83), "wrong engine's strength applied");
         }
+    }
+
+    // ── Runtime engine fallback (debug session dfn-panic-under-load) ────────
+
+    fn fault(fault: EngineFault) -> EngineFaultReport {
+        EngineFaultReport {
+            generation: 1,
+            fault,
+        }
+    }
+
+    #[test]
+    fn overloaded_deepfilternet_falls_back_to_rnnoise_and_config_follows() {
+        let pipeline = AudioPipeline::new().unwrap();
+        let mut config = Config {
+            engine: EngineType::DeepFilterNet,
+            ..Config::default()
+        };
+        let fb = handle_engine_fault(fault(EngineFault::Overloaded), &pipeline, &mut config);
+        assert_eq!(
+            fb,
+            Some(RuntimeFallback {
+                from: EngineType::DeepFilterNet,
+                to: EngineType::RNNoise,
+                fault: EngineFault::Overloaded,
+            })
+        );
+        assert_eq!(
+            config.engine,
+            EngineType::RNNoise,
+            "config.engine must name the engine that is really running (UI/tray sync from it)"
+        );
+        assert_eq!(
+            config.runtime_fallback_from,
+            Some(EngineType::DeepFilterNet),
+            "the user's choice is kept (and is what gets saved)"
+        );
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn explicit_engine_pick_ends_the_session_only_fallback() {
+        let pipeline = AudioPipeline::new().unwrap();
+        let mut pw = PipeWireManager::connect().expect("stub connect should succeed");
+        let mut config = Config {
+            engine: EngineType::RNNoise,
+            runtime_fallback_from: Some(EngineType::DeepFilterNet),
+            ..Config::default()
+        };
+        handle_ui_event(
+            UiEvent::EngineChanged(EngineType::RNNoise),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &RefCell::new(None),
+            &RefCell::new(None),
+        );
+        assert_eq!(
+            config.runtime_fallback_from, None,
+            "RNNoise is now the user's own choice" // i18n-ignore: test assertion message
+        );
+        assert_eq!(config.engine, EngineType::RNNoise);
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn every_heavier_engine_falls_back_to_rnnoise_on_panic_too() {
+        for from in [EngineType::Dpdfnet2, EngineType::Dpdfnet8, EngineType::Khip] {
+            let pipeline = AudioPipeline::new().unwrap();
+            let mut config = Config {
+                engine: from,
+                ..Config::default()
+            };
+            let fb = handle_engine_fault(fault(EngineFault::Panicked), &pipeline, &mut config)
+                .expect("a heavier engine always has RNNoise below it");
+            assert_eq!((fb.from, fb.to), (from, EngineType::RNNoise));
+            assert_eq!(config.engine, EngineType::RNNoise);
+            pipeline.shutdown();
+        }
+    }
+
+    #[test]
+    fn failing_rnnoise_has_nothing_lighter_and_config_is_untouched() {
+        let pipeline = AudioPipeline::new().unwrap();
+        let mut config = Config {
+            engine: EngineType::RNNoise,
+            ..Config::default()
+        };
+        let before = config.clone();
+        assert_eq!(
+            handle_engine_fault(fault(EngineFault::Overloaded), &pipeline, &mut config),
+            None
+        );
+        assert_eq!(config, before);
+        pipeline.shutdown();
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn engine_fallback_notification_names_both_engines_and_the_reason() {
+        let (title, body) = engine_fallback_notification_text(RuntimeFallback {
+            from: EngineType::DeepFilterNet,
+            to: EngineType::RNNoise,
+            fault: EngineFault::Overloaded,
+        });
+        assert!(
+            title.contains("RNNoise") && !title.contains("%s"),
+            "{title}"
+        );
+        assert!(
+            body.starts_with("DeepFilterNet ") && !body.contains("%s"), // i18n-ignore: test
+            "{body}"
+        );
+        let (_, crashed) = engine_fallback_notification_text(RuntimeFallback {
+            from: EngineType::Dpdfnet8,
+            to: EngineType::RNNoise,
+            fault: EngineFault::Panicked,
+        });
+        assert!(crashed.starts_with("DPDFNet-8 "), "{crashed}");
+        assert_ne!(
+            body.replace("DeepFilterNet", ""),
+            crashed.replace("DPDFNet-8", ""),
+            "one text per reason"
+        );
     }
 
     // ── System default + picker input (debug session mic-row-blank-single-device) ─

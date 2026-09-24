@@ -86,6 +86,34 @@ pub enum ProcessingMode {
     MaxQuality,
 }
 
+/// Runtime health an engine reports about itself, polled by the audio thread
+/// after every processed block (see [`NoiseEngine::health`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineHealth {
+    /// Processing normally.
+    Healthy,
+    /// The engine could not keep up with real time and has switched itself
+    /// to dry passthrough (its output is now the unprocessed input) to keep
+    /// the virtual mic alive. The app should replace it with a lighter
+    /// engine and tell the user.
+    Overloaded,
+}
+
+/// The engine the app switches to when `failed` stops working at runtime
+/// (overload, panic): RNNoise, the lightest engine, which has no
+/// model/runtime dependency and keeps up on any machine CleanMic supports.
+/// `None` when `failed` already is RNNoise — there is nothing lighter that
+/// still suppresses noise.
+pub fn runtime_fallback_engine(failed: EngineType) -> Option<EngineType> {
+    match failed {
+        EngineType::RNNoise => None,
+        EngineType::DeepFilterNet
+        | EngineType::Dpdfnet2
+        | EngineType::Dpdfnet8
+        | EngineType::Khip => Some(EngineType::RNNoise),
+    }
+}
+
 /// Common interface for all noise suppression engines.
 ///
 /// Implementations must be `Send` so they can be owned by the audio thread.
@@ -114,6 +142,13 @@ pub trait NoiseEngine: Send {
 
     /// Release resources held by the engine.
     fn teardown(&mut self);
+
+    /// Report the engine's own runtime health. Called by the audio thread
+    /// after every processed block, so it must be cheap and lock-free.
+    /// Engines without self-monitoring keep this default.
+    fn health(&self) -> EngineHealth {
+        EngineHealth::Healthy
+    }
 }
 
 /// Why an engine is or is not available, in machine-checkable form
@@ -637,6 +672,26 @@ mod tests {
         // computes — i.e. the map is not a shared/aliased fallback value.
         assert_eq!(*dpdfnet2, engine_availability(EngineType::Dpdfnet2));
         assert_eq!(*dpdfnet8, engine_availability(EngineType::Dpdfnet8));
+    }
+
+    // ── runtime_fallback_engine (dfn-panic-under-load) ──────────────────────
+
+    #[test]
+    fn runtime_fallback_is_rnnoise_for_every_engine_but_rnnoise() {
+        for engine in EngineType::all() {
+            let expected = if engine == EngineType::RNNoise {
+                None
+            } else {
+                Some(EngineType::RNNoise)
+            };
+            assert_eq!(runtime_fallback_engine(engine), expected, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn engines_are_healthy_unless_they_say_otherwise() {
+        assert_eq!(PassthroughEngine::new().health(), EngineHealth::Healthy);
+        assert_eq!(super::PassthroughEngine.health(), EngineHealth::Healthy);
     }
 
     // ── fallback_notice (D-11) ───────────────────────────────────────────────

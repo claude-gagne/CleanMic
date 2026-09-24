@@ -18,11 +18,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 use crate::dsp::{AutoGain, DcBlocker};
-use crate::engine::NoiseEngine;
+use crate::engine::{EngineHealth, NoiseEngine};
 use crate::pipewire::monitor::MonitorOutput;
 use crate::pipewire::ringbuf::{RingBufReader, RingBufWriter};
 
@@ -63,6 +64,17 @@ const CAPTURE_KEEP_AFTER_TRIM: usize = 2 * BUFFER_SIZE;
 /// the heartbeat. Covers a full [`CAPTURE_MAX_BACKLOG`] in one pass, while
 /// guaranteeing a slower-than-real-time engine cannot starve Stop/SetEngine.
 const MAX_BLOCKS_PER_PASS: usize = CAPTURE_MAX_BACKLOG / BUFFER_SIZE + 1;
+
+/// Capture-backlog trims (the audio thread fell more than
+/// [`CAPTURE_MAX_BACKLOG`] behind) within [`FELL_BEHIND_FAULT_WINDOW`] that
+/// mean the active engine is slower than real time rather than hit by a
+/// one-off stall. An RTF 1.25 engine trims every ~0.7 s; DPDFNet-8 MaxQuality
+/// under load trimmed 56 times in one 21 s recording (E2E 2026-09-24); quiet
+/// E2E runs trim 0 times.
+const FELL_BEHIND_FAULT_COUNT: usize = 3;
+
+/// Window for [`FELL_BEHIND_FAULT_COUNT`].
+const FELL_BEHIND_FAULT_WINDOW: Duration = Duration::from_secs(10);
 
 /// Convert a sample count to milliseconds for logging.
 fn samples_to_ms(samples: usize) -> f64 {
@@ -137,6 +149,114 @@ fn rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
+/// Why the audio thread asks the app to replace the active engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineFault {
+    /// The engine cannot keep up with real time: it said so itself
+    /// ([`EngineHealth::Overloaded`], e.g. DeepFilterNet's underrun guard
+    /// gave up and is passing audio through), or the audio thread fell more
+    /// than [`CAPTURE_MAX_BACKLOG`] behind [`FELL_BEHIND_FAULT_COUNT`] times
+    /// within [`FELL_BEHIND_FAULT_WINDOW`] while running it.
+    Overloaded,
+    /// The engine panicked; the audio thread already dropped it and passes
+    /// audio through unprocessed.
+    Panicked,
+}
+
+/// A fault of the engine installed by the `generation`-th
+/// [`AudioPipeline::set_engine`] call (1-based), so the app can ignore a
+/// report about an engine it has already replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineFaultReport {
+    pub generation: u64,
+    pub fault: EngineFault,
+}
+
+/// Watches the active engine for the failures that would otherwise leave the
+/// virtual mic dead or unusable without anyone noticing, and reports each
+/// engine at most once. Pure bookkeeping (no allocation, no I/O): safe on
+/// the audio thread.
+struct EngineWatchdog {
+    /// Number of `SetEngine` commands processed; matches the app-side count
+    /// of [`AudioPipeline::set_engine`] calls once the queue has drained.
+    generation: u64,
+    /// The current engine was already reported.
+    reported: bool,
+    /// Instants of the most recent capture-backlog trims (ring).
+    trims: [Option<Instant>; FELL_BEHIND_FAULT_COUNT],
+    next_trim: usize,
+}
+
+impl EngineWatchdog {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            reported: false,
+            trims: [None; FELL_BEHIND_FAULT_COUNT],
+            next_trim: 0,
+        }
+    }
+
+    /// A new engine was installed: watch it from scratch.
+    fn engine_replaced(&mut self) {
+        self.generation += 1;
+        self.reported = false;
+        self.trims = [None; FELL_BEHIND_FAULT_COUNT];
+    }
+
+    fn report(&mut self, fault: EngineFault) -> Option<EngineFaultReport> {
+        if self.reported {
+            return None;
+        }
+        self.reported = true;
+        Some(EngineFaultReport {
+            generation: self.generation,
+            fault,
+        })
+    }
+
+    /// Poll the active engine's own health after a processed block.
+    fn check_health(&mut self, health: EngineHealth) -> Option<EngineFaultReport> {
+        match health {
+            EngineHealth::Healthy => None,
+            EngineHealth::Overloaded => self.report(EngineFault::Overloaded),
+        }
+    }
+
+    /// The capture backlog was just trimmed at `now`.
+    fn fell_behind(&mut self, now: Instant) -> Option<EngineFaultReport> {
+        self.trims[self.next_trim] = Some(now);
+        self.next_trim = (self.next_trim + 1) % FELL_BEHIND_FAULT_COUNT;
+        // After the write, `next_trim` indexes the OLDEST of the last N.
+        let oldest = self.trims[self.next_trim]?;
+        if now.duration_since(oldest) <= FELL_BEHIND_FAULT_WINDOW {
+            self.report(EngineFault::Overloaded)
+        } else {
+            None
+        }
+    }
+
+    /// The active engine panicked and was dropped.
+    fn panicked(&mut self) -> Option<EngineFaultReport> {
+        self.report(EngineFault::Panicked)
+    }
+}
+
+/// Send a fault report to the app (at most once per engine, see
+/// [`EngineWatchdog`], so the channel send is rare).
+fn send_fault(fault_tx: &mpsc::Sender<EngineFaultReport>, report: Option<EngineFaultReport>) {
+    if let Some(report) = report {
+        log::warn!(
+            "Audio thread: active engine (#{}) reported {:?} — asking the app for a lighter engine",
+            report.generation,
+            report.fault
+        );
+        if fault_tx.send(report).is_err() {
+            log::debug!("engine fault channel closed - app may have shut down");
+        }
+    }
+}
+
 /// The main audio pipeline that owns the processing thread.
 ///
 /// Communication with the audio thread is entirely via channels — no shared
@@ -151,6 +271,11 @@ pub struct AudioPipeline {
     /// Incremented by the audio thread on every main loop iteration.
     /// The health check compares successive values to detect a stuck/dead thread.
     heartbeat: Arc<AtomicU64>,
+    /// Runtime engine faults reported by the audio thread.
+    fault_rx: mpsc::Receiver<EngineFaultReport>,
+    /// Number of engines handed to the audio thread via [`Self::set_engine`]
+    /// (the generation of the most recently sent engine).
+    engines_sent: AtomicU64,
 }
 
 impl Default for AudioPipeline {
@@ -169,12 +294,20 @@ impl AudioPipeline {
     pub fn new() -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let (level_tx, level_rx) = mpsc::channel::<LevelReport>();
+        let (fault_tx, fault_rx) = mpsc::channel::<EngineFaultReport>();
         let channel_alive = Arc::new(AtomicBool::new(true));
         let heartbeat = Arc::new(AtomicU64::new(0));
         let heartbeat_thread = heartbeat.clone();
 
-        let thread_handle =
-            spawn_audio_thread(cmd_rx, level_tx, None, None, heartbeat_thread, true)?;
+        let thread_handle = spawn_audio_thread(
+            cmd_rx,
+            level_tx,
+            fault_tx,
+            None,
+            None,
+            heartbeat_thread,
+            true,
+        )?;
 
         Ok(Self {
             cmd_tx,
@@ -182,6 +315,8 @@ impl AudioPipeline {
             thread_handle: Some(thread_handle),
             channel_alive,
             heartbeat,
+            fault_rx,
+            engines_sent: AtomicU64::new(0),
         })
     }
 
@@ -226,6 +361,7 @@ impl AudioPipeline {
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let (level_tx, level_rx) = mpsc::channel::<LevelReport>();
+        let (fault_tx, fault_rx) = mpsc::channel::<EngineFaultReport>();
         let channel_alive = Arc::new(AtomicBool::new(true));
         let heartbeat = Arc::new(AtomicU64::new(0));
         let heartbeat_thread = heartbeat.clone();
@@ -233,6 +369,7 @@ impl AudioPipeline {
         let thread_handle = spawn_audio_thread(
             cmd_rx,
             level_tx,
+            fault_tx,
             Some(capture_reader),
             Some(output_writer),
             heartbeat_thread,
@@ -245,6 +382,8 @@ impl AudioPipeline {
             thread_handle: Some(thread_handle),
             channel_alive,
             heartbeat,
+            fault_rx,
+            engines_sent: AtomicU64::new(0),
         })
     }
 
@@ -279,6 +418,7 @@ impl AudioPipeline {
 
     /// Swap the active noise suppression engine.
     pub fn set_engine(&self, engine: Box<dyn NoiseEngine>) {
+        self.engines_sent.fetch_add(1, Ordering::AcqRel);
         if self.cmd_tx.send(AudioCommand::SetEngine(engine)).is_err() {
             log::error!("audio thread channel closed - SetEngine command dropped");
             self.channel_alive.store(false, Ordering::Release);
@@ -403,6 +543,26 @@ impl AudioPipeline {
         last
     }
 
+    /// The next runtime engine fault reported by the audio thread about the
+    /// engine that is still current, if any. Reports about an engine that
+    /// has already been replaced by a later [`Self::set_engine`] call are
+    /// dropped here (logged), so a caller never "falls back" away from an
+    /// engine the user picked after the failing one.
+    pub fn poll_engine_fault(&self) -> Option<EngineFaultReport> {
+        while let Ok(report) = self.fault_rx.try_recv() {
+            let current = self.engines_sent.load(Ordering::Acquire);
+            if report.generation == current {
+                return Some(report);
+            }
+            log::info!(
+                "Ignoring {:?} for engine #{} (current engine is #{current})",
+                report.fault,
+                report.generation
+            );
+        }
+        None
+    }
+
     /// Shut down the audio thread and join it.
     pub fn shutdown(mut self) {
         if self.cmd_tx.send(AudioCommand::Shutdown).is_err() {
@@ -436,6 +596,7 @@ impl Drop for AudioPipeline {
 fn spawn_audio_thread(
     cmd_rx: mpsc::Receiver<AudioCommand>,
     level_tx: mpsc::Sender<LevelReport>,
+    fault_tx: mpsc::Sender<EngineFaultReport>,
     capture_reader: Option<RingBufReader>,
     output_writer: Option<RingBufWriter>,
     heartbeat: Arc<AtomicU64>,
@@ -447,6 +608,7 @@ fn spawn_audio_thread(
             audio_thread_main(
                 cmd_rx,
                 level_tx,
+                fault_tx,
                 capture_reader,
                 output_writer,
                 heartbeat,
@@ -560,6 +722,7 @@ fn handle_set_engine(
 
 /// Process a command received on the audio thread. Returns `true` if the
 /// thread should shut down.
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     cmd: AudioCommand,
     running: &mut bool,
@@ -568,6 +731,7 @@ fn handle_command(
     monitor: &mut MonitorOutput,
     input_device: &mut String,
     auto_gain: &mut AutoGain,
+    watchdog: &mut EngineWatchdog,
 ) -> bool {
     match cmd {
         AudioCommand::Start => {
@@ -580,6 +744,7 @@ fn handle_command(
         }
         AudioCommand::SetEngine(new_engine) => {
             handle_set_engine(engine, crossfade, new_engine, *running);
+            watchdog.engine_replaced();
         }
         AudioCommand::SetInputDevice(device) => {
             log::info!("Input device changed to: {}", device);
@@ -649,6 +814,7 @@ fn handle_command(
 fn audio_thread_main(
     cmd_rx: mpsc::Receiver<AudioCommand>,
     level_tx: mpsc::Sender<LevelReport>,
+    fault_tx: mpsc::Sender<EngineFaultReport>,
     capture_reader: Option<RingBufReader>,
     output_writer: Option<RingBufWriter>,
     heartbeat: Arc<AtomicU64>,
@@ -659,6 +825,7 @@ fn audio_thread_main(
     let mut crossfade: Option<CrossfadeState> = None;
     let mut monitor = MonitorOutput::new();
     let mut _input_device = String::new();
+    let mut watchdog = EngineWatchdog::new();
 
     // Exponential moving average for level reporting. Smooths the per-batch
     // RMS so the UI meters don't dance on ambient noise fluctuations.
@@ -748,6 +915,7 @@ fn audio_thread_main(
                         &mut monitor,
                         &mut _input_device,
                         &mut input_auto_gain,
+                        &mut watchdog,
                     ) {
                         return;
                     }
@@ -817,6 +985,7 @@ fn audio_thread_main(
                             samples_to_ms(backlog),
                             samples_to_ms(dropped)
                         );
+                        send_fault(&fault_tx, watchdog.fell_behind(Instant::now()));
                     }
                     let read = reader.read(&mut input_buf);
                     for s in &mut input_buf[read..] {
@@ -855,12 +1024,15 @@ fn audio_thread_main(
 
                     if process_result.is_err() {
                         log::error!(
-                            "Audio engine panicked during processing — dropping engine and falling back to passthrough. \
-                             Select a different engine in the UI to restore noise suppression."
+                            "Audio engine panicked during processing — dropping engine and falling back to passthrough \
+                             until the app installs a replacement."
                         );
                         engine = None;
                         crossfade = None;
                         output_buf.copy_from_slice(&input_buf);
+                        send_fault(&fault_tx, watchdog.panicked());
+                    } else if let Some(ref eng) = engine {
+                        send_fault(&fault_tx, watchdog.check_health(eng.health()));
                     }
 
                     if let Some(ref writer) = output_writer {
@@ -923,6 +1095,9 @@ fn audio_thread_main(
                     engine = None;
                     crossfade = None;
                     output_buf.copy_from_slice(&input_buf);
+                    send_fault(&fault_tx, watchdog.panicked());
+                } else if let Some(ref eng) = engine {
+                    send_fault(&fault_tx, watchdog.check_health(eng.health()));
                 }
 
                 if let Some(ref writer) = output_writer {
@@ -982,6 +1157,7 @@ fn audio_thread_main(
                         &mut monitor,
                         &mut _input_device,
                         &mut input_auto_gain,
+                        &mut watchdog,
                     ) {
                         return;
                     }
@@ -1235,6 +1411,7 @@ mod tests {
         let mut monitor = MonitorOutput::new();
         let mut input_device = String::new();
         let mut test_auto_gain = AutoGain::new(SAMPLE_RATE);
+        let mut test_watchdog = EngineWatchdog::new();
 
         // Enable monitor.
         handle_command(
@@ -1245,6 +1422,7 @@ mod tests {
             &mut monitor,
             &mut input_device,
             &mut test_auto_gain,
+            &mut test_watchdog,
         );
         assert!(monitor.is_enabled());
 
@@ -1257,6 +1435,7 @@ mod tests {
             &mut monitor,
             &mut input_device,
             &mut test_auto_gain,
+            &mut test_watchdog,
         );
 
         // Monitor must still be enabled after engine swap.
@@ -2389,6 +2568,7 @@ mod tests {
         let mut monitor = MonitorOutput::new();
         let mut input_device = String::new();
         let mut test_auto_gain = AutoGain::new(SAMPLE_RATE);
+        let mut test_watchdog = EngineWatchdog::new();
         assert!(test_auto_gain.is_enabled(), "AutoGain starts enabled");
 
         handle_command(
@@ -2399,6 +2579,7 @@ mod tests {
             &mut monitor,
             &mut input_device,
             &mut test_auto_gain,
+            &mut test_watchdog,
         );
         assert!(!test_auto_gain.is_enabled());
 
@@ -2410,6 +2591,7 @@ mod tests {
             &mut monitor,
             &mut input_device,
             &mut test_auto_gain,
+            &mut test_watchdog,
         );
         assert!(test_auto_gain.is_enabled());
     }
@@ -2612,5 +2794,255 @@ mod tests {
             on_level.input_rms,
             off_level.input_rms
         );
+    }
+
+    // --- Engine fault watchdog (debug session dfn-panic-under-load) --------
+    //
+    // A failing-but-alive engine (DeepFilterNet's guard gave up, an engine
+    // slower than real time, a caught panic) must be reported to the app
+    // exactly once, tagged with the engine's generation so the app never
+    // replaces an engine the user picked after the failing one.
+
+    #[test]
+    fn watchdog_reports_three_trims_within_the_window_once() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        assert_eq!(w.fell_behind(t0), None);
+        assert_eq!(
+            w.fell_behind(t0 + Duration::from_secs(4)),
+            None,
+            "2 trims: a stall, not overload"
+        );
+        assert_eq!(
+            w.fell_behind(t0 + FELL_BEHIND_FAULT_WINDOW),
+            Some(EngineFaultReport {
+                generation: 1,
+                fault: EngineFault::Overloaded
+            }),
+            "3rd trim exactly at the window edge still counts"
+        );
+        assert_eq!(
+            w.fell_behind(t0 + Duration::from_secs(11)),
+            None,
+            "reported once per engine"
+        );
+        assert_eq!(
+            w.check_health(EngineHealth::Overloaded),
+            None,
+            "once, whatever the source"
+        );
+    }
+
+    #[test]
+    fn watchdog_ignores_trims_spread_wider_than_the_window() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        let step = FELL_BEHIND_FAULT_WINDOW / 2 + Duration::from_millis(1);
+        for k in 0..10 {
+            assert_eq!(
+                w.fell_behind(t0 + step * k),
+                None,
+                "trim #{k}: never 3 within the window"
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_rearms_and_bumps_generation_on_engine_replaced() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        assert!(w.panicked().is_some());
+        let t0 = Instant::now();
+        w.fell_behind(t0);
+        w.fell_behind(t0);
+        w.engine_replaced();
+        assert_eq!(w.fell_behind(t0), None, "old engine's trims must not count");
+        assert_eq!(w.check_health(EngineHealth::Healthy), None);
+        assert_eq!(
+            w.check_health(EngineHealth::Overloaded),
+            Some(EngineFaultReport {
+                generation: 2,
+                fault: EngineFault::Overloaded
+            })
+        );
+    }
+
+    /// Passthrough engine whose health turns `Overloaded` after `healthy_blocks`
+    /// processed blocks (like DeepFilterNet's guard giving up).
+    struct GivesUpEngine {
+        healthy_blocks: usize,
+        processed: usize,
+    }
+
+    impl NoiseEngine for GivesUpEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            self.processed += 1;
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _: f32) {}
+        fn set_mode(&mut self, _: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+        fn health(&self) -> EngineHealth {
+            if self.processed > self.healthy_blocks {
+                EngineHealth::Overloaded
+            } else {
+                EngineHealth::Healthy
+            }
+        }
+    }
+
+    fn wait_for_fault(pipeline: &AudioPipeline, within: Duration) -> Option<EngineFaultReport> {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Some(r) = pipeline.poll_engine_fault() {
+                return Some(r);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[test]
+    fn engine_reporting_overloaded_reaches_the_app_once() {
+        let pipeline = AudioPipeline::new().unwrap();
+        pipeline.set_engine(Box::new(GivesUpEngine {
+            healthy_blocks: 3,
+            processed: 0,
+        }));
+        pipeline.start();
+        assert_eq!(
+            wait_for_fault(&pipeline, Duration::from_secs(2)),
+            Some(EngineFaultReport {
+                generation: 1,
+                fault: EngineFault::Overloaded
+            })
+        );
+        assert_eq!(
+            wait_for_fault(&pipeline, Duration::from_millis(200)),
+            None,
+            "reported once"
+        );
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn caught_engine_panic_reaches_the_app() {
+        let pipeline = AudioPipeline::new().unwrap();
+        pipeline.set_engine(Box::new(PanicOnFirstProcessEngine));
+        pipeline.start();
+        assert_eq!(
+            wait_for_fault(&pipeline, Duration::from_secs(2)),
+            Some(EngineFaultReport {
+                generation: 1,
+                fault: EngineFault::Panicked
+            })
+        );
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn fault_about_an_already_replaced_engine_is_dropped() {
+        let pipeline = AudioPipeline::new().unwrap();
+        pipeline.set_engine(Box::new(GivesUpEngine {
+            healthy_blocks: 0,
+            processed: 0,
+        }));
+        pipeline.start();
+        // Let the audio thread report engine #1 ...
+        thread::sleep(Duration::from_millis(150));
+        // ... while the user has meanwhile picked engine #2.
+        pipeline.set_engine(Box::new(PassthroughEngine::new()));
+        assert_eq!(
+            wait_for_fault(&pipeline, Duration::from_millis(300)),
+            None,
+            "a report about engine #1 must not trigger a fallback away from engine #2"
+        );
+        pipeline.shutdown();
+    }
+
+    /// Same two reports on the REAL capture path (ring buffers, what
+    /// production runs), not only in simulation mode.
+    #[test]
+    fn faults_on_the_real_capture_path_reach_the_app() {
+        for (engine, expected) in [
+            (
+                Box::new(GivesUpEngine {
+                    healthy_blocks: 3,
+                    processed: 0,
+                }) as Box<dyn NoiseEngine>,
+                EngineFault::Overloaded,
+            ),
+            (Box::new(PanicOnFirstProcessEngine), EngineFault::Panicked),
+        ] {
+            let (cw, cr) = ring_buffer(65_536);
+            let (ow, or_) = ring_buffer(65_536);
+            let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
+            let pw = FakePipeWire::start(cw, or_);
+            pipeline.set_engine(engine);
+            pipeline.start();
+            let fault = wait_for_fault(&pipeline, Duration::from_secs(2));
+            drop(pw);
+            pipeline.shutdown();
+            assert_eq!(
+                fault,
+                Some(EngineFaultReport {
+                    generation: 1,
+                    fault: expected
+                })
+            );
+        }
+    }
+
+    /// DPDFNet-8 under load: an engine slower than real time makes the audio
+    /// thread trim its capture backlog again and again; that is reported as
+    /// Overloaded (the engine itself never says so).
+    #[test]
+    fn slower_than_realtime_engine_is_reported_overloaded() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
+        let pw = FakePipeWire::start(cw, or_);
+        let slow = Arc::new(AtomicBool::new(true));
+        pipeline.set_engine(Box::new(SlowEngine {
+            per_block: Duration::from_micros(12_500), // RTF 1.25
+            slow: slow.clone(),
+        }));
+        pipeline.start();
+        let fault = wait_for_fault(&pipeline, Duration::from_secs(6));
+        slow.store(false, Ordering::Release);
+        thread::sleep(Duration::from_millis(100));
+        drop(pw);
+        pipeline.shutdown();
+        assert_eq!(
+            fault,
+            Some(EngineFaultReport {
+                generation: 1,
+                fault: EngineFault::Overloaded
+            })
+        );
+    }
+
+    /// Held-out guard against false positives: a real-time engine on the
+    /// same fake graph for 3 s is never reported.
+    #[test]
+    fn realtime_engine_is_never_reported() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
+        let pw = FakePipeWire::start(cw, or_);
+        pipeline.set_engine(Box::new(PassthroughEngine::new()));
+        pipeline.start();
+        let fault = wait_for_fault(&pipeline, Duration::from_secs(3));
+        drop(pw);
+        pipeline.shutdown();
+        assert_eq!(fault, None);
     }
 }

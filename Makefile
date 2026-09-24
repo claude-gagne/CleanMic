@@ -12,6 +12,7 @@
 #   ci-check      - Run fmt-check, clippy -D warnings, and tests (mirrors release CI)
 #   harness-test  - Offline checks for the silent E2E test harness (scripts/e2e-audio.sh)
 #   e2e-audio     - Run the silent E2E audio test (SCENARIOS="...", E2E_ARGS="...")
+#   test-dfn-overload - Starved-CPU DeepFilterNet regression (needs vendor/, ~25 s of one CPU)
 #   nested-run    - Start a nested CleanMic session by hand (NESTED_ARGS="...")
 #   nested-stop   - Stop that nested session
 #   clean         - Remove build artifacts
@@ -23,7 +24,7 @@ DESTDIR ?=
 
 BINARY  := target/release/cleanmic
 
-.PHONY: build appimage kill vendors mo install uninstall fmt lint test ci-check clean harness-test e2e-audio nested-run nested-stop
+.PHONY: build appimage kill vendors mo install uninstall fmt lint test ci-check clean harness-test e2e-audio nested-run nested-stop test-dfn-overload
 
 mo:
 	@mkdir -p locale/fr/LC_MESSAGES
@@ -101,6 +102,13 @@ harness-test:
 # (--out, --lang, --monitor-null-sink, ...).
 e2e-audio:
 	bash scripts/e2e-audio.sh $(E2E_ARGS) $(or $(SCENARIOS),baseline)
+
+# The vendored DeepFilterNet plugin aborts the whole process on its 100th
+# "Processing too slow" underrun; this runs it in a child process pinned to
+# one CPU next to busy loops and asserts the guard keeps it alive and never
+# silent (tests/deepfilter_overload.rs, debug session dfn-panic-under-load).
+test-dfn-overload:
+	$(CARGO) test --release --features deepfilter --test deepfilter_overload -- --ignored --nocapture
 
 # Manual nested-CleanMic poking: start a Xephyr display and launch into it.
 # NESTED_ARGS passes through nested-run.sh launch options (--lang, --config

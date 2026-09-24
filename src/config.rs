@@ -157,6 +157,16 @@ pub struct Config {
     /// `Pending`/`Fail`, this field may still be observed but is never used
     /// to gate a migration attempt that could not happen anyway (D-12).
     pub dpdfnet_default_migration_complete: bool,
+
+    /// The engine the user chose, while a runtime engine fallback stands in
+    /// for it this session (it could not keep up or crashed — see
+    /// `app::handle_engine_fault`; `engine` then names the stand-in so the
+    /// selector and tray stay truthful). Never serialized: `save_to`
+    /// persists this chosen engine instead of the stand-in, so a transient
+    /// CPU overload never silently rewrites the user's choice for future
+    /// sessions. Cleared by any explicit engine pick.
+    #[serde(skip)]
+    pub(crate) runtime_fallback_from: Option<EngineType>,
 }
 
 impl Default for Config {
@@ -184,6 +194,7 @@ impl Default for Config {
             last_seen_update_version: None,
             auto_gain_enabled: true,
             dpdfnet_default_migration_complete: false,
+            runtime_fallback_from: None,
         }
     }
 }
@@ -356,8 +367,17 @@ impl Config {
                 .with_context(|| format!("failed to create config dir {}", parent.display()))?;
         }
 
-        let contents =
-            toml::to_string_pretty(self).context("failed to serialize config to TOML")?;
+        // A runtime engine fallback is session-only: persist the engine the
+        // user chose, not the stand-in (see `runtime_fallback_from`).
+        let contents = match self.runtime_fallback_from {
+            Some(chosen) => toml::to_string_pretty(&Config {
+                engine: chosen,
+                runtime_fallback_from: None,
+                ..self.clone()
+            }),
+            None => toml::to_string_pretty(self),
+        }
+        .context("failed to serialize config to TOML")?;
 
         fs::write(path, contents)
             .with_context(|| format!("failed to write config to {}", path.display()))?;
@@ -369,6 +389,39 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dfn-panic-under-load: a runtime fallback stands in for the user's
+    /// engine for this session only; the file keeps the user's choice.
+    #[test]
+    fn runtime_fallback_engine_is_never_persisted() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("config.toml");
+        let config = Config {
+            engine: EngineType::RNNoise,
+            runtime_fallback_from: Some(EngineType::DeepFilterNet),
+            ..Config::default()
+        };
+        config.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("engine = \"DeepFilterNet\""), "{text}");
+        assert!(!text.contains("runtime_fallback"), "{text}");
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.engine, EngineType::DeepFilterNet);
+        assert_eq!(loaded.runtime_fallback_from, None);
+        // The in-memory config is untouched by saving.
+        assert_eq!(config.engine, EngineType::RNNoise);
+
+        // Without a fallback, the active engine is what gets persisted.
+        let plain = Config {
+            engine: EngineType::RNNoise,
+            ..Config::default()
+        };
+        plain.save_to(&path).unwrap();
+        assert_eq!(
+            Config::load_from(&path).unwrap().engine,
+            EngineType::RNNoise
+        );
+    }
 
     #[test]
     fn unit_tests_never_write_the_real_user_config() {

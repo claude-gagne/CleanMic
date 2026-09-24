@@ -315,3 +315,19 @@ msgstr "Signaler un problème"
 # (e.g. "DeepFilterNet"), never the failed/requested engine's name.
 msgid "Unable to start the selected engine — using instead:"
 msgstr "Impossible de démarrer le moteur sélectionné — utilisation de :"
+
+# dfn-panic-under-load: Notification title — the active engine failed at
+# runtime and CleanMic switched to a lighter one (src/app.rs). %s is the NEW
+# engine's untranslated proper-noun name (e.g. "RNNoise").
+msgid "Noise suppression switched to %s"
+msgstr "Réduction de bruit : passage à %s"
+
+# dfn-panic-under-load: Notification body — the engine could not keep up with
+# real time (CPU overload). %s is the FAILED engine's name (e.g. "DeepFilterNet").
+msgid "%s could not keep up on this computer, so CleanMic switched engines to keep your microphone working. You can switch back in the main window."
+msgstr "%s n'arrivait pas à suivre sur cet ordinateur ; CleanMic a donc changé de moteur pour que votre micro continue de fonctionner. Vous pouvez revenir en arrière depuis la fenêtre principale."
+
+# dfn-panic-under-load: Notification body — the engine crashed. %s is the
+# FAILED engine's name.
+msgid "%s stopped working, so CleanMic switched engines to keep your microphone working. You can switch back in the main window."
+msgstr "%s a cessé de fonctionner ; CleanMic a donc changé de moteur pour que votre micro continue de fonctionner. Vous pouvez revenir en arrière depuis la fenêtre principale."
