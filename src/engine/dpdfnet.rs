@@ -21,18 +21,44 @@
 //! 1. **Analysis** — shift a 960-sample ring by one hop, append the new hop,
 //!    multiply by the exact Vorbis (COLA, 50% overlap) window, real-FFT to
 //!    481 complex bins, interleave into a `[1,1,481,2]`-shaped `spec` tensor.
-//! 2. **Inference** — `Session::run` with `spec` + `state_in`, single
-//!    intra/inter-op thread. Output `spec_e`/`state_out` are validated
-//!    (correct length, all-finite) before being committed; on any failure
-//!    the prior recurrent state is kept untouched and a zero spectrum is
-//!    substituted (never corrupt, never propagate non-finite values).
-//! 3. **Attenuation limit** — blend the enhanced spectrum with a
-//!    `NOISY_FRAME_OFFSET`-hop-delayed copy of the noisy input spectrum,
-//!    weighted by a per-variant, strength-derived dB cap (never a raw
-//!    dry/wet bypass — see [`DpdfnetEngine::strength_to_attn_db`], D-14/15/16).
-//! 4. **Synthesis** — inverse real-FFT the blended spectrum, window, and
-//!    overlap-add into the 960-sample synthesis ring; emit the first 480
-//!    samples.
+//! 2. **Inference (D-03 decimation)** — on `ProcessingMode::MaxQuality`
+//!    (ratio 1), `Session::run` executes every hop. On the decimated modes
+//!    (`Balanced` ratio 2, `LowCpu` ratio 4), the model runs only once every
+//!    `ratio`-th hop — single intra/inter-op thread either way. Output
+//!    `spec_e`/`state_out` are validated (correct length, all-finite) before
+//!    being committed; on any failure the prior recurrent state is kept
+//!    untouched and a zero spectrum is substituted (never corrupt, never
+//!    propagate non-finite values).
+//! 3. **Synthesis input, per mode:**
+//!    - `MaxQuality`: blend `spec_e` with a `NOISY_FRAME_OFFSET`-hop-delayed
+//!      copy of the noisy input spectrum (unchanged [`AttnLimiter::apply`]),
+//!      weighted by a per-variant, strength-derived dB cap (never a raw
+//!      dry/wet bypass — see [`DpdfnetEngine::strength_to_attn_db`],
+//!      D-14/15/16), on a per-hop working copy (`spec_out`) so the blend
+//!      runs exactly once and can never compound.
+//!    - `Balanced`/`LowCpu` (decimated, D-03 gain-mask hold): on held hops,
+//!      the model's enhanced spectrum is never re-synthesized (that produced
+//!      a robotic buzz — consecutive held-hop outputs were near-exact
+//!      repeats). Instead, a per-bin real gain mask ([`derive_gain`]) is
+//!      derived once per inference and applied ([`apply_gain`]) to the
+//!      CURRENT, correctly aligned noisy frame every hop, then blended once
+//!      ([`AttnLimiter::blend`]). The alignment is `NOISY_FRAME_OFFSET *
+//!      ratio` hops, not `NOISY_FRAME_OFFSET` alone: the model's 4-frame
+//!      delay counts MODEL STEPS, and a model step equals one hop only at
+//!      ratio 1 — measured as a `+4 * (ratio - 1)`-hop lag vs `MaxQuality` on
+//!      the tracked demo speech clips (quick-260923-v4q E1). See
+//!      [`NoisyHistory`] for how that aligned frame is recovered.
+//! 4. **Synthesis** — inverse real-FFT the working copy (`spec_out`),
+//!    window, and overlap-add into the 960-sample synthesis ring; emit the
+//!    first 480 samples.
+//!
+//! Right after a mode switch, the model's last few inference steps ran at
+//! the OLD hop spacing, so for up to 4 inferences the `NOISY_FRAME_OFFSET *
+//! ratio` alignment is only approximate (a known, accepted transient — no
+//! temporal gain smoothing is applied to hide it; smoothing would lag real
+//! onsets instead). Right after init/teardown, decimated modes synthesize
+//! silence for at most `NOISY_FRAME_OFFSET * ratio` hops (warm-up, until
+//! [`NoisyHistory`] has a frame old enough to align against).
 //!
 //! ## Runtime asset resolution (T-15.1-03)
 //!
@@ -327,13 +353,17 @@ fn derive_gain(
     gain: &mut [f32; FREQ_BINS],
 ) {
     for k in 0..FREQ_BINS {
-        let e = (enhanced[2 * k] * enhanced[2 * k] + enhanced[2 * k + 1] * enhanced[2 * k + 1])
-            .sqrt();
+        let e =
+            (enhanced[2 * k] * enhanced[2 * k] + enhanced[2 * k + 1] * enhanced[2 * k + 1]).sqrt();
         let x = (aligned_noisy[2 * k] * aligned_noisy[2 * k]
             + aligned_noisy[2 * k + 1] * aligned_noisy[2 * k + 1])
             .sqrt();
         let g = e / x.max(GAIN_EPS);
-        gain[k] = if g.is_finite() { g.clamp(0.0, GAIN_MAX) } else { 0.0 };
+        gain[k] = if g.is_finite() {
+            g.clamp(0.0, GAIN_MAX)
+        } else {
+            0.0
+        };
     }
 }
 
@@ -621,12 +651,18 @@ impl DpdfnetEngine {
     }
 
     /// Map a [`ProcessingMode`] to the inference decimation ratio: ONNX
-    /// inference runs once every `decimation_ratio(mode)` hops, holding the
-    /// prior `spec_e` on the hops in between (D-03). `MaxQuality` == 1 means
-    /// every hop (today's unconditional behavior); `Balanced` == 2;
-    /// `LowCpu` == 4. **Provisional** starting values — confirmed/adjusted by
-    /// owner ear + the CPU-time sweep harness in 15.2-04, same discretionary
-    /// status as `strength_to_attn_db`'s anchors.
+    /// inference runs once every `decimation_ratio(mode)` hops (D-03). On the
+    /// hops in between, the prior enhanced spectrum is never re-synthesized
+    /// — instead a held per-bin real gain mask is applied to the current,
+    /// correctly aligned noisy frame every hop (quick-260923-v4q gain-mask
+    /// hold; see [`derive_gain`]/[`apply_gain`]/[`NoisyHistory`]). This ratio
+    /// is bounded by [`MAX_DECIMATION_RATIO`], which in turn sizes
+    /// [`NOISY_HISTORY_LEN`] — introducing a mode with a larger ratio without
+    /// updating both constants would silently break the alignment. `MaxQuality`
+    /// == 1 means every hop (today's unconditional behavior); `Balanced` ==
+    /// 2; `LowCpu` == 4. **Provisional** starting values — confirmed/adjusted
+    /// by owner ear + the CPU-time sweep harness in 15.2-04, same
+    /// discretionary status as `strength_to_attn_db`'s anchors.
     fn decimation_ratio(mode: ProcessingMode) -> u32 {
         match mode {
             ProcessingMode::MaxQuality => 1,
@@ -880,6 +916,12 @@ impl NoiseEngine for DpdfnetEngine {
             // decimation ratio `ratio`, spec_e describes the noisy analysis
             // frame from NOISY_FRAME_OFFSET * ratio hops ago, not
             // NOISY_FRAME_OFFSET hops ago (quick-260923-v4q E1).
+            //
+            // Known transient: right after a mode switch, the model's last
+            // few inference steps ran at the OLD hop spacing, so for up to 4
+            // inferences this alignment is only approximate -- accepted, not
+            // corrected (no temporal gain smoothing; smoothing would lag
+            // real onsets instead, per the design's D-06 rationale).
             let aligned_age = NOISY_FRAME_OFFSET * ratio as usize;
             let aligned_frame: Option<[f32; SPEC_LEN]> = self.history.get(aligned_age).copied();
 
@@ -902,6 +944,9 @@ impl NoiseEngine for DpdfnetEngine {
                     apply_gain(&self.gain, &aligned, &mut self.spec_out);
                     self.attn.blend(&aligned, &mut self.spec_out);
                 }
+                // Warm-up mute: no aligned frame exists yet, which only
+                // happens for at most aligned_age (== NOISY_FRAME_OFFSET *
+                // ratio) hops right after init() or teardown()/reinit.
                 None => self.spec_out = [0f32; SPEC_LEN],
             }
         }
@@ -1191,9 +1236,11 @@ mod tests {
                     "vendor/dpdfnet-reference/models/{name}_48khz_hr.onnx"
                 ))
             });
-        let dylib = std::env::var("ORT_DYLIB_PATH").map(PathBuf::from).unwrap_or_else(|_| {
-            manifest_dir.join("vendor/dpdfnet-reference/lib/libonnxruntime.so")
-        });
+        let dylib = std::env::var("ORT_DYLIB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                manifest_dir.join("vendor/dpdfnet-reference/lib/libonnxruntime.so")
+            });
         if !model.is_file() || !dylib.is_file() {
             return None;
         }
@@ -1399,5 +1446,273 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Task 2: alignment, no-compounding and MaxQuality invariants ──────
+
+    #[test]
+    fn gain_derive_clamps_to_unity_and_never_goes_non_finite() {
+        let mut gain = [0f32; FREQ_BINS];
+
+        // |E| > |X| must clamp to exactly GAIN_MAX.
+        let mut noisy = [0f32; SPEC_LEN];
+        let mut enhanced = [0f32; SPEC_LEN];
+        for k in 0..FREQ_BINS {
+            noisy[2 * k] = 1.0;
+            enhanced[2 * k] = 5.0; // |E| = 5 > |X| = 1
+        }
+        derive_gain(&enhanced, &noisy, &mut gain);
+        for &g in gain.iter() {
+            assert_eq!(g, GAIN_MAX, "|E| > |X| must clamp to exactly GAIN_MAX");
+        }
+
+        // X == 0, E == 0 -> gain 0.
+        let zero = [0f32; SPEC_LEN];
+        derive_gain(&zero, &zero, &mut gain);
+        for &g in gain.iter() {
+            assert_eq!(g, 0.0, "X == 0 and E == 0 must give gain 0");
+        }
+
+        // X == 0, E > 0 -> gain GAIN_MAX.
+        let mut enhanced_only = [0f32; SPEC_LEN];
+        for k in 0..FREQ_BINS {
+            enhanced_only[2 * k] = 3.0;
+        }
+        derive_gain(&enhanced_only, &zero, &mut gain);
+        for &g in gain.iter() {
+            assert_eq!(g, GAIN_MAX, "X == 0 and E > 0 must give GAIN_MAX");
+        }
+
+        // Huge-magnitude inputs (deliberately overflowing f32's squared-sum
+        // path to inf/inf = NaN internally) must still resolve to a finite,
+        // in-range gain via the non-finite fallback.
+        let mut huge_noisy = [0f32; SPEC_LEN];
+        let mut huge_enhanced = [0f32; SPEC_LEN];
+        for k in 0..FREQ_BINS {
+            huge_noisy[2 * k] = 1e30;
+            huge_noisy[2 * k + 1] = 1e30;
+            huge_enhanced[2 * k] = 1e35;
+            huge_enhanced[2 * k + 1] = -1e35;
+        }
+        derive_gain(&huge_enhanced, &huge_noisy, &mut gain);
+        for &g in gain.iter() {
+            assert!(
+                g.is_finite() && (0.0..=GAIN_MAX).contains(&g),
+                "gain must be finite and in [0, GAIN_MAX], got {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn gain_apply_scales_re_and_im_by_the_same_gain() {
+        let mut noisy = [0f32; SPEC_LEN];
+        for k in 0..FREQ_BINS {
+            let n = k as f32;
+            noisy[2 * k] = 0.4 + 0.02 * n;
+            noisy[2 * k + 1] = -0.3 + 0.015 * n;
+        }
+        let mut gain = [0f32; FREQ_BINS];
+        for (k, g) in gain.iter_mut().enumerate() {
+            *g = (k as f32 / FREQ_BINS as f32).clamp(0.0, 1.0);
+        }
+        let mut out = [0f32; SPEC_LEN];
+        apply_gain(&gain, &noisy, &mut out);
+
+        for k in 0..FREQ_BINS {
+            let in_re = noisy[2 * k];
+            let in_im = noisy[2 * k + 1];
+            let out_re = out[2 * k];
+            let out_im = out[2 * k + 1];
+            let in_mag = (in_re * in_re + in_im * in_im).sqrt();
+            let out_mag = (out_re * out_re + out_im * out_im).sqrt();
+            assert!(
+                (out_mag - gain[k] * in_mag).abs() < 1e-5,
+                "bin {k}: magnitude not scaled by gain"
+            );
+            if in_mag > 1e-6 && gain[k] > 1e-3 {
+                let in_phase = in_im.atan2(in_re);
+                let out_phase = out_im.atan2(out_re);
+                assert!(
+                    (in_phase - out_phase).abs() < 1e-4,
+                    "bin {k}: phase changed by apply_gain"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn noisy_history_returns_frame_pushed_age_hops_ago() {
+        let mut history = NoisyHistory::new();
+
+        // Before any push, everything is None.
+        assert!(history.get(0).is_none());
+
+        // Distinctly tag each pushed frame with its push index in bin 0, and
+        // push 3x the ring capacity so the ring wraps twice.
+        let total_pushes = 3 * NOISY_HISTORY_LEN;
+        for i in 0..total_pushes {
+            if i < NOISY_HISTORY_LEN {
+                assert!(
+                    history.get(i).is_none(),
+                    "get({i}) must be None before {} frames have been pushed",
+                    i + 1
+                );
+            }
+            let mut frame = [0f32; SPEC_LEN];
+            frame[0] = i as f32;
+            history.push(&frame);
+        }
+
+        for a in 0..NOISY_HISTORY_LEN {
+            let expected_push_index = total_pushes - 1 - a;
+            let frame = history
+                .get(a)
+                .unwrap_or_else(|| panic!("get({a}) must be Some after {total_pushes} pushes"));
+            assert_eq!(
+                frame[0], expected_push_index as f32,
+                "get({a}) returned the wrong frame"
+            );
+        }
+        assert!(
+            history.get(NOISY_HISTORY_LEN).is_none(),
+            "get(NOISY_HISTORY_LEN) must be None (ring capacity exceeded)"
+        );
+    }
+
+    #[test]
+    fn noisy_history_covers_every_mode_alignment() {
+        for mode in [
+            ProcessingMode::MaxQuality,
+            ProcessingMode::Balanced,
+            ProcessingMode::LowCpu,
+        ] {
+            let ratio = DpdfnetEngine::decimation_ratio(mode);
+            assert!(
+                ratio <= MAX_DECIMATION_RATIO,
+                "mode {mode:?}: ratio {ratio} exceeds MAX_DECIMATION_RATIO"
+            );
+            let aligned_age = NOISY_FRAME_OFFSET * ratio as usize;
+            assert!(
+                aligned_age < NOISY_HISTORY_LEN,
+                "mode {mode:?}: aligned age {aligned_age} is not covered by NOISY_HISTORY_LEN {NOISY_HISTORY_LEN}"
+            );
+        }
+    }
+
+    /// Shared white-box check for `decimated_hop_spectrum_is_stored_gain_on_aligned_noisy_frame`:
+    /// re-derives, independently in the test, what the stored gain and the
+    /// synthesized working copy must equal at every hop once an aligned
+    /// noisy frame exists, and compares against the engine's actual private
+    /// state.
+    fn check_decimated_gain_alignment_invariant(mode: ProcessingMode) {
+        let Some(mut engine) = build_test_engine(DpdfnetVariant::Dpdfnet2) else {
+            eprintln!(
+                "[dpdfnet decimation] SKIP: pinned model/runtime unavailable in this environment"
+            );
+            return;
+        };
+        engine.set_strength(0.0); // alpha = 0.1, the largest
+        engine.set_mode(mode);
+        let ratio = DpdfnetEngine::decimation_ratio(mode) as usize;
+        let aligned_age = NOISY_FRAME_OFFSET * ratio;
+
+        let mut seed = 0x2468_ACE0u32;
+        let n_hops = aligned_age + 40;
+        let mut recorded_noisy: Vec<[f32; SPEC_LEN]> = Vec::with_capacity(n_hops);
+        let mut prior_gain: Option<[f32; FREQ_BINS]> = None;
+
+        for h in 0..n_hops {
+            let input = non_stationary_hop(h, &mut seed);
+            let mut output = [0f32; HOP];
+            engine.process(&input, &mut output);
+            recorded_noisy.push(engine.spec);
+
+            let inferred = (h as u32) % (ratio as u32) == 0;
+
+            if h < aligned_age {
+                continue;
+            }
+            let aligned = recorded_noisy[h - aligned_age];
+
+            if inferred {
+                let mut expected_gain = [0f32; FREQ_BINS];
+                derive_gain(&engine.spec_e, &aligned, &mut expected_gain);
+                assert_eq!(
+                    engine.gain, expected_gain,
+                    "hop {h} ({mode:?}): stored gain does not match derive_gain(spec_e, aligned noisy)"
+                );
+            } else if let Some(prior) = prior_gain {
+                assert_eq!(
+                    engine.gain, prior,
+                    "hop {h} ({mode:?}): gain must stay byte-identical on held hops"
+                );
+            }
+            prior_gain = Some(engine.gain);
+
+            let mut expected_out = [0f32; SPEC_LEN];
+            apply_gain(&engine.gain, &aligned, &mut expected_out);
+            let alpha = engine.attn.alpha;
+            if engine.attn.enabled {
+                for i in 0..SPEC_LEN {
+                    expected_out[i] = alpha * aligned[i] + (1.0 - alpha) * expected_out[i];
+                }
+            }
+            let max_abs = expected_out
+                .iter()
+                .fold(0f32, |acc, v| acc.max(v.abs()))
+                .max(1.0);
+            for i in 0..SPEC_LEN {
+                assert!(
+                    (engine.spec_out[i] - expected_out[i]).abs() <= 1e-6 * max_abs,
+                    "hop {h} ({mode:?}) bin {i}: spec_out differs from expected gain-mask+blend output"
+                );
+            }
+        }
+        engine.teardown();
+    }
+
+    #[test]
+    fn decimated_hop_spectrum_is_stored_gain_on_aligned_noisy_frame() {
+        check_decimated_gain_alignment_invariant(ProcessingMode::Balanced);
+        check_decimated_gain_alignment_invariant(ProcessingMode::LowCpu);
+    }
+
+    #[test]
+    fn max_quality_synthesizes_raw_model_spectrum_blended_once() {
+        let Some(mut engine) = build_test_engine(DpdfnetVariant::Dpdfnet2) else {
+            eprintln!(
+                "[dpdfnet decimation] SKIP: pinned model/runtime unavailable in this environment"
+            );
+            return;
+        };
+        engine.set_strength(0.0);
+        engine.set_mode(ProcessingMode::MaxQuality);
+
+        let mut seed = 0x0BAD_F00Du32;
+        let n_hops = NOISY_FRAME_OFFSET + 20;
+        let mut recorded_noisy: Vec<[f32; SPEC_LEN]> = Vec::with_capacity(n_hops);
+
+        for t in 0..n_hops {
+            let input = non_stationary_hop(t, &mut seed);
+            let mut output = [0f32; HOP];
+            engine.process(&input, &mut output);
+            recorded_noisy.push(engine.spec);
+
+            if t >= NOISY_FRAME_OFFSET {
+                let delayed = recorded_noisy[t - NOISY_FRAME_OFFSET];
+                let alpha = engine.attn.alpha;
+                let mut expected = [0f32; SPEC_LEN];
+                for i in 0..SPEC_LEN {
+                    expected[i] = alpha * delayed[i] + (1.0 - alpha) * engine.spec_e[i];
+                }
+                for i in 0..SPEC_LEN {
+                    assert!(
+                        (engine.spec_out[i] - expected[i]).abs() < 1e-5,
+                        "hop {t} bin {i}: MaxQuality spec_out is not exactly alpha*delayed + (1-alpha)*spec_e"
+                    );
+                }
+            }
+        }
+        engine.teardown();
     }
 }

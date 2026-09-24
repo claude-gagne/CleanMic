@@ -442,13 +442,18 @@ mod dpdfnet_production {
         if let Some(mut healthy) = build_engine("dpdfnet8") {
             let input = vec![0.02f32; HOP];
             let mut output = vec![0f32; HOP];
-            // The pinned golden vectors show exactly two hops (960 samples)
-            // of legitimate near-zero output while the model's recurrent
-            // state converges (see `DpdfnetEngine::latency_frames` docs) --
-            // process past that warm-up before asserting non-silence, so
-            // this isolation check exercises steady-state behavior rather
-            // than mistaking correct warm-up silence for a broken engine.
-            for _ in 0..8 {
+            // This engine defaults to ProcessingMode::Balanced (decimation
+            // ratio 2). Since quick-260923-v4q's D-03 gain-mask hold fix,
+            // decimated modes synthesize true silence until NoisyHistory has
+            // a frame old enough to align against -- up to
+            // NOISY_FRAME_OFFSET * ratio hops (8 for Balanced, 16 for
+            // LowCpu; see `src/engine/dpdfnet.rs` module docs), longer than
+            // the 2-hop MaxQuality-only warm-up `DpdfnetEngine::latency_frames`
+            // documents. 24 hops clears that warm-up with margin for either
+            // decimated ratio, so this isolation check exercises real
+            // steady-state behavior rather than mistaking correct warm-up
+            // silence for a broken engine.
+            for _ in 0..24 {
                 healthy.process(&input, &mut output);
             }
             assert!(
