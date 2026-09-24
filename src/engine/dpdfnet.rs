@@ -428,12 +428,14 @@ impl DpdfnetEngine {
     /// (never negative) residual noisy-floor fraction, so suppression can
     /// never get WEAKER as strength increases.
     ///
-    /// **Provisional.** These anchors are placeholders pending Plan 08's
-    /// per-variant blind-listening validation and Plan 09's frozen
-    /// production constants (RESEARCH.md Open Question 1). Strength 0.0
-    /// deliberately still selects a real, non-trivial suppression anchor —
-    /// never the disabled/unlimited-noisy-floor extreme — so it is never a
-    /// raw dry/wet bypass (D-15).
+    /// **Owner-approved (provisional).** These per-variant anchors were
+    /// reviewed by the owner during the 15.2-03 checkpoint (D-05) and
+    /// approved unchanged as "for now" — a provisional sign-off, not a
+    /// permanent freeze; see `15.2-STRENGTH-ANCHORS.json`'s
+    /// `owner_decision.status: APPROVED_PROVISIONAL` for the full rationale
+    /// and caveats. Strength 0.0 deliberately still selects a real,
+    /// non-trivial suppression anchor — never the disabled/unlimited-noisy-
+    /// floor extreme — so it is never a raw dry/wet bypass (D-15).
     fn strength_to_attn_db(variant: DpdfnetVariant, strength: f32) -> f32 {
         let s = strength.clamp(0.0, 1.0);
         let (light, balanced, strong) = match variant {

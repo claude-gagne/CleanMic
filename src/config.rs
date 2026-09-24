@@ -14,19 +14,24 @@ use serde::{Deserialize, Serialize};
 use crate::engine::dpdfnet_policy::{self, Dpdfnet2DefaultDecision};
 use crate::engine::{EngineType, ProcessingMode};
 
-/// Provisional initial normalized strength for DPDFNet-2 (D-14) — a distinct
-/// constant, never the legacy 0.5 default and never copied from another
-/// engine's setting. Pending a future validation/freeze plan.
+/// Owner-approved (provisional) initial normalized strength for DPDFNet-2
+/// (D-14) — a distinct constant, never the legacy 0.5 default and never
+/// copied from another engine's setting. Reviewed and approved unchanged
+/// "for now" by the owner in the 15.2-03 checkpoint; see
+/// `15.2-STRENGTH-ANCHORS.json`'s `owner_decision.status:
+/// APPROVED_PROVISIONAL` for the full rationale — this is a provisional
+/// sign-off, not a permanent freeze.
 const DPDFNET2_DEFAULT_STRENGTH: f32 = 0.6;
 
-/// Provisional initial normalized strength for DPDFNet-8 (D-14) — its own
-/// distinct constant, independent of DPDFNet-2's.
+/// Owner-approved (provisional) initial normalized strength for DPDFNet-8
+/// (D-14) — its own distinct constant, independent of DPDFNet-2's. Same
+/// 15.2-03 owner-approval status as `DPDFNET2_DEFAULT_STRENGTH` above.
 const DPDFNET8_DEFAULT_STRENGTH: f32 = 0.55;
 
 /// Each engine's independent initial normalized strength (D-14). RNNoise,
 /// DeepFilterNet, and Khip keep the historical 0.5 "Balanced" default;
-/// DPDFNet-2/DPDFNet-8 get distinct provisional constants pending future
-/// blind-listening validation and freeze into a permanent value.
+/// DPDFNet-2/DPDFNet-8 get distinct constants the owner approved
+/// provisionally ("for now") in the 15.2-03 checkpoint.
 fn default_strength_for(engine: EngineType) -> f32 {
     match engine {
         EngineType::RNNoise | EngineType::DeepFilterNet | EngineType::Khip => 0.5,
