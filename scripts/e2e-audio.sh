@@ -156,6 +156,30 @@ err() { echo "[e2e] $*" >&2; }
 : "${E2E_DISPLAY:=:47}"
 : "${E2E_LANG:=fr}"
 
+# ---------------------------------------------------------------------------
+# Load-aware verdict (quick 260924-n4s, R5): the machine is shared (other
+# agents' builds, Syncthing, a browser). A FAIL recorded while the HOST was
+# starved isn't evidence of a CleanMic defect. scripts/e2e/contention.py
+# samples per-recording contention; a pre-flight gate refuses to start
+# scenarios on a busy machine (exit 7, INCONCLUSIVE); scheduling-sensitive
+# metrics (holes, latency_spread_ms, fell_behind, and latency_ms for
+# DeepFilterNet only) get majority-of-attempts retries instead of a single
+# roll of the dice.
+# ---------------------------------------------------------------------------
+: "${E2E_MAX_ATTEMPTS:=3}"                 # odd, so a majority always exists
+: "${QUIET_OTHER_BUSY_PCT:=15}"            # dfn-panic-under-load's quiet runs sat under 20%; a little headroom
+: "${QUIET_WINDOW_S:=2}"
+: "${QUIET_WINDOWS:=3}"                    # 3 consecutive quiet 2s windows, per the debug session's quiet runs
+: "${QUIET_WAIT_MAX_S:=180}"               # pre-flight: give the machine 3 minutes to go quiet before INCONCLUSIVE
+: "${QUIET_WAIT_ATTEMPT_S:=60}"            # per-attempt/per-scenario: shorter, just avoid launching into a spike
+: "${CONTENDED_OTHER_BUSY_PCT:=20}"        # LOAD_FLAG_BUSY_PCT's own value: matches the existing "ran under load" flag
+: "${CONTENDED_STEAL_PCT:=2}"              # a VM/cloud host stealing >2% of a core is a real contention signal
+: "${CONTENDED_IOWAIT_PCT:=10}"            # heavy disk I/O (e.g. Syncthing) starves the audio thread's page-ins
+: "${AUDIO_WAIT_STARVED_MS:=5}"            # a late delivery must exceed LIMITER_KEEP (10ms) to leave a hole
+: "${SAMPLER_INTERVAL_S:=0.1}"             # fast (per-thread) sample cadence
+: "${SAMPLER_SCAN_S:=1.0}"                 # slow (whole-/proc) scan cadence -- a full /proc walk is not free
+: "${BASELINE_PREROLL_S:=8}"               # unrecorded warm-up before each baseline attempt (DFN's first-speech underruns)
+
 KNOWN_SCENARIOS="baseline swaps toggle modes dc autogain stress monitor all"
 
 # ---------------------------------------------------------------------------
@@ -256,6 +280,12 @@ declare -a THRESHOLD_ARGS=(
   --threshold "load_flag_busy_pct=$LOAD_FLAG_BUSY_PCT"
   --threshold "stress_dead_run_max_ms=$STRESS_DEAD_RUN_MAX_MS"
   --threshold "stress_recovery_max_s=$STRESS_RECOVERY_MAX_S"
+  --threshold "e2e_max_attempts=$E2E_MAX_ATTEMPTS"
+  --threshold "quiet_other_busy_pct=$QUIET_OTHER_BUSY_PCT"
+  --threshold "contended_other_busy_pct=$CONTENDED_OTHER_BUSY_PCT"
+  --threshold "contended_steal_pct=$CONTENDED_STEAL_PCT"
+  --threshold "contended_iowait_pct=$CONTENDED_IOWAIT_PCT"
+  --threshold "audio_wait_starved_ms=$AUDIO_WAIT_STARVED_MS"
 )
 declare -a META_ARGS=()
 
@@ -275,8 +305,13 @@ build_environment_meta() {
     --meta "binary=$bin" --meta "sha256_12=$sha" --meta "mtime=$mtime"
     --meta "git_head=$head" --meta "git_dirty=$dirty" --meta "display=$DISPLAY_ARG"
     --meta "lang=$LANG_ARG" --meta "remote_desktop_session=$REMOTE_DESKTOP_SESSION"
+    --meta "nproc=$(nproc)"
   )
+  [ -n "$PREFLIGHT_WAIT_S" ] && META_ARGS+=(--meta "preflight_wait_s=$PREFLIGHT_WAIT_S")
+  [ -n "$PREFLIGHT_OTHER_BUSY_PCT" ] && META_ARGS+=(--meta "preflight_other_busy_pct=$PREFLIGHT_OTHER_BUSY_PCT")
 }
+PREFLIGHT_WAIT_S=""
+PREFLIGHT_OTHER_BUSY_PCT=""
 
 cmtest_node_count() {
   pw-dump 2>/dev/null | python3 "$E2E_DIR/pwgraph.py" count --prefix cmtest_ 2>/dev/null || echo 0
@@ -326,6 +361,7 @@ on_exit() {
   fi
   CLEANUP_DONE=1
   stop_cpu_load
+  stop_sampler
   [ -n "$RECORDER_PID" ] && kill -INT "$RECORDER_PID" 2>/dev/null
   [ -n "$PLAYER_PID" ] && kill -TERM "$PLAYER_PID" 2>/dev/null
   sleep 0.3
@@ -407,6 +443,65 @@ stop_cpu_load() {
     taskset -a -p -c "0-$(( $(nproc) - 1 ))" "$LOAD_APP_PID" >/dev/null 2>&1 || true
   fi
   LOAD_APP_PID=""
+}
+
+# ---------------------------------------------------------------------------
+# Contention sampler (R5, quick 260924-n4s): a background scripts/e2e/
+# contention.py `run` process, started around each recording so its report
+# row shows what else the machine was doing at the time. Declared before the
+# trap so on_exit can always call stop_sampler, which is idempotent.
+# ---------------------------------------------------------------------------
+
+SAMPLER_PID=""
+SAMPLER_STOP_FILE=""
+SAMPLER_OUT=""
+
+# start_sampler NAME [APP_PID] -- writes JSONL samples to
+# $OUT/logs/NAME.samples.jsonl; stopped by stop_sampler.
+start_sampler() {
+  local name="$1" app_pid="${2:-}"
+  stop_sampler
+  SAMPLER_STOP_FILE="$OUT/logs/${name}.sampler.stop"
+  SAMPLER_OUT="$OUT/logs/${name}.samples.jsonl"
+  rm -f "$SAMPLER_STOP_FILE" "$SAMPLER_OUT"
+  local display_dir="$CLEANMIC_HARNESS_STATE/display-${DISPLAY_ARG#:}"
+  local -a app_arg=()
+  [ -n "$app_pid" ] && app_arg=(--app-pid "$app_pid")
+  python3 "$E2E_DIR/contention.py" run --harness-pid "$$" --state-root "$CLEANMIC_HARNESS_STATE" \
+    --display-dir "$display_dir" "${app_arg[@]}" \
+    --interval "$SAMPLER_INTERVAL_S" --scan-interval "$SAMPLER_SCAN_S" \
+    --out "$SAMPLER_OUT" --stop-file "$SAMPLER_STOP_FILE" \
+    >"$OUT/logs/${name}.sampler.log" 2>&1 &
+  SAMPLER_PID=$!
+  disown 2>/dev/null || true
+}
+
+# stop_sampler -- signal the stop file, wait briefly for the sampler to exit
+# on its own, then kill it (verified by command line) as a backstop. Safe to
+# call any number of times, on any exit path.
+stop_sampler() {
+  [ -n "$SAMPLER_STOP_FILE" ] && : >"$SAMPLER_STOP_FILE" 2>/dev/null
+  if [ -n "$SAMPLER_PID" ]; then
+    local waited=0
+    while kill -0 "$SAMPLER_PID" 2>/dev/null && [ "$waited" -lt 30 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if [ -r "/proc/$SAMPLER_PID/cmdline" ] && tr '\0' ' ' <"/proc/$SAMPLER_PID/cmdline" 2>/dev/null | grep -qF "contention.py"; then
+      kill "$SAMPLER_PID" 2>/dev/null || true
+    fi
+  fi
+  SAMPLER_PID=""
+}
+
+# contention_wait_quiet MAX_S -- returns 0 (quiet) or 1 (not quiet within
+# MAX_S), printing contention.py's own one-line summary either way.
+contention_wait_quiet() {
+  local max_s="$1"
+  local display_dir="$CLEANMIC_HARNESS_STATE/display-${DISPLAY_ARG#:}"
+  python3 "$E2E_DIR/contention.py" wait-quiet --max-s "$max_s" --window-s "$QUIET_WINDOW_S" \
+    --windows "$QUIET_WINDOWS" --other-busy-pct "$QUIET_OTHER_BUSY_PCT" \
+    --harness-pid "$$" --state-root "$CLEANMIC_HARNESS_STATE" --display-dir "$display_dir"
 }
 
 trap on_exit EXIT
@@ -506,6 +601,11 @@ RECORD_START_EPOCH=""
 # Set by record_pair, appended to the next measure_and_add: CPU busy/steal
 # share and 1-min load average over the recording (the "ran under load" flag).
 declare -a LAST_CPU_META=()
+# Set by record_pair, appended to the next measure_and_add: the contention
+# sampler's JSONL path, REC_LINK_EPOCH and the contended-verdict thresholds
+# (R5), so `analyze.py measure` can attach a contention summary + hole
+# attribution to this recording.
+declare -a LAST_CONTENTION_ARGS=()
 
 # app_alive PID -- 0 when PID exists and is really running. A crashed app
 # can linger for many seconds while apport/systemd-coredump drains its core
@@ -532,6 +632,49 @@ cpu_sample() {
   echo "$((total - idle - iowait)) $total $steal"
 }
 
+# link_player WAV NAME -- spawns the (untracked-until-linked) pw-play
+# player, waits for its output port, audits, links it into cmtest_in,
+# records REC_LINK_EPOCH (the wall-clock moment audio starts flowing --
+# BEFORE the second audit, so a slow audit never inflates it), audits again.
+# Sets the global PLAYER_PID and REC_LINK_EPOCH. Shared by record_pair and
+# the baseline attempts loop's unrecorded pre-roll.
+REC_LINK_EPOCH=""
+link_player() {
+  local wav="$1" name="$2"
+  local duration_s
+  duration_s="$(python3 -c "
+import wave
+with wave.open('$wav', 'rb') as w:
+    print(round(w.getnframes() / w.getframerate(), 1) + 1)
+" 2>/dev/null || echo 30)"
+  local timeout_s; timeout_s=$(python3 -c "print(int($duration_s) + 15)" 2>/dev/null || echo 45)
+
+  # NOT disowned -- `wait "$PLAYER_PID"` needs bash to still track this job.
+  timeout "$timeout_s" pw-play -P '{ node.autoconnect=false node.name=cmtest_play }' "$wav" \
+    >"$OUT/logs/play_$name.log" 2>&1 &
+  PLAYER_PID=$!
+
+  local waited=0
+  while [ "$waited" -lt 30 ]; do
+    pw-link -o 2>/dev/null | grep -q "cmtest_play:output_MONO" && break
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+
+  if ! audit_graph; then
+    kill "$PLAYER_PID" 2>/dev/null || true
+    abort 4 "RDP-safe graph audit failed before linking the player for '$name'."
+  fi
+
+  pw-link cmtest_play:output_MONO cmtest_in:input_MONO >/dev/null 2>&1 || true
+  REC_LINK_EPOCH="$(date +%s.%N)"
+
+  if ! audit_graph; then
+    kill "$PLAYER_PID" 2>/dev/null || true
+    abort 4 "RDP-safe graph audit failed right after linking the player for '$name'."
+  fi
+}
+
 record_pair() {
   local name="$1" wav="$2" source_port="${3:-CleanMic:capture_MONO}" driver_func="${4:-}"
   local rec_wav="$OUT/rec/$name.wav"
@@ -539,6 +682,8 @@ record_pair() {
   # as an "unmeasurable latency" (dfn-panic-under-load), never as exit 5.
   local app_pid=""
   app_pid="$(bash "$NESTED_RUN" app-pid "$DISPLAY_ARG" 2>/dev/null)" || app_pid=""
+
+  start_sampler "$name" "$app_pid"
 
   # NOT disowned: `wait "$RECORDER_PID"` below needs bash to still track this
   # as one of its children. A disowned job returns instantly (rc 0) from
@@ -560,38 +705,7 @@ record_pair() {
 
   sleep 0.5
 
-  local duration_s
-  duration_s="$(python3 -c "
-import wave
-with wave.open('$wav', 'rb') as w:
-    print(round(w.getnframes() / w.getframerate(), 1) + 1)
-" 2>/dev/null || echo 30)"
-  local timeout_s; timeout_s=$(python3 -c "print(int($duration_s) + 15)" 2>/dev/null || echo 45)
-
-  # NOT disowned -- see the recorder's note above; `wait "$PLAYER_PID"` below
-  # requires it.
-  timeout "$timeout_s" pw-play -P '{ node.autoconnect=false node.name=cmtest_play }' "$wav" \
-    >"$OUT/logs/play_$name.log" 2>&1 &
-  PLAYER_PID=$!
-
-  waited=0
-  while [ "$waited" -lt 30 ]; do
-    pw-link -o 2>/dev/null | grep -q "cmtest_play:output_MONO" && break
-    sleep 0.05
-    waited=$((waited + 1))
-  done
-
-  if ! audit_graph; then
-    kill "$PLAYER_PID" 2>/dev/null || true
-    abort 4 "RDP-safe graph audit failed before linking the player for '$name'."
-  fi
-
-  pw-link cmtest_play:output_MONO cmtest_in:input_MONO >/dev/null 2>&1 || true
-
-  if ! audit_graph; then
-    kill "$PLAYER_PID" 2>/dev/null || true
-    abort 4 "RDP-safe graph audit failed right after linking the player for '$name'."
-  fi
+  link_player "$wav" "$name"
 
   RECORD_START_EPOCH="$(date +%s.%N)"
   local cpu_a load_a
@@ -625,11 +739,19 @@ with wave.open('$wav', 'rb') as w:
     --meta "cpu_steal_pct=$(python3 -c "print(round(100 * ($sb - $sa) / max(1, $tb - $ta), 1))")"
     --meta "loadavg_1m=$(python3 -c "print(max($load_a, $load_b))")"
   )
+  # Consumed by measure_and_add: analyze.py measure runs contention.py
+  # summarize() internally over [REC_LINK_EPOCH, now] when given these.
+  LAST_CONTENTION_ARGS=(
+    --contention-samples "$SAMPLER_OUT" --rec-link-epoch "$REC_LINK_EPOCH" --source-onset-s 0
+    --contended-other-busy-pct "$CONTENDED_OTHER_BUSY_PCT" --contended-steal-pct "$CONTENDED_STEAL_PCT"
+    --contended-iowait-pct "$CONTENDED_IOWAIT_PCT" --audio-wait-starved-ms "$AUDIO_WAIT_STARVED_MS"
+  )
 
   sleep 0.8
   kill -INT "$RECORDER_PID" 2>/dev/null || true
   wait "$RECORDER_PID" 2>/dev/null || true
   RECORDER_PID=""
+  stop_sampler
 
   if [ -n "$app_pid" ] && ! app_alive "$app_pid"; then
     local died_json="$OUT/rec/${name}_app_alive.json"
@@ -692,6 +814,9 @@ click_target() {
 APP_LOG=""
 launch_and_wait() {
   local engine="$1" mode="$2"; shift 2
+  # R5: best-effort -- a timeout here doesn't abort; it just means this
+  # scenario's recordings may come back contended (visible in the report).
+  contention_wait_quiet "$QUIET_WAIT_ATTEMPT_S" >/dev/null 2>&1 || true
   # `stop` (always run at the end of the PREVIOUS scenario/iteration) closes
   # the recorded Xephyr along with the app -- reopen it first. A no-op reuse
   # when it is already alive (e.g. this run's very first launch).
@@ -712,7 +837,7 @@ measure_and_add() {
   local json="$OUT/rec/${recording}.json"
   if ! python3 "$E2E_DIR/analyze.py" measure "$OUT/rec/${recording}.wav" \
     --scenario "$scenario" --recording "$recording" --kind "$kind" \
-    "$@" "${LAST_CPU_META[@]}" --json-out "$json"; then
+    "$@" "${LAST_CPU_META[@]}" "${LAST_CONTENTION_ARGS[@]}" --json-out "$json"; then
     abort 5 "analyze.py measure failed for $recording."
   fi
   MEASURED_JSON+=("$json")
@@ -779,8 +904,41 @@ scenario_baseline() {
     wait_for_log "Linked cmtest_mic:capture_MONO -> CleanMic-capture:input_MONO" 10 "$APP_LOG" || true
     sleep 2
 
-    record_pair "baseline_${engine}" "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
-    measure_and_add baseline "baseline_${engine}" speech --meta "engine=$engine" --meta "mode=$mode"
+    # R5: an attempts loop, not a single roll of the dice. Deterministic
+    # metrics never retry; scheduling-sensitive ones (holes, latency_spread_ms,
+    # fell_behind, and latency_ms for DeepFilterNet) get a majority verdict
+    # over up to E2E_MAX_ATTEMPTS independent fresh recordings.
+    local -a attempt_jsons=()
+    local aggregate_json="$OUT/rec/baseline_${engine}_aggregate.json"
+    local attempt
+    for attempt in $(seq 1 "$E2E_MAX_ATTEMPTS"); do
+      # Best-effort: a timeout here doesn't abort -- the recording's own
+      # contention summary (via the sampler) is what decide_attempts acts on.
+      contention_wait_quiet "$QUIET_WAIT_ATTEMPT_S" >/dev/null 2>&1 || true
+
+      # Unrecorded pre-roll: DeepFilterNet's first-speech underruns land in
+      # the first few seconds of real audio (planning_evidence), so a
+      # post-startup restart/shed needs speech to have already flowed.
+      link_player "$OUT/signals/speech.wav" "baseline_${engine}_a${attempt}_preroll"
+      sleep "$BASELINE_PREROLL_S"
+      kill "$PLAYER_PID" 2>/dev/null || true
+      wait "$PLAYER_PID" 2>/dev/null || true
+      PLAYER_PID=""
+
+      local rec_name="baseline_${engine}_a${attempt}"
+      record_pair "$rec_name" "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+      measure_and_add baseline "$rec_name" speech --meta "engine=$engine" --meta "mode=$mode"
+      attempt_jsons+=("$OUT/rec/${rec_name}.json")
+
+      local verdict=""
+      verdict="$(python3 "$E2E_DIR/analyze.py" attempts --max-attempts "$E2E_MAX_ATTEMPTS" \
+        --scenario baseline --recording "baseline_${engine}" "${THRESHOLD_ARGS[@]}" \
+        --meta "engine=$engine" --meta "mode=$mode" \
+        --json-out "$aggregate_json" "${attempt_jsons[@]}")" || abort 5 "analyze.py attempts failed for baseline_${engine}."
+      log "baseline $engine: attempt $attempt/$E2E_MAX_ATTEMPTS -> $verdict"
+      [ "$verdict" = "done" ] && break
+    done
+    [ -s "$aggregate_json" ] && MEASURED_JSON+=("$aggregate_json")
 
     run_nested stop "$DISPLAY_ARG"
     cp "$APP_LOG" "$OUT/logs/baseline_${engine}.log" 2>/dev/null || true
@@ -1178,6 +1336,30 @@ log "starting Xephyr on $DISPLAY_ARG"
 run_nested xephyr "$DISPLAY_ARG"
 
 start_graph
+
+# ---------------------------------------------------------------------------
+# Pre-flight quiet gate (R5): refuse to run any scenario on a machine that
+# never settled down -- exit 7 (INCONCLUSIVE), not a FAIL. No test audio has
+# played yet.
+# ---------------------------------------------------------------------------
+log "pre-flight: waiting for the machine to go quiet (up to ${QUIET_WAIT_MAX_S}s)..."
+PREFLIGHT_START_T=$(date +%s.%N)
+PREFLIGHT_QUIET_LOG="$OUT/logs/preflight_quiet.log"
+PREFLIGHT_RESULT="PASS"
+contention_wait_quiet "$QUIET_WAIT_MAX_S" >"$PREFLIGHT_QUIET_LOG" 2>&1 || PREFLIGHT_RESULT="INCONCLUSIVE"
+PREFLIGHT_WAIT_S="$(python3 -c "import time; print(round(time.time() - $PREFLIGHT_START_T, 1))" 2>/dev/null || echo "?")"
+PREFLIGHT_OTHER_BUSY_PCT="$(grep -Eo '[0-9.]+-[0-9.]+%' "$PREFLIGHT_QUIET_LOG" 2>/dev/null | head -1 || true)"
+PREFLIGHT_NOTE="$(tr '\n' ' ' <"$PREFLIGHT_QUIET_LOG" 2>/dev/null || true)"
+cat "$PREFLIGHT_QUIET_LOG" >&2 2>/dev/null || true
+python3 "$E2E_DIR/analyze.py" check --scenario preflight --recording preflight_quiet \
+  --metric preflight_quiet --value "waited ${PREFLIGHT_WAIT_S}s, other_busy ${PREFLIGHT_OTHER_BUSY_PCT:-unknown}" \
+  --threshold-desc "quiet within ${QUIET_WAIT_MAX_S}s" --result "$PREFLIGHT_RESULT" \
+  --note "$PREFLIGHT_NOTE" --json-out "$OUT/rec/preflight_quiet.json"
+MEASURED_JSON+=("$OUT/rec/preflight_quiet.json")
+if [ "$PREFLIGHT_RESULT" != "PASS" ]; then
+  log "pre-flight: the machine never went quiet -- refusing to run any scenario (exit 7)."
+  exit 0
+fi
 
 RUN_LIST="${SCENARIOS[*]}"
 if [[ " $RUN_LIST " == *" all "* ]]; then

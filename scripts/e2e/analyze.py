@@ -8,10 +8,14 @@ display or any recorded audio (see test_analyze.py). The `measure` and
 
 USAGE
   analyze.py measure REC.wav --scenario S --recording R --kind K \
-      [--meta k=v]... --json-out OUT.json
+      [--meta k=v]... [--contention-samples F.jsonl --rec-link-epoch EPOCH] \
+      --json-out OUT.json
   analyze.py stress-check --logscan L.json --app-alive yes|no --load-start EPOCH \
       --recovery-max-s N --scenario S --recording R --json-out OUT.json
   analyze.py active-engine --logscan L.json --started-with ENGINE
+  analyze.py attempts --max-attempts K --scenario S --recording R \
+      [--threshold k=v]... --json-out OUT.json ATTEMPT.json...
+      (prints "done" or "again")
   analyze.py report --out report.md [--threshold k=v]... [--meta k=v]... \
       [--aborted REASON] MEASURED.json...
 
@@ -19,6 +23,9 @@ EXIT CODES (report / measure)
   0  ok (report: every metric PASSed)
   1  report: at least one metric FAILed
   2  bad input (unreadable WAV / JSON, bad CLI usage)
+  7  report: no FAIL, but at least one metric is INCONCLUSIVE (R5: the
+     machine never got quiet, or a scheduling-sensitive metric only failed
+     under contention or host-starvation)
 """
 
 from __future__ import annotations
@@ -26,13 +33,17 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import re
 import struct
 import sys
-from collections import namedtuple
+from collections import Counter, namedtuple
 from typing import Any
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import contention as contention_mod  # noqa: E402  (quick 260924-n4s, R5)
 
 # ---------------------------------------------------------------------------
 # WAV reading
@@ -218,21 +229,37 @@ def zero_runs(o: np.ndarray, min_len: int = 240) -> list[tuple[int, int]]:
     return [(int(s), int(length)) for s, length in zip(starts, lengths) if length >= min_len]
 
 
+def _hole_frame_indices(o: np.ndarray, fs: int = 48000, frame_ms: float = 10.0) -> list[int]:
+    """Frame indices whose level drops below -90 dB while the frames 3
+    positions before AND after it are both above -50 dB -- a brief silent
+    gap surrounded by loud audio, distinct from natural silence. Shared by
+    `holes()` (count) and `hole_times_s()` (positions, for R5's host/engine
+    attribution)."""
+    frame = int(fs * frame_ms / 1000)
+    if frame <= 0 or len(o) < frame:
+        return []
+    m = len(o) // frame
+    framed = o[: m * frame].reshape(m, frame)
+    levels = 20 * np.log10(np.sqrt(np.mean(framed**2, axis=1)) + 1e-12)
+    idxs = []
+    for k in range(3, m - 3):
+        if levels[k] < -90 and levels[k - 3] > -50 and levels[k + 3] > -50:
+            idxs.append(k)
+    return idxs
+
+
 def holes(o: np.ndarray, fs: int = 48000, frame_ms: float = 10.0) -> int:
     """Count of `frame_ms` frames whose level drops below -90 dB while the
     frames 3 positions before AND after it are both above -50 dB -- a brief
     silent gap surrounded by loud audio, distinct from natural silence."""
+    return len(_hole_frame_indices(o, fs, frame_ms))
+
+
+def hole_times_s(o: np.ndarray, fs: int = 48000, frame_ms: float = 10.0) -> list[float]:
+    """Start time (seconds, relative to the start of `o`) of every frame
+    `holes()` counts."""
     frame = int(fs * frame_ms / 1000)
-    if frame <= 0 or len(o) < frame:
-        return 0
-    m = len(o) // frame
-    framed = o[: m * frame].reshape(m, frame)
-    levels = 20 * np.log10(np.sqrt(np.mean(framed**2, axis=1)) + 1e-12)
-    count = 0
-    for k in range(3, m - 3):
-        if levels[k] < -90 and levels[k - 3] > -50 and levels[k + 3] > -50:
-            count += 1
-    return count
+    return [round(k * frame / fs, 3) for k in _hole_frame_indices(o, fs, frame_ms)]
 
 
 def dead_speech(inp: np.ndarray, out: np.ndarray, fs: int = 48000, frame_ms: float = 10.0) -> tuple[float, float]:
@@ -354,6 +381,178 @@ def _log_epoch(ts: str) -> float | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Task 1 (R5): load-aware verdict -- WAV<->epoch mapping, hole attribution,
+# scheduling-sensitive retries with a majority verdict.
+# ---------------------------------------------------------------------------
+
+# Metrics whose value a busy HOST (not the engine) can move: a contended
+# machine starves the audio thread's `poll`/mutex wakeups (holes,
+# fell_behind) or the graph-quantum jitter the envelope xcorr sees
+# (latency_spread_ms). latency_ms is scheduling-sensitive ONLY for
+# DeepFilterNet, whose vendored plugin adds +10 ms per underrun -- a
+# scheduling effect proven in dfn-panic-under-load -- while every other
+# engine's steady-state latency is architectural, not host-load-dependent.
+SCHED_SENSITIVE = {"holes", "latency_spread_ms", "fell_behind"}
+
+
+def is_sched_sensitive_metric(metric: str, measured: dict[str, Any]) -> bool:
+    if metric in SCHED_SENSITIVE:
+        return True
+    if metric == "latency_ms" and str(measured.get("engine", "")) == "DeepFilterNet":
+        return True
+    return False
+
+
+def hole_epoch(t_wav: float, rec_link_epoch: float, source_onset_s: float, input_onset_wav_s: float) -> float:
+    """Map a hole's position in the OUTPUT-active-region-relative WAV
+    timeline (`hole_times_s`, itself relative to the input's active-region
+    start) back to a wall-clock epoch: REC_LINK_EPOCH (when the player was
+    linked, i.e. wav-time 0) plus the source signal's own silence lead-in
+    (`source_onset_s`) plus the hole's offset from the INPUT's measured
+    active-region start in this particular recording."""
+    return rec_link_epoch + source_onset_s + (t_wav - input_onset_wav_s)
+
+
+def attribute_holes(
+    hole_times_wav: list[float],
+    rec_link_epoch: float,
+    source_onset_s: float,
+    input_onset_wav_s: float,
+    fast_samples: list[dict[str, Any]],
+    audio_wait_starved_ms: float,
+) -> list[dict[str, Any]]:
+    """Classify each hole as host_starved (some app thread waited
+    >= audio_wait_starved_ms inside [t-250ms, t+150ms]), else engine_slow
+    (the cleanmic-audio thread's CPU share in that window is >= 90%), else
+    unexplained."""
+    fast = sorted(fast_samples, key=lambda s: s["t"])
+    out: list[dict[str, Any]] = []
+    for t_wav in hole_times_wav:
+        t_epoch = hole_epoch(t_wav, rec_link_epoch, source_onset_s, input_onset_wav_s)
+        lo, hi = t_epoch - 0.25, t_epoch + 0.15
+        host_starved = False
+        audio_run_ns = 0.0
+        audio_wall_s = 0.0
+        for a, b in zip(fast, fast[1:]):
+            if b["t"] < lo or a["t"] > hi:
+                continue
+            dt = b["t"] - a["t"]
+            if dt <= 0:
+                continue
+            a_threads = {th["tid"]: th for th in a.get("threads", [])}
+            for tb in b.get("threads", []):
+                ta = a_threads.get(tb["tid"])
+                if ta is None:
+                    continue
+                d_wait_ms = (tb["wait_ns"] - ta["wait_ns"]) / 1e6
+                if d_wait_ms >= audio_wait_starved_ms:
+                    host_starved = True
+                if tb.get("comm") == contention_mod.AUDIO_THREAD_COMM:
+                    audio_run_ns += tb["run_ns"] - ta["run_ns"]
+                    audio_wall_s += dt
+        if host_starved:
+            cls = "host_starved"
+        elif audio_wall_s > 0 and (audio_run_ns / 1e9) / audio_wall_s >= 0.90:
+            cls = "engine_slow"
+        else:
+            cls = "unexplained"
+        out.append({"t_wav": round(t_wav, 3), "t_epoch": round(t_epoch, 3), "class": cls})
+    return out
+
+
+def decide_attempts(attempts: list[dict[str, dict[str, Any]]], max_attempts: int) -> tuple[list[dict[str, Any]], bool]:
+    """attempts is one dict per attempt made SO FAR (in order); each maps
+    metric name -> {"value", "result" ("PASS"/"FAIL"), "sched_sensitive",
+    "contended", "host_starved" (holes only, meaningful on FAIL)}.
+
+    Deterministic metrics never retry: any FAIL anywhere is a final FAIL.
+    Scheduling-sensitive metrics that never FAIL are resolved PASS on the
+    first attempt (no retry needed to confirm a clean run). Once one FAILs,
+    a FAIL under contention (or, for `holes`, a FAIL whose failing holes are
+    ALL host_starved) is excluded from the "quiet" tally -- it's evidence,
+    but not counted toward a majority. The metric resolves the moment either
+    side of the quiet tally reaches a majority of `max_attempts`, or, once
+    `max_attempts` is reached, by comparing the quiet tally (a tie, including
+    0-0, is INCONCLUSIVE -- never FAIL when every failure was excluded).
+
+    Returns (rows, needs_more)."""
+    majority = max_attempts // 2 + 1
+    metrics: list[str] = []
+    seen: set[str] = set()
+    for a in attempts:
+        for m in a:
+            if m not in seen:
+                seen.add(m)
+                metrics.append(m)
+
+    rows: list[dict[str, Any]] = []
+    any_unresolved = False
+    any_deterministic_fail = False
+    for metric in metrics:
+        per_attempt = [a[metric] for a in attempts if metric in a]
+        sched_sensitive = any(p.get("sched_sensitive") for p in per_attempt)
+
+        if not sched_sensitive:
+            fails = [p for p in per_attempt if p["result"] == "FAIL"]
+            result = "FAIL" if fails else "PASS"
+            if result == "FAIL":
+                any_deterministic_fail = True
+            rows.append(
+                {
+                    "metric": metric,
+                    "result": result,
+                    "sched_sensitive": False,
+                    "values": [p["value"] for p in per_attempt],
+                    "classes": [p.get("contended") and "contended" or "quiet" for p in per_attempt],
+                }
+            )
+            continue
+
+        def excluded(p: dict[str, Any]) -> bool:
+            return bool(p.get("contended")) or (metric == "holes" and p["result"] == "FAIL" and p.get("host_starved"))
+
+        quiet_pass = sum(1 for p in per_attempt if p["result"] == "PASS" and not excluded(p))
+        quiet_fail = sum(1 for p in per_attempt if p["result"] == "FAIL" and not excluded(p))
+        any_fail_at_all = any(p["result"] == "FAIL" for p in per_attempt)
+
+        unresolved = False
+        if not any_fail_at_all:
+            result = "PASS"
+        elif quiet_fail >= majority:
+            result = "FAIL"
+        elif quiet_pass >= majority:
+            result = "PASS"
+        elif len(attempts) >= max_attempts:
+            if quiet_pass > quiet_fail:
+                result = "PASS"
+            elif quiet_fail > quiet_pass:
+                result = "FAIL"
+            else:
+                result = "INCONCLUSIVE"
+        else:
+            result = "INCONCLUSIVE"
+            unresolved = True
+
+        if unresolved:
+            any_unresolved = True
+        rows.append(
+            {
+                "metric": metric,
+                "result": result,
+                "sched_sensitive": True,
+                "values": [p["value"] for p in per_attempt],
+                "classes": [
+                    "contended" if p.get("contended") else ("host_starved" if p.get("host_starved") else "quiet")
+                    for p in per_attempt
+                ],
+            }
+        )
+
+    needs_more = (not any_deterministic_fail) and any_unresolved and len(attempts) < max_attempts
+    return rows, needs_more
+
+
 def evaluate_stress(
     logscan_result: dict[str, Any],
     app_alive: bool,
@@ -451,7 +650,33 @@ def _coerce_threshold_value(v: str):
         return v
 
 
-def measure_recording(path: str, scenario: str, recording: str, kind: str, meta: dict[str, str]) -> dict[str, Any]:
+def _load_jsonl(path: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def measure_recording(
+    path: str,
+    scenario: str,
+    recording: str,
+    kind: str,
+    meta: dict[str, str],
+    *,
+    contention_samples: str | None = None,
+    rec_link_epoch: float | None = None,
+    source_onset_s: float = 0.0,
+    audio_wait_starved_ms: float = 5.0,
+    contended_thresholds: dict[str, float] | None = None,
+) -> dict[str, Any]:
     x, fs = read_wav(path)
     if x.shape[1] < 2:
         raise ValueError(f"expected a 2-channel recording (input, output): {path}")
@@ -495,14 +720,52 @@ def measure_recording(path: str, scenario: str, recording: str, kind: str, meta:
         "settled_gain_db": round(settled_gain_db(inp, out), 2),
         "in_curve": rms_curve(inp, fs),
         "out_curve": rms_curve(out, fs),
+        "hole_times_s": hole_times_s(out_active, fs),
     }
+    if contention_samples is not None and rec_link_epoch is not None:
+        samples = _load_jsonl(contention_samples)
+        recording_span_s = len(inp) / fs
+        contention_summary = contention_mod.summarize(
+            samples, rec_link_epoch, rec_link_epoch + recording_span_s, contended_thresholds
+        )
+        result["contention"] = contention_summary
+        fast_samples = [s for s in samples if s.get("type") == "fast"]
+        # hole_times_s() is already relative to the INPUT's active-region
+        # start (it runs on out_active = out[start:end]), so the input onset
+        # offset here is 0 -- source_onset_s is the sole calibration knob
+        # for any residual link-vs-first-sample latency.
+        input_onset_wav_s = 0.0
+        attributed = attribute_holes(
+            result["hole_times_s"], rec_link_epoch, source_onset_s, input_onset_wav_s, fast_samples, audio_wait_starved_ms
+        )
+        result["hole_classes"] = [h["class"] for h in attributed]
+        result["hole_attribution"] = attributed
     result.update(meta)
     return result
 
 
 def cmd_measure(args: argparse.Namespace) -> int:
     meta = _parse_kv_list(args.meta or [])
-    result = measure_recording(args.wav, args.scenario, args.recording, args.kind, meta)
+    contended_thresholds = None
+    if args.contended_other_busy_pct is not None:
+        contended_thresholds = {
+            "contended_other_busy_pct": args.contended_other_busy_pct,
+            "contended_steal_pct": args.contended_steal_pct,
+            "contended_iowait_pct": args.contended_iowait_pct,
+            "audio_wait_starved_ms": args.audio_wait_starved_ms,
+        }
+    result = measure_recording(
+        args.wav,
+        args.scenario,
+        args.recording,
+        args.kind,
+        meta,
+        contention_samples=args.contention_samples,
+        rec_link_epoch=args.rec_link_epoch,
+        source_onset_s=args.source_onset_s,
+        audio_wait_starved_ms=args.audio_wait_starved_ms,
+        contended_thresholds=contended_thresholds,
+    )
     with open(args.json_out, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
     print(f"analyze: measured {args.recording} -> {args.json_out} (latency_ms={result['latency_ms']})")
@@ -713,6 +976,77 @@ def eval_check(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row
     ]
 
 
+def eval_aggregate(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """An `attempts`-produced `aggregate` JSON: one row per metric, its final
+    verdict, and the per-attempt values (never downgraded -- decide_attempts
+    already resolved contention/host_starved exclusions)."""
+    rows = []
+    for m in measured.get("metrics", []):
+        classes = m.get("classes", [])
+        values_str = " / ".join(f"{v} ({c})" for v, c in zip(m.get("values", []), classes))
+        note = f"{measured.get('attempts_used', '?')}/{measured.get('max_attempts', '?')} attempts: {values_str}"
+        rows.append(Row(m["metric"], values_str, "(majority of quiet attempts)", m["result"], note))
+    return rows
+
+
+def _rule_rows(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """The raw (undamped by contention/host_starved downgrade) rows for this
+    recording's `kind` -- what `evaluate()` starts from, and what
+    `decide_attempts` needs (it does its OWN exclusion bookkeeping)."""
+    kind = measured.get("kind", "speech")
+    rule = RULES_BY_KIND.get(kind, eval_speech)
+    return rule(measured, thresholds)
+
+
+def _contention_row(measured: dict[str, Any]) -> list[Row]:
+    """INFO row: every recording taken alongside a contention.py sampler
+    gets its other/harness/audio_daemon busy share, steal/iowait, loadavg,
+    the cleanmic-audio thread's own CPU share and max scheduling wait, and
+    the contended verdict with its reasons."""
+    c = measured.get("contention")
+    if not c:
+        return []
+    note = (
+        f"other_busy {c.get('other_busy_pct_mean')}% (p95 {c.get('other_busy_pct_p95')}%), "
+        f"steal {c.get('steal_pct')}%, iowait {c.get('iowait_pct')}%, loadavg {c.get('loadavg_1m_max')}, "
+        f"audio_thread_cpu {c.get('audio_thread_cpu_pct')}%, audio_wait_max {c.get('audio_wait_ms_max')}ms"
+    )
+    if c.get("reasons"):
+        note += "; " + "; ".join(c["reasons"])
+    return [Row("contention", "contended" if c.get("contended") else "quiet", "(informational)", "INFO", note)]
+
+
+def _holes_attribution_row(measured: dict[str, Any]) -> list[Row]:
+    """INFO row: how many holes this recording's `hole_classes` attributes
+    to host_starved / engine_slow / unexplained."""
+    classes = measured.get("hole_classes")
+    if not classes:
+        return []
+    counts = Counter(classes)
+    note = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    return [Row("holes_attribution", len(classes), "(informational)", "INFO", note)]
+
+
+def downgrade_row(row: Row, measured: dict[str, Any]) -> Row:
+    """A FAIL on a scheduling-sensitive metric is downgraded to INCONCLUSIVE
+    when this recording was contended, or -- for `holes` specifically --
+    when every failing hole was attributed to host_starved. Deterministic
+    metrics, PASS/INFO rows, and non-`holes` sched-sensitive metrics under a
+    host_starved (but not contended) run are never downgraded by this path
+    (holes is the only metric with its own per-instance attribution)."""
+    if row.result != "FAIL" or not is_sched_sensitive_metric(row.metric, measured):
+        return row
+    if measured.get("contention", {}).get("contended"):
+        note = f"{row.note}; downgraded: recording was contended".strip("; ")
+        return row._replace(result="INCONCLUSIVE", note=note)
+    if row.metric == "holes":
+        classes = measured.get("hole_classes") or []
+        if classes and all(c == "host_starved" for c in classes):
+            note = f"{row.note}; downgraded: every failing hole was host_starved".strip("; ")
+            return row._replace(result="INCONCLUSIVE", note=note)
+    return row
+
+
 RULES_BY_KIND = {
     "speech": eval_speech,
     "monitor_path": eval_speech,
@@ -724,13 +1058,17 @@ RULES_BY_KIND = {
     "ag_pink": eval_ag_pink,
     "check": eval_check,
     "stress_load": eval_stress_load,
+    "aggregate": eval_aggregate,
 }
 
 
 def evaluate(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
     kind = measured.get("kind", "speech")
-    rule = RULES_BY_KIND.get(kind, eval_speech)
-    return rule(measured, thresholds) + _cpu_row(measured, thresholds)
+    rows = _rule_rows(measured, thresholds) + _cpu_row(measured, thresholds)
+    rows += _contention_row(measured) + _holes_attribution_row(measured)
+    if kind != "aggregate":
+        rows = [downgrade_row(r, measured) for r in rows]
+    return rows
 
 
 def load_summary(measurements: list[dict[str, Any]], thresholds: dict[str, Any]) -> tuple[str, str]:
@@ -747,6 +1085,23 @@ def load_summary(measurements: list[dict[str, Any]], thresholds: dict[str, Any])
         return "n/a", "unknown"
     peak = max(vals)
     return f"{peak:g}", "yes" if peak > flag else "no"
+
+
+def contention_summary_stats(measurements: list[dict[str, Any]]) -> tuple[float | None, int]:
+    """(max other_busy_pct_mean across recordings with a contention summary,
+    count of contended recordings) for the report's Environment table."""
+    vals = []
+    contended_count = 0
+    for m in measurements:
+        c = m.get("contention")
+        if not c:
+            continue
+        v = c.get("other_busy_pct_mean")
+        if isinstance(v, (int, float)):
+            vals.append(v)
+        if c.get("contended"):
+            contended_count += 1
+    return (max(vals) if vals else None), contended_count
 
 
 def render_report(
@@ -771,6 +1126,16 @@ def render_report(
     peak_busy, under_load = load_summary(measurements, thresholds)
     lines.append(f"| max_cpu_busy_pct | {peak_busy} |")
     lines.append(f"| ran_under_load | {under_load} |")
+    if "nproc" in meta:
+        lines.append(f"| nproc | {meta['nproc']} |")
+    if "preflight_wait_s" in meta:
+        lines.append(f"| preflight_wait_s | {meta['preflight_wait_s']} |")
+    if "preflight_other_busy_pct" in meta:
+        lines.append(f"| preflight_other_busy_pct | {meta['preflight_other_busy_pct']} |")
+    max_other_busy, contended_count = contention_summary_stats(measurements)
+    if max_other_busy is not None:
+        lines.append(f"| max_other_busy_pct | {max_other_busy:g} |")
+        lines.append(f"| contended_recordings | {contended_count} |")
     lines.append("")
 
     lines.append("## Thresholds")
@@ -782,6 +1147,7 @@ def render_report(
     lines.append("")
 
     total_fail = 0
+    total_inconclusive = 0
     by_scenario: dict[str, list[dict[str, Any]]] = {}
     for m in measurements:
         by_scenario.setdefault(m.get("scenario", "unknown"), []).append(m)
@@ -796,6 +1162,8 @@ def render_report(
             for row in rows:
                 if row.result == "FAIL":
                     total_fail += 1
+                elif row.result == "INCONCLUSIVE":
+                    total_inconclusive += 1
                 note = f" ({row.note})" if row.note else ""
                 lines.append(
                     f"| {m.get('recording', '?')} | {row.metric} | {row.value}{note} | "
@@ -810,9 +1178,14 @@ def render_report(
         lines.append("")
 
     if total_fail:
-        summary = f"Result: FAIL ({total_fail} failed)"
+        summary = f"Result: FAIL ({total_fail} failed, {total_inconclusive} inconclusive)"
+        exit_code = 1
+    elif total_inconclusive:
+        summary = f"Result: INCONCLUSIVE ({total_inconclusive} inconclusive)"
+        exit_code = 7
     else:
         summary = "Result: PASS"
+        exit_code = 0
     lines.append(f"**{summary}**")
     lines.append("")
 
@@ -821,9 +1194,10 @@ def render_report(
     lines.append("- Synthetic mic (pw-loopback), not a physical microphone or hardware clock.")
     lines.append("- No perceptual (subjective quality) judgement is made here.")
     lines.append("- The monitor path is covered only when run with `--monitor-null-sink`.")
+    lines.append("- Exit 7 (INCONCLUSIVE) means the machine never got quiet, or a scheduling-sensitive")
+    lines.append("  metric only failed under contention/host-starvation -- not a confirmed defect.")
     lines.append("")
 
-    exit_code = 1 if total_fail else 0
     return "\n".join(lines), exit_code
 
 
@@ -970,6 +1344,52 @@ def cmd_active_engine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_attempts(args: argparse.Namespace) -> int:
+    """Fold ATTEMPT.json (one `measure`d recording per attempt taken so far,
+    in order) into a decide_attempts() verdict, write the `aggregate` JSON,
+    and print "done" (stop -- the aggregate is ready to add to the report)
+    or "again" (record one more attempt and re-run this command with it
+    appended)."""
+    thresholds = {k: _coerce_threshold_value(v) for k, v in _parse_kv_list(args.threshold or []).items()}
+    attempts: list[dict[str, dict[str, Any]]] = []
+    for path in args.attempt_json:
+        with open(path, encoding="utf-8") as fh:
+            measured = json.load(fh)
+        rows = _rule_rows(measured, thresholds)
+        contended = bool(measured.get("contention", {}).get("contended"))
+        entry: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row.result not in ("PASS", "FAIL"):
+                continue  # INFO rows carry no pass/fail verdict to retry on
+            host_starved = False
+            if row.metric == "holes" and row.result == "FAIL":
+                classes = measured.get("hole_classes") or []
+                host_starved = bool(classes) and all(c == "host_starved" for c in classes)
+            entry[row.metric] = {
+                "value": row.value,
+                "result": row.result,
+                "sched_sensitive": is_sched_sensitive_metric(row.metric, measured),
+                "contended": contended,
+                "host_starved": host_starved,
+            }
+        attempts.append(entry)
+
+    rows, needs_more = decide_attempts(attempts, args.max_attempts)
+    result: dict[str, Any] = {
+        "scenario": args.scenario,
+        "recording": args.recording,
+        "kind": "aggregate",
+        "attempts_used": len(attempts),
+        "max_attempts": args.max_attempts,
+        "metrics": rows,
+    }
+    result.update(_parse_kv_list(args.meta or []))
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    print("again" if needs_more else "done")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -981,6 +1401,13 @@ def main(argv: list[str] | None = None) -> int:
     p_measure.add_argument("--kind", required=True)
     p_measure.add_argument("--meta", action="append", default=[])
     p_measure.add_argument("--json-out", required=True)
+    p_measure.add_argument("--contention-samples", default=None, help="contention.py `run` JSONL for this recording")
+    p_measure.add_argument("--rec-link-epoch", type=float, default=None)
+    p_measure.add_argument("--source-onset-s", type=float, default=0.0)
+    p_measure.add_argument("--contended-other-busy-pct", type=float, default=None)
+    p_measure.add_argument("--contended-steal-pct", type=float, default=2.0)
+    p_measure.add_argument("--contended-iowait-pct", type=float, default=10.0)
+    p_measure.add_argument("--audio-wait-starved-ms", type=float, default=5.0)
 
     p_report = sub.add_parser("report")
     p_report.add_argument("--out", required=True)
@@ -999,7 +1426,7 @@ def main(argv: list[str] | None = None) -> int:
     p_check.add_argument("--metric", required=True)
     p_check.add_argument("--value", required=True)
     p_check.add_argument("--threshold-desc", required=True)
-    p_check.add_argument("--result", required=True, choices=["PASS", "FAIL", "INFO", "SKIP"])
+    p_check.add_argument("--result", required=True, choices=["PASS", "FAIL", "INFO", "SKIP", "INCONCLUSIVE"])
     p_check.add_argument("--note", default="")
     p_check.add_argument("--json-out", required=True)
 
@@ -1044,6 +1471,15 @@ def main(argv: list[str] | None = None) -> int:
     p_active.add_argument("--logscan", required=True)
     p_active.add_argument("--started-with", required=True)
 
+    p_attempts = sub.add_parser("attempts")
+    p_attempts.add_argument("--max-attempts", type=int, required=True)
+    p_attempts.add_argument("--scenario", required=True)
+    p_attempts.add_argument("--recording", required=True)
+    p_attempts.add_argument("--threshold", action="append", default=[])
+    p_attempts.add_argument("--meta", action="append", default=[])
+    p_attempts.add_argument("--json-out", required=True)
+    p_attempts.add_argument("attempt_json", nargs="+")
+
     args = parser.parse_args(argv)
 
     try:
@@ -1065,6 +1501,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_stress_check(args)
         if args.cmd == "active-engine":
             return cmd_active_engine(args)
+        if args.cmd == "attempts":
+            return cmd_attempts(args)
     except (OSError, ValueError) as exc:
         print(f"analyze: {exc}", file=sys.stderr)
         return 2

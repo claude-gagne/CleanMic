@@ -8,6 +8,7 @@ rules. No network, no PipeWire, no X server; seeded RNGs only. Runs both as:
 
 from __future__ import annotations
 
+import json
 import os
 import struct
 import sys
@@ -19,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np  # noqa: E402
 
 import analyze  # noqa: E402
+import contention  # noqa: E402
 
 FS = 48000
 
@@ -376,6 +378,350 @@ def test_per_engine_holes_override():
     assert dfn["holes"].result == "PASS" and dfn["holes"].threshold == "<= 8"
     other = {r.metric: r for r in analyze.evaluate(dict(base, engine="Dpdfnet8"), th)}
     assert other["holes"].result == "FAIL" and other["holes"].threshold == "<= 0"
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (R5): contention.py parsers + classification
+# ---------------------------------------------------------------------------
+
+
+def test_contention_parse_stat_aggregate():
+    d = contention.parse_stat_aggregate("cpu  100 10 50 800 20 5 5 10")
+    assert d["busy"] == 180
+    assert d["iowait"] == 20
+    assert d["steal"] == 10
+    assert d["total"] == 1000
+
+
+def test_contention_parse_pid_stat_with_parens_and_spaces():
+    line = "1234 (Web Content) S 1 1 1 0 -1 4194560 100 0 0 0 200 50 0 0 20 0 4 0 1000 0 0 18446744073709551615"
+    info = contention.parse_pid_stat(line)
+    assert info["comm"] == "Web Content"
+    assert info["ppid"] == 1
+    assert info["session"] == 1
+    assert info["cpu_ticks"] == 250
+
+    line2 = "55 (a) b) S 1 1 7 0 -1 0 0 0 0 0 11 22 0 0 20 0 4 0 1 0 0 0"
+    info2 = contention.parse_pid_stat(line2)
+    assert info2["comm"] == "a) b"
+    assert info2["session"] == 7
+    assert info2["ppid"] == 1
+
+
+def test_contention_parse_schedstat():
+    assert contention.parse_schedstat("123 456 7") == (123, 456, 7)
+
+
+def test_contention_resolve_descendants():
+    ppid_map = {2: 1, 3: 2, 4: 2, 5: 99, 6: 4}
+    assert contention.resolve_descendants(ppid_map, 1) == {2, 3, 4, 6}
+
+
+def test_contention_has_harness_marker():
+    assert contention.has_harness_marker(None, "/x") is False  # unreadable environ = no marker, never an error
+    env = "A=1\x00CLEANMIC_HARNESS_STATE_ROOT=/x/y\x00B=2"
+    assert contention.has_harness_marker(env, "/x/y") is True
+    assert contention.has_harness_marker(env, "/x") is False  # exact-line, never a substring match
+
+
+def test_contention_classify_pid():
+    descendants = {10, 11}
+    assert contention.classify_pid(10, "bash", 5, descendants, 99, 42, False) == "harness"  # descendant
+    assert contention.classify_pid(42, "Xephyr", 5, descendants, 99, 42, False) == "harness"  # xephyr pid
+    assert contention.classify_pid(20, "bash", 99, descendants, 99, 42, False) == "harness"  # same session
+    assert contention.classify_pid(30, "cleanmic", 5, descendants, 99, 42, True) == "harness"  # marker
+    assert contention.classify_pid(50, "pipewire", 5, descendants, 99, 42, False) == "audio_daemon"
+    assert contention.classify_pid(51, "wireplumber", 5, descendants, 99, 42, False) == "audio_daemon"
+    assert contention.classify_pid(52, "pipewire-pulse", 5, descendants, 99, 42, False) == "audio_daemon"
+    assert contention.classify_pid(60, "firefox", 5, descendants, 99, 42, False) == "other"
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (R5): contention.py summarize()
+# ---------------------------------------------------------------------------
+
+
+def _fast(t, run_ns=0, wait_ns=0, busy=0, iowait=0, steal=0, total=0, comm="cleanmic-audio", tid=1):
+    return {
+        "type": "fast",
+        "t": float(t),
+        "stat": {"busy": busy, "iowait": iowait, "steal": steal, "total": total},
+        "loadavg_1m": 1.23,
+        "threads": [{"tid": tid, "comm": comm, "run_ns": run_ns, "wait_ns": wait_ns}],
+    }
+
+
+def _slow(t, busy=0, iowait=0, steal=0, total=0, harness=0, audio_daemon=0, other=0, top_other=None):
+    return {
+        "type": "slow",
+        "t": float(t),
+        "stat": {"busy": busy, "iowait": iowait, "steal": steal, "total": total},
+        "classes": {"harness": harness, "audio_daemon": audio_daemon, "other": other},
+        "top_other": top_other or {},
+    }
+
+
+def test_contention_summarize_core_metrics():
+    samples = [_fast(i, run_ns=i * 500_000_000, wait_ns=i * 3_000_000, busy=i * 40, iowait=i * 5, steal=i * 1, total=i * 100) for i in range(11)]
+    samples += [_slow(i, total=i * 100, harness=i * 5, audio_daemon=i * 2, other=i * 10, top_other={"stress": i * 8, "syncthing": i * 2}) for i in range(0, 11, 2)]
+    result = contention.summarize(samples, 0.0, 10.0)
+    assert result["busy_pct"] == 40.0
+    assert result["iowait_pct"] == 5.0
+    assert result["steal_pct"] == 1.0
+    assert result["loadavg_1m_max"] == 1.23
+    assert result["other_busy_pct_mean"] == 10.0
+    assert result["harness_busy_pct"] == 5.0
+    assert result["audio_daemon_busy_pct"] == 2.0
+    assert result["audio_thread_cpu_pct"] == 50.0
+    assert result["audio_wait_ms_max"] == 3.0
+    assert result["audio_wait_ms_total"] == 30.0
+    assert result["app_wait_ms_max"] == 3.0
+    assert result["top_other"][0] == {"comm": "stress", "ticks": 80}
+    assert result["contended"] is False
+
+
+def test_contention_summarize_contended_boundaries():
+    def make(other=0.0, steal=0.0, iowait=0.0, wait_ms=0.0):
+        total = 1000
+        samples = [
+            _fast(0),
+            _fast(1, wait_ns=int(wait_ms * 1e6), iowait=int(iowait * 10), steal=int(steal * 10), total=total),
+            _slow(0),
+            _slow(1, total=total, other=int(other * 10)),
+        ]
+        return contention.summarize(samples, 0.0, 1.0)
+
+    assert make(other=20.0)["contended"] is False  # exactly at the limit never trips it
+    r = make(other=20.1)
+    assert r["contended"] is True and "other_busy_pct" in r["reasons"][0]
+    assert make(steal=2.0)["contended"] is False
+    assert make(steal=2.1)["contended"] is True
+    assert make(iowait=10.0)["contended"] is False
+    assert make(iowait=10.1)["contended"] is True
+    assert make(wait_ms=4.9)["contended"] is False
+    assert make(wait_ms=5.0)["contended"] is True  # app_wait_ms_max uses >=
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (R5): pre-flight quiet gate
+# ---------------------------------------------------------------------------
+
+
+def test_contention_decide_quiet():
+    quiet, streak, lo, hi = contention.decide_quiet([10, 12, 14], 15, 3)
+    assert quiet is True and streak == 3
+
+    quiet2, streak2, lo2, hi2 = contention.decide_quiet([10, 20, 12, 14, 13], 15, 3)
+    assert quiet2 is True and streak2 == 3  # the 20 resets the streak, then 3 more windows re-qualify
+    assert lo2 == 10 and hi2 == 20
+
+    quiet3, streak3, lo3, hi3 = contention.decide_quiet([20, 21, 22], 15, 3)
+    assert quiet3 is False and streak3 == 0
+    assert lo3 == 20 and hi3 == 22
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (R5): decide_attempts
+# ---------------------------------------------------------------------------
+
+
+def _attempt_metric(result, sched=True, contended=False, host_starved=False, value=1):
+    return {"value": value, "result": result, "sched_sensitive": sched, "contended": contended, "host_starved": host_starved}
+
+
+def test_decide_attempts_all_pass_first_try():
+    rows, needs_more = analyze.decide_attempts(
+        [{"holes": _attempt_metric("PASS"), "latency_ms": _attempt_metric("PASS", sched=False)}], 3
+    )
+    assert needs_more is False
+    assert all(r["result"] == "PASS" for r in rows)
+
+
+def test_decide_attempts_deterministic_fail_never_retries():
+    rows, needs_more = analyze.decide_attempts([{"exact_repeat_frac": _attempt_metric("FAIL", sched=False)}], 3)
+    assert needs_more is False
+    assert rows[0]["result"] == "FAIL"
+
+
+def test_decide_attempts_sched_fail_twice_quiet_stops_early():
+    rows, needs_more = analyze.decide_attempts([{"holes": _attempt_metric("FAIL")}], 3)
+    assert needs_more is True
+    rows, needs_more = analyze.decide_attempts([{"holes": _attempt_metric("FAIL")}, {"holes": _attempt_metric("FAIL")}], 3)
+    assert needs_more is False  # majority (2/3) reached without a 3rd attempt
+    assert rows[0]["result"] == "FAIL"
+
+
+def test_decide_attempts_fail_then_pass_pass_is_pass():
+    attempts = [{"holes": _attempt_metric("FAIL")}, {"holes": _attempt_metric("PASS")}]
+    _rows, needs_more = analyze.decide_attempts(attempts, 3)
+    assert needs_more is True
+    attempts.append({"holes": _attempt_metric("PASS")})
+    rows, needs_more = analyze.decide_attempts(attempts, 3)
+    assert needs_more is False
+    assert rows[0]["result"] == "PASS"
+
+
+def test_decide_attempts_mixed_quiet_and_contended_is_inconclusive():
+    attempts = [
+        {"holes": _attempt_metric("FAIL")},
+        {"holes": _attempt_metric("PASS")},
+        {"holes": _attempt_metric("FAIL", contended=True)},
+    ]
+    rows, needs_more = analyze.decide_attempts(attempts, 3)
+    assert needs_more is False
+    assert rows[0]["result"] == "INCONCLUSIVE"
+
+
+def test_decide_attempts_only_contended_failures_never_fail():
+    rows, _ = analyze.decide_attempts([{"holes": _attempt_metric("FAIL", contended=True)}] * 3, 3)
+    assert rows[0]["result"] == "INCONCLUSIVE"
+    rows2, _ = analyze.decide_attempts(
+        [{"holes": _attempt_metric("FAIL", contended=True)}, {"holes": _attempt_metric("PASS")}, {"holes": _attempt_metric("PASS")}], 3
+    )
+    assert rows2[0]["result"] == "PASS"
+
+
+def test_decide_attempts_only_host_starved_holes_never_fail():
+    rows, _ = analyze.decide_attempts([{"holes": _attempt_metric("FAIL", host_starved=True)}] * 3, 3)
+    assert rows[0]["result"] == "INCONCLUSIVE"
+
+
+def test_decide_attempts_never_exceeds_max_attempts():
+    attempts = [{"holes": _attempt_metric("FAIL")}] * 5
+    _rows, needs_more = analyze.decide_attempts(attempts, 3)
+    assert needs_more is False
+
+
+def test_latency_ms_sched_sensitive_only_for_deepfilternet():
+    assert analyze.is_sched_sensitive_metric("latency_ms", {"engine": "DeepFilterNet"}) is True
+    assert analyze.is_sched_sensitive_metric("latency_ms", {"engine": "RNNoise"}) is False
+    assert analyze.is_sched_sensitive_metric("holes", {"engine": "RNNoise"}) is True
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (R5): WAV<->epoch mapping + hole attribution
+# ---------------------------------------------------------------------------
+
+
+def test_hole_epoch_mapping_with_synthetic_offset():
+    got = analyze.hole_epoch(t_wav=5.0, rec_link_epoch=1000.0, source_onset_s=2.0, input_onset_wav_s=1.0)
+    assert got == 1000.0 + 2.0 + (5.0 - 1.0)
+
+
+def test_attribute_holes_classes():
+    fast_samples_starved = [
+        {"type": "fast", "t": 1004.9, "threads": [{"tid": 1, "comm": "cleanmic-audio", "run_ns": 0, "wait_ns": 0}]},
+        {"type": "fast", "t": 1005.0, "threads": [{"tid": 1, "comm": "cleanmic-audio", "run_ns": 0, "wait_ns": 6_000_000}]},
+    ]
+    res = analyze.attribute_holes([5.0], 1000.0, 0.0, 0.0, fast_samples_starved, 5.0)
+    assert res[0]["class"] == "host_starved"
+    assert res[0]["t_epoch"] == 1005.0
+
+    fast_samples_slow = [
+        {"type": "fast", "t": 1004.9, "threads": [{"tid": 1, "comm": "cleanmic-audio", "run_ns": 0, "wait_ns": 0}]},
+        {"type": "fast", "t": 1005.0, "threads": [{"tid": 1, "comm": "cleanmic-audio", "run_ns": 95_000_000, "wait_ns": 0}]},
+    ]
+    res2 = analyze.attribute_holes([5.0], 1000.0, 0.0, 0.0, fast_samples_slow, 5.0)
+    assert res2[0]["class"] == "engine_slow"
+
+    fast_samples_none = [
+        {"type": "fast", "t": 1004.9, "threads": [{"tid": 1, "comm": "cleanmic-audio", "run_ns": 0, "wait_ns": 0}]},
+        {"type": "fast", "t": 1005.0, "threads": [{"tid": 1, "comm": "cleanmic-audio", "run_ns": 5_000_000, "wait_ns": 0}]},
+    ]
+    res3 = analyze.attribute_holes([5.0], 1000.0, 0.0, 0.0, fast_samples_none, 5.0)
+    assert res3[0]["class"] == "unexplained"
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (R5): downgrade + report exit codes (0 / 1 / 7)
+# ---------------------------------------------------------------------------
+
+
+def test_downgrade_contended_sched_sensitive_fail_to_inconclusive():
+    measured = {
+        "kind": "speech", "engine": "DeepFilterNet", "latency_ms": 200, "lag_corr": 0.9, "latency_spread_ms": 2,
+        "contention": {"contended": True, "other_busy_pct_mean": 30},
+    }
+    th = {"latency_max_ms_deepfilternet": 140, "lag_corr_min": 0.5, "latency_drift_max_ms": 15}
+    rows = {r.metric: r for r in analyze.evaluate(measured, th)}
+    assert rows["latency_ms"].result == "INCONCLUSIVE"
+
+
+def test_downgrade_all_host_starved_holes_to_inconclusive():
+    th = {"latency_max_ms": 120, "lag_corr_min": 0.5, "latency_drift_max_ms": 15, "holes_max": 0}
+    measured_all = {
+        "kind": "speech", "engine": "RNNoise", "latency_ms": 50, "lag_corr": 0.9, "latency_spread_ms": 2,
+        "holes": 3, "hole_classes": ["host_starved", "host_starved", "host_starved"],
+    }
+    rows = {r.metric: r for r in analyze.evaluate(measured_all, th)}
+    assert rows["holes"].result == "INCONCLUSIVE"
+
+    measured_mixed = dict(measured_all, hole_classes=["host_starved", "engine_slow", "host_starved"])
+    rows2 = {r.metric: r for r in analyze.evaluate(measured_mixed, th)}
+    assert rows2["holes"].result == "FAIL"  # not EVERY failing hole was host_starved
+
+
+def test_report_exit_codes_include_inconclusive_7():
+    th = {"latency_max_ms": 120, "lag_corr_min": 0.5, "latency_drift_max_ms": 15, "holes_max": 0}
+    all_starved = {
+        "kind": "speech", "engine": "RNNoise", "latency_ms": 50, "lag_corr": 0.9, "latency_spread_ms": 2,
+        "holes": 3, "hole_classes": ["host_starved", "host_starved", "host_starved"],
+    }
+    text, code = analyze.render_report([all_starved], th, {}, None)
+    assert code == 7 and "Result: INCONCLUSIVE" in text
+
+    real_fail = dict(all_starved, hole_classes=["host_starved", "engine_slow", "host_starved"])
+    _text2, code2 = analyze.render_report([real_fail], th, {}, None)
+    assert code2 == 1
+
+    ok = {"kind": "speech", "latency_ms": 50, "lag_corr": 0.9, "latency_spread_ms": 2}
+    _text3, code3 = analyze.render_report([ok], {"latency_max_ms": 120, "lag_corr_min": 0.5, "latency_drift_max_ms": 15}, {}, None)
+    assert code3 == 0
+
+
+def test_report_environment_contention_stats():
+    measurements = [
+        {"kind": "speech", "latency_ms": 50, "lag_corr": 0.9, "latency_spread_ms": 2, "contention": {"contended": False, "other_busy_pct_mean": 5.0}},
+        {"kind": "speech", "latency_ms": 50, "lag_corr": 0.9, "latency_spread_ms": 2, "contention": {"contended": True, "other_busy_pct_mean": 25.0}},
+    ]
+    th = {"latency_max_ms": 120, "lag_corr_min": 0.5, "latency_drift_max_ms": 15}
+    max_other, contended_count = analyze.contention_summary_stats(measurements)
+    assert max_other == 25.0 and contended_count == 1
+    text, _code = analyze.render_report(measurements, th, {"nproc": "8"}, None)
+    assert "max_other_busy_pct" in text and "contended_recordings" in text and "| nproc | 8 |" in text
+
+
+def test_check_cli_accepts_inconclusive_result():
+    # Regression (real E2E run, quick 260924-n4s): the preflight_quiet row is
+    # written via `analyze.py check --result INCONCLUSIVE`; argparse's
+    # --result choices must include it or the row (and the exit-7 verdict)
+    # silently never gets recorded.
+    with tempfile.TemporaryDirectory() as td:
+        out_json = os.path.join(td, "check.json")
+        rc = analyze.main(
+            [
+                "check", "--scenario", "preflight", "--recording", "preflight_quiet",
+                "--metric", "preflight_quiet", "--value", "never quiet",
+                "--threshold-desc", "quiet within 20s", "--result", "INCONCLUSIVE",
+                "--json-out", out_json,
+            ]
+        )
+        assert rc == 0
+        with open(out_json, encoding="utf-8") as fh:
+            data = json.load(fh)
+        assert data["result"] == "INCONCLUSIVE"
+
+
+def test_aggregate_kind_renders_in_report():
+    aggregate = {
+        "scenario": "baseline", "recording": "baseline_RNNoise", "kind": "aggregate",
+        "attempts_used": 3, "max_attempts": 3,
+        "metrics": [{"metric": "holes", "result": "PASS", "sched_sensitive": True, "values": [1, 0, 0], "classes": ["quiet", "quiet", "quiet"]}],
+    }
+    rows = analyze.evaluate(aggregate, {})
+    assert rows[0].metric == "holes" and rows[0].result == "PASS"
+    text, code = analyze.render_report([aggregate], {}, {}, None)
+    assert code == 0 and "holes" in text
 
 
 def _run_all():

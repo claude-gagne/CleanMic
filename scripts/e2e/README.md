@@ -261,6 +261,65 @@ line appended by the trap handler on every exit path.
 | 4 | unsafe or busy environment — refused BEFORE any test audio played |
 | 5 | harness/driver error: `nested-run.sh` failed, an action was unconfirmed, a recording came back empty, or the app died |
 | 6 | cleanup was left incomplete — overrides every other code |
+| 7 | INCONCLUSIVE — no FAIL, but the machine never got quiet (pre-flight), or a scheduling-sensitive metric only failed under contention/host-starvation, never on a quiet attempt. Precedence: 6 > abort codes (2-5, 130, 143) > 1 > 7 > 0 |
+
+## Load-aware verdict (quick 260924-n4s, R5)
+
+The harness runs next to the owner's real desktop, other agents' builds, and
+background services (Syncthing, a browser) — a FAIL recorded while the HOST
+was starved is not evidence of a CleanMic defect. `scripts/e2e/contention.py`
+(stdlib-only /proc parsers, no new dependency) makes that visible instead of
+silent:
+
+- **Contention sampling.** A background sampler (`contention.py run`) runs
+  alongside every recording: fast (0.1 s) per-thread `schedstat` samples of
+  the harness's own app process, plus slower (1 s) whole-`/proc` scans
+  classifying every pid as `harness` (descendant of the harness process, its
+  recorded setsid session, the recorded Xephyr, or the exact
+  `CLEANMIC_HARNESS_STATE_ROOT` marker), `audio_daemon` (pipewire /
+  wireplumber / pipewire-pulse), or `other`. `contention.py summarize` turns
+  the samples plus a `[REC_LINK_EPOCH, end]` window into `other_busy_pct`
+  (mean/p95), `steal_pct`, `iowait_pct`, `loadavg_1m_max`, the
+  `cleanmic-audio` thread's own CPU share and max scheduling wait, and a
+  `contended` verdict with reasons (`other_busy_pct > 20`, `steal_pct > 2`,
+  `iowait_pct > 10`, or `app_wait_ms_max >= 5`). Every recording's report
+  section gets an INFO `contention` row.
+- **Pre-flight quiet gate.** After the RDP-safe graph comes up (before any
+  test audio plays), `contention.py wait-quiet` blocks until
+  `QUIET_WINDOWS` (3) consecutive `QUIET_WINDOW_S` (2 s) windows sit at or
+  below `QUIET_OTHER_BUSY_PCT` (15%), or `QUIET_WAIT_MAX_S` (180 s) elapses.
+  A never-quiet machine ends the run as INCONCLUSIVE (exit 7) with a
+  `preflight_quiet` check row — no scenario runs, nothing is signalled.
+  Each scenario/attempt launch also does a shorter, best-effort
+  `QUIET_WAIT_ATTEMPT_S` (60 s) wait that never aborts on timeout — it just
+  means that attempt's own contention sampling may mark it `contended`.
+- **Majority-of-attempts retries.** `holes`, `latency_spread_ms`,
+  `fell_behind`, and `latency_ms` (DeepFilterNet only — its vendored plugin
+  adds +10 ms per underrun, a scheduling effect) are scheduling-sensitive.
+  The `baseline` scenario runs each engine as an attempts loop (up to
+  `E2E_MAX_ATTEMPTS`, default 3, each a fresh launch with an unrecorded
+  `BASELINE_PREROLL_S`-second pre-roll before the measured recording):
+  deterministic metrics never retry (any FAIL anywhere is final); a
+  scheduling-sensitive metric that never FAILs resolves PASS on attempt 1;
+  once it FAILs, a FAIL taken while `contended` (or, for `holes`, a FAIL
+  whose failing holes are ALL `host_starved`) is excluded from the "quiet"
+  tally — evidence, not a vote. The metric resolves the moment either side
+  of the quiet tally reaches a majority of `E2E_MAX_ATTEMPTS`, or, once
+  attempts are exhausted, by comparing the quiet tally (a tie — including
+  0-0, i.e. every failure was excluded — is INCONCLUSIVE, never FAIL). See
+  `analyze.py`'s `decide_attempts()`.
+- **Hole attribution.** Every `holes` frame is mapped back to a wall-clock
+  epoch (`REC_LINK_EPOCH + source_onset_s + (t_wav - input_onset_wav)`) and
+  classified `host_starved` (some app thread waited >= `AUDIO_WAIT_STARVED_MS`
+  inside `[t-250ms, t+150ms]`), else `engine_slow` (the `cleanmic-audio`
+  thread's own CPU share in that window was >= 90%), else `unexplained`. A
+  recording's `hole_classes` gets its own INFO row, and an all-`host_starved`
+  `holes` FAIL downgrades to INCONCLUSIVE.
+- **Offline-tested.** Every rule above is a pure function
+  (`contention.py`'s parsers/classification/`summarize`/`decide_quiet`,
+  `analyze.py`'s `decide_attempts`/`attribute_holes`/`downgrade_row`) with
+  synthetic-Instant-style fixtures in `test_analyze.py` — no root, no live
+  PipeWire graph, no real waiting.
 
 ## Troubleshooting
 
