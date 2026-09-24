@@ -16,7 +16,7 @@
 //! conferencing level before either sees it.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,19 @@ const FELL_BEHIND_FAULT_COUNT: usize = 3;
 
 /// Window for [`FELL_BEHIND_FAULT_COUNT`].
 const FELL_BEHIND_FAULT_WINDOW: Duration = Duration::from_secs(10);
+
+/// Bound on [`AudioPipeline::shutdown_and_join`]'s wait for the audio thread
+/// to exit. The engine's `teardown()` (which releases DPDFNet's ONNX Runtime
+/// `Session`) runs on the audio thread as part of handling
+/// [`AudioCommand::Shutdown`], so this bound is also how long shutdown can
+/// take to guarantee that release happens before the process exits and ORT
+/// tears down its global statics (debug session base-latency-330ms — a
+/// still-inferring audio thread at that point logs ONNX Runtime errors into
+/// the void). Kept comfortably under `app::shutdown`'s documented 2 s budget
+/// so a stuck audio thread can never make shutdown hang or blow that budget:
+/// `shutdown_and_join` returns `false` and logs a warning at the deadline
+/// instead of blocking forever.
+pub const AUDIO_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Convert a sample count to milliseconds for logging.
 fn samples_to_ms(samples: usize) -> f64 {
@@ -264,7 +277,14 @@ fn send_fault(fault_tx: &mpsc::Sender<EngineFaultReport>, report: Option<EngineF
 pub struct AudioPipeline {
     cmd_tx: mpsc::Sender<AudioCommand>,
     level_rx: mpsc::Receiver<LevelReport>,
-    thread_handle: Option<thread::JoinHandle<()>>,
+    /// `Mutex` (not a plain `Option`) so [`Self::shutdown_and_join`] can take
+    /// `&self`: it must be callable through a shared `Rc<AudioPipeline>`
+    /// (the GUI keeps clones of the pipeline alive in GLib timer sources
+    /// after `app.run_with_args` returns — see `shutdown_gui_session`), where
+    /// no caller ever has exclusive access. `AudioPipeline` stays `Send`; it
+    /// is already `!Sync` because of `mpsc::Receiver`, so this adds no new
+    /// cross-thread sharing.
+    thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
     /// Tracks whether the command channel is still open.
     /// Set to `false` whenever a send fails (audio thread is dead).
     channel_alive: Arc<AtomicBool>,
@@ -312,7 +332,7 @@ impl AudioPipeline {
         Ok(Self {
             cmd_tx,
             level_rx,
-            thread_handle: Some(thread_handle),
+            thread_handle: Mutex::new(Some(thread_handle)),
             channel_alive,
             heartbeat,
             fault_rx,
@@ -379,7 +399,7 @@ impl AudioPipeline {
         Ok(Self {
             cmd_tx,
             level_rx,
-            thread_handle: Some(thread_handle),
+            thread_handle: Mutex::new(Some(thread_handle)),
             channel_alive,
             heartbeat,
             fault_rx,
@@ -563,27 +583,87 @@ impl AudioPipeline {
         None
     }
 
-    /// Shut down the audio thread and join it.
-    pub fn shutdown(mut self) {
+    /// Shut down the audio thread and join it (bounded — see
+    /// [`Self::shutdown_and_join`]).
+    pub fn shutdown(self) {
+        self.shutdown_and_join(AUDIO_THREAD_JOIN_TIMEOUT);
+    }
+
+    /// Send [`AudioCommand::Shutdown`] and wait up to `timeout` for the audio
+    /// thread to exit, then join it.
+    ///
+    /// Takes `&self` (not `self`) so it can be called through a shared
+    /// reference — the GUI keeps the pipeline in an `Rc` whose clones are
+    /// held by GLib timer sources that are still attached after
+    /// `app.run_with_args` returns, so no caller there ever has exclusive
+    /// ownership (see `app::shutdown_gui_session`).
+    ///
+    /// Returns `true` once the thread has actually exited and been joined —
+    /// which is also the guarantee that the active engine's `teardown()` has
+    /// run (releasing e.g. DPDFNet's ONNX Runtime `Session`) before this call
+    /// returns. Returns `false` if `timeout` elapses first: the handle is
+    /// then detached (dropped without joining) so this method never blocks
+    /// forever, and a warning is logged naming the timeout. The audio thread
+    /// keeps running in the background in that case; a stuck engine is a bug
+    /// to fix, not something to wait out.
+    ///
+    /// Idempotent: once the thread has been joined (by any call, or because
+    /// it already exited on its own), every subsequent call returns `true`
+    /// immediately without re-sending `Shutdown` or re-joining.
+    pub fn shutdown_and_join(&self, timeout: Duration) -> bool {
+        let mut guard = match self.thread_handle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if guard.is_none() {
+            // Already joined by an earlier call (or Drop running after
+            // `shutdown(self)` already did the work) — nothing to do.
+            return true;
+        }
+
         if self.cmd_tx.send(AudioCommand::Shutdown).is_err() {
-            log::error!("audio thread channel closed - Shutdown command dropped");
+            log::debug!("audio thread channel closed - already exited");
             self.channel_alive.store(false, Ordering::Release);
         }
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match guard.as_ref() {
+                Some(handle) if handle.is_finished() => break,
+                Some(_) => {}
+                None => return true,
+            }
+            if Instant::now() >= deadline {
+                log::warn!(
+                    "Audio thread did not stop within {:.1}s — shutdown continues without it",
+                    timeout.as_secs_f64()
+                );
+                // Detach: drop the handle without joining so this call never
+                // hangs. The thread keeps running in the background.
+                *guard = None;
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
         }
+
+        if let Some(handle) = guard.take() {
+            let join_start = Instant::now();
+            if let Err(e) = handle.join() {
+                log::error!("Audio thread panicked during shutdown: {:?}", e);
+            }
+            log::info!(
+                "Audio thread joined in {:.1} ms",
+                join_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        true
     }
 }
 
 impl Drop for AudioPipeline {
     fn drop(&mut self) {
-        // Send shutdown; if send fails the thread already exited.
-        if self.cmd_tx.send(AudioCommand::Shutdown).is_err() {
-            log::debug!("audio thread channel closed on drop - already exited");
-        }
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
-        }
+        self.shutdown_and_join(AUDIO_THREAD_JOIN_TIMEOUT);
     }
 }
 
@@ -1215,6 +1295,163 @@ mod tests {
         fn teardown(&mut self) {
             self.initialized = false;
         }
+    }
+
+    // -- shutdown_and_join ordering / bound (Task 2, debug session
+    // base-latency-330ms) --
+
+    /// Engine that records every `process()` call, and flags when
+    /// `teardown()` ran and when it was dropped — the fixture used by both
+    /// the ordering test and the idempotency test.
+    struct ProbeEngine {
+        processed: Arc<AtomicU64>,
+        torn_down: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl NoiseEngine for ProbeEngine {
+        fn init(&mut self, _sample_rate: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            output.copy_from_slice(input);
+            self.processed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn set_strength(&mut self, _strength: f32) {}
+        fn set_mode(&mut self, _mode: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {
+            self.torn_down.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for ProbeEngine {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn shutdown_and_join_releases_the_engine_before_it_returns() {
+        let processed = Arc::new(AtomicU64::new(0));
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let pipeline = AudioPipeline::new().unwrap();
+        pipeline.set_engine(Box::new(ProbeEngine {
+            processed: processed.clone(),
+            torn_down: torn_down.clone(),
+            dropped: dropped.clone(),
+        }));
+        pipeline.start();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while processed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            processed.load(Ordering::SeqCst) > 0,
+            "engine never processed a block before the timeout"
+        );
+
+        assert!(pipeline.shutdown_and_join(AUDIO_THREAD_JOIN_TIMEOUT));
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "engine was never torn down"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "engine was never dropped");
+
+        let count_at_return = processed.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            processed.load(Ordering::SeqCst),
+            count_at_return,
+            "processing continued after shutdown_and_join returned"
+        );
+    }
+
+    /// Engine whose `process()` spins on a release flag after signalling
+    /// entry, simulating a stuck engine.
+    struct StuckEngine {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl NoiseEngine for StuckEngine {
+        fn init(&mut self, _sample_rate: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            self.entered.store(true, Ordering::SeqCst);
+            let start = Instant::now();
+            while !self.release.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(10)
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _strength: f32) {}
+        fn set_mode(&mut self, _mode: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    #[test]
+    fn shutdown_and_join_is_bounded_when_the_audio_thread_is_stuck() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+
+        let pipeline = AudioPipeline::new().unwrap();
+        pipeline.set_engine(Box::new(StuckEngine {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        pipeline.start();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "engine never entered process() before the timeout"
+        );
+
+        let call_start = Instant::now();
+        let result = pipeline.shutdown_and_join(Duration::from_millis(200));
+        assert!(
+            !result,
+            "shutdown_and_join must report false when the thread is stuck"
+        );
+        assert!(
+            call_start.elapsed() < Duration::from_secs(1),
+            "shutdown_and_join did not bound itself to the timeout"
+        );
+
+        // Unstick the thread so it doesn't keep spinning into later tests.
+        release.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    #[test]
+    fn shutdown_and_join_is_idempotent() {
+        let pipeline = AudioPipeline::new().unwrap();
+
+        assert!(pipeline.shutdown_and_join(AUDIO_THREAD_JOIN_TIMEOUT));
+
+        let start = Instant::now();
+        assert!(pipeline.shutdown_and_join(AUDIO_THREAD_JOIN_TIMEOUT));
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "second call to an already-joined pipeline should return immediately"
+        );
+
+        // A following drop must also return immediately, not panic or hang.
+        drop(pipeline);
     }
 
     #[test]

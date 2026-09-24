@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::audio::{AudioPipeline, EngineFault, EngineFaultReport};
+use crate::audio::{AUDIO_THREAD_JOIN_TIMEOUT, AudioPipeline, EngineFault, EngineFaultReport};
 use crate::config::Config;
 use crate::engine::{self, EngineType};
 use crate::instance_lock;
@@ -459,9 +459,22 @@ pub mod errors {
 ///
 /// This function must complete within 2 seconds. It logs a warning if shutdown
 /// takes longer than expected.
+///
+/// The audio thread — and with it the active engine's `teardown()` — must be
+/// released (joined) here, before this function returns and the process can
+/// exit, because DPDFNet's ONNX Runtime tears down its own global statics at
+/// process exit: a still-inferring audio thread caught mid-teardown then logs
+/// ONNX Runtime errors into the void instead of shutting down cleanly (debug
+/// session `base-latency-330ms`). Takes `pipeline` by shared reference (not
+/// by value) so this same function serves both the headless owned-pipeline
+/// path and the GUI path, where every caller after `app.run_with_args`
+/// returns only ever holds shared `Rc` references — see
+/// [`shutdown_gui_session`]. The virtual mic (and the streams that feed it)
+/// is destroyed only after the audio thread has actually stopped, so nothing
+/// is still writing through the ring buffers when the streams go away.
 pub fn shutdown(
     config: &Config,
-    pipeline: Option<AudioPipeline>,
+    pipeline: Option<&AudioPipeline>,
     pw_manager: &mut PipeWireManager,
 ) -> Result<()> {
     let start = Instant::now();
@@ -474,10 +487,14 @@ pub fn shutdown(
         log::info!("Config saved");
     }
 
-    // 2. Stop audio pipeline (joins the audio thread).
+    // 2. Stop the audio pipeline: bounded join of the audio thread, which
+    // guarantees the active engine's teardown() has already run.
     if let Some(pipeline) = pipeline {
-        pipeline.shutdown();
-        log::info!("Audio pipeline stopped");
+        if pipeline.shutdown_and_join(AUDIO_THREAD_JOIN_TIMEOUT) {
+            log::info!("Audio pipeline stopped");
+        } else {
+            log::warn!("Audio thread did not stop in time during shutdown — continuing without it");
+        }
     }
 
     // 3. Destroy the virtual mic.
@@ -501,6 +518,36 @@ pub fn shutdown(
     }
 
     Ok(())
+}
+
+/// Run [`shutdown`] for a GUI session, after `app.run_with_args` returns.
+///
+/// The pipeline, config and PipeWire manager are shared (`Rc`) by that point:
+/// GLib timer sources registered during `run_with_gui` still hold their own
+/// clones, so dropping any one clone here never actually drops (and stops)
+/// the audio thread — that was the pre-fix bug (`base-latency-330ms`), where
+/// `drop(pipeline)` after `app.run_with_args` looked like it stopped
+/// everything but the Rc refcount was never actually 1. Calling `shutdown`
+/// explicitly, through shared references, is what actually stops the audio
+/// thread (and releases the engine) regardless of how many clones are still
+/// alive. This one call site covers every quit path (Ctrl+Q, menu Quit,
+/// no-tray window close, tray Quit, SIGTERM), which previously only called
+/// `app.quit()` directly (Ctrl+Q / menu / no-tray close) or duplicated a
+/// partial save-and-destroy inline (tray Quit, SIGTERM) — none of them ever
+/// stopped the audio thread.
+#[cfg(any(feature = "gui", test))]
+fn shutdown_gui_session(
+    config: &RefCell<Config>,
+    pipeline: &AudioPipeline,
+    pw_manager: &RefCell<PipeWireManager>,
+) {
+    if let Err(e) = shutdown(
+        &config.borrow(),
+        Some(pipeline),
+        &mut pw_manager.borrow_mut(),
+    ) {
+        log::error!("Shutdown failed: {}", e);
+    }
 }
 
 /// Apply the persisted settings to a freshly created engine before it is
@@ -1196,7 +1243,7 @@ fn run_headless(
     }
 
     log::info!("Shutdown signal received");
-    shutdown(&config, Some(pipeline), &mut pw_manager)?;
+    shutdown(&config, Some(&pipeline), &mut pw_manager)?;
     Ok(())
 }
 
@@ -1862,15 +1909,10 @@ fn run_with_gui(
                     sync_tray_state(&tray_state_timer, &tray_handle_timer, &cfg);
                 }
                 if is_quit && let Some(app) = app_weak.upgrade() {
-                    // Perform shutdown before quitting GTK.
-                    let cfg = config_timer.borrow();
-                    // We can't move pipeline out of Rc, so just save and destroy mic.
-                    if let Err(e) = cfg.save() {
-                        log::error!("Failed to save config: {}", e);
-                    }
-                    if let Err(e) = pw_timer.borrow_mut().destroy_virtual_mic() {
-                        log::error!("Failed to destroy virtual mic: {}", e);
-                    }
+                    // The single ordered shutdown_gui_session() call after
+                    // app.run_with_args() below covers this quit path (save,
+                    // bounded audio-thread join, virtual mic destroy) — this
+                    // branch only needs to end the GTK main loop.
                     app.quit();
                     return glib::ControlFlow::Break;
                 }
@@ -1927,13 +1969,9 @@ fn run_with_gui(
                         sync_tray_state(&tray_state_timer, &tray_handle_timer, &cfg);
                     }
                     if is_quit && let Some(app) = app_weak.upgrade() {
-                        let cfg = config_timer.borrow();
-                        if let Err(e) = cfg.save() {
-                            log::error!("Failed to save config: {}", e);
-                        }
-                        if let Err(e) = pw_timer.borrow_mut().destroy_virtual_mic() {
-                            log::error!("Failed to destroy virtual mic: {}", e);
-                        }
+                        // See the UiEvent::Quit branch above: the single
+                        // ordered shutdown_gui_session() call after
+                        // app.run_with_args() below covers this quit path.
                         app.quit();
                         return glib::ControlFlow::Break;
                     }
@@ -2021,17 +2059,13 @@ fn run_with_gui(
                 }
             }
 
-            // Check shutdown signal (from SIGTERM/SIGINT).
+            // Check shutdown signal (from SIGTERM/SIGINT). See the
+            // UiEvent::Quit branch above: the single ordered
+            // shutdown_gui_session() call after app.run_with_args() below
+            // covers this quit path too.
             if is_shutdown_requested()
                 && let Some(app) = app_weak.upgrade()
             {
-                let cfg = config_timer.borrow();
-                if let Err(e) = cfg.save() {
-                    log::error!("Failed to save config: {}", e);
-                }
-                if let Err(e) = pw_timer.borrow_mut().destroy_virtual_mic() {
-                    log::error!("Failed to destroy virtual mic: {}", e);
-                }
                 app.quit();
                 return glib::ControlFlow::Break;
             }
@@ -2399,8 +2433,18 @@ fn run_with_gui(
 
     log::info!("GTK application exited");
 
-    // Pipeline cleanup — drop triggers shutdown of audio thread.
-    // The Rc should have refcount 1 here since GTK closures are dropped.
+    // GLib timer sources (the 33 ms, 1500 ms and health timers) each hold
+    // their own Rc clone of `pipeline`/`config`/`pw_manager`, and dropping
+    // them here does not actually drop those clones' refcount to zero — so
+    // relying on `drop(pipeline)` alone to stop the audio thread was the
+    // pre-fix bug (base-latency-330ms): the audio thread, and the ORT
+    // Session inside a DPDFNet engine, kept running past process exit. Every
+    // quit path above only ends the GTK main loop; this single call is what
+    // actually saves config, bounds-joins the audio thread (releasing the
+    // engine) and destroys the virtual mic, regardless of how many Rc clones
+    // are still alive.
+    shutdown_gui_session(&config, &pipeline, &pw_manager);
+
     drop(pipeline);
     drop(pw_manager);
     drop(config);
@@ -2885,11 +2929,104 @@ mod tests {
         pipeline.start();
         std::thread::sleep(Duration::from_millis(20));
 
-        shutdown(&config, Some(pipeline), &mut pw).expect("shutdown should succeed");
+        shutdown(&config, Some(&pipeline), &mut pw).expect("shutdown should succeed");
         assert!(
             !pw.is_virtual_mic_active(),
             "virtual mic should be destroyed after shutdown"
         );
+    }
+
+    // ── shutdown / shutdown_gui_session release the engine (Task 2, debug
+    // session base-latency-330ms) ──────────────────────────────────────────
+
+    /// Engine that flags when `teardown()` ran and when it was dropped, used
+    /// by the two tests below to prove `shutdown`/`shutdown_gui_session`
+    /// actually release the engine (join the audio thread) before returning.
+    struct ShutdownProbeEngine {
+        torn_down: std::sync::Arc<AtomicBool>,
+        dropped: std::sync::Arc<AtomicBool>,
+    }
+
+    impl engine::NoiseEngine for ShutdownProbeEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _strength: f32) {}
+        fn set_mode(&mut self, _mode: crate::engine::ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {
+            self.torn_down.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for ShutdownProbeEngine {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// `shutdown()` must release the engine (bounded join of the audio
+    /// thread, which runs `teardown()`) before it returns.
+    #[test]
+    fn shutdown_releases_the_engine_before_it_returns() {
+        let torn_down = std::sync::Arc::new(AtomicBool::new(false));
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+
+        let config = Config::default();
+        let mut pw = PipeWireManager::offline();
+        let pipeline = AudioPipeline::new().unwrap();
+        pipeline.set_engine(Box::new(ShutdownProbeEngine {
+            torn_down: torn_down.clone(),
+            dropped: dropped.clone(),
+        }));
+        pipeline.start();
+        std::thread::sleep(Duration::from_millis(20));
+
+        shutdown(&config, Some(&pipeline), &mut pw).expect("shutdown should succeed");
+
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "engine was never torn down"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "engine was never dropped");
+    }
+
+    /// Regression for the observed bug: the pipeline lives in an `Rc` with an
+    /// extra clone kept alive for the whole test (standing in for the GLib
+    /// timer sources that still hold clones after `app.run_with_args`
+    /// returns). `shutdown_gui_session` must still release the engine —
+    /// dropping one `Rc` clone alone never stopped the audio thread.
+    #[test]
+    fn shutdown_gui_session_releases_the_engine_despite_outstanding_rc_clones() {
+        let torn_down = std::sync::Arc::new(AtomicBool::new(false));
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+
+        let config = RefCell::new(Config::default());
+        let pw_manager = RefCell::new(PipeWireManager::offline());
+        let pipeline = std::rc::Rc::new(AudioPipeline::new().unwrap());
+        pipeline.set_engine(Box::new(ShutdownProbeEngine {
+            torn_down: torn_down.clone(),
+            dropped: dropped.clone(),
+        }));
+        pipeline.start();
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Extra outstanding clone — never dropped in this test, standing in
+        // for a GLib timer source's clone.
+        let _outstanding_clone = pipeline.clone();
+
+        shutdown_gui_session(&config, &pipeline, &pw_manager);
+
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "engine was never torn down"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "engine was never dropped");
     }
 
     /// App orchestration: start pipeline, verify it started, shutdown, verify cleanup.
@@ -2915,7 +3052,7 @@ mod tests {
         );
 
         // Shutdown.
-        shutdown(&config, Some(pipeline), &mut pw).expect("shutdown should succeed");
+        shutdown(&config, Some(&pipeline), &mut pw).expect("shutdown should succeed");
         assert!(
             !pw.is_virtual_mic_active(),
             "Virtual mic should be gone after shutdown"
