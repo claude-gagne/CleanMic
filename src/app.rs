@@ -768,6 +768,17 @@ fn handle_tray_command(
                 current_capture_target,
             );
         }
+        TrayCommand::ToggleAutoGain => {
+            let new_state = !config.auto_gain_enabled;
+            handle_ui_event(
+                UiEvent::AutoGainToggled(new_state),
+                pipeline,
+                config,
+                pw_manager,
+                last_explicit,
+                current_capture_target,
+            );
+        }
         TrayCommand::OpenWindow => {
             log::info!("Open main window requested (not yet implemented in headless mode)");
         }
@@ -1167,13 +1178,14 @@ fn run_with_gui(
         use crate::tray::TrayState;
         use std::sync::{Arc, Mutex};
 
-        let state = TrayState::new(
+        let mut state = TrayState::new(
             config.enabled,
             config.engine,
             config.mode,
             config.monitor_enabled,
             engine::all_engine_availability(),
         );
+        state.set_auto_gain_enabled(config.auto_gain_enabled);
         Some(Arc::new(Mutex::new(state)))
     } else {
         None
@@ -1786,7 +1798,9 @@ fn run_with_gui(
                     let tray_needs_debounce = matches!(cmd, TrayCommand::SetEngine(_));
                     let tray_needs_immediate_save = matches!(
                         cmd,
-                        TrayCommand::Toggle | TrayCommand::ToggleMonitor
+                        TrayCommand::Toggle
+                            | TrayCommand::ToggleMonitor
+                            | TrayCommand::ToggleAutoGain
                     );
                     // Intercept CheckForUpdates before handle_tray_command (per D-02, D-04)
                     #[cfg(feature = "updater")]
@@ -2318,6 +2332,7 @@ fn sync_tray_state(
                 .set_engine(config.engine)
                 .set_mode(config.mode)
                 .set_monitor_enabled(config.monitor_enabled)
+                .set_auto_gain_enabled(config.auto_gain_enabled)
                 .set_update_available(crate::updater::update_available_for(
                     config.last_seen_update_version.as_deref(),
                     env!("CARGO_PKG_VERSION"),
@@ -2979,6 +2994,41 @@ mod tests {
             &current_capture_target_test,
         );
         assert!(config.enabled);
+
+        drop(pipeline);
+    }
+
+    /// handle_tray_command dispatches ToggleAutoGain correctly (quick task
+    /// 260923-x24).
+    #[test]
+    fn handle_tray_command_toggle_auto_gain() {
+        let pipeline = AudioPipeline::new().unwrap();
+        let mut config = Config::default();
+        let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
+
+        assert!(config.auto_gain_enabled, "default config starts ON");
+
+        handle_tray_command(
+            TrayCommand::ToggleAutoGain,
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
+        assert!(!config.auto_gain_enabled);
+
+        handle_tray_command(
+            TrayCommand::ToggleAutoGain,
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
+        assert!(config.auto_gain_enabled);
 
         drop(pipeline);
     }

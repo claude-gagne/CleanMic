@@ -13,13 +13,19 @@
 //!
 //! # Input level semantics
 //!
-//! The input meter shows the RMS of the post-DC-block capture signal — the
-//! same DC-free samples the active engine receives (see
-//! `crate::audio::LevelReport::input_rms`). Quiet mics (for example laptop
-//! DMICs, with speech around -40 dBFS) now truthfully sit near the
-//! [`DBFS_MIN`] floor instead of being inflated by an inaudible DC offset.
-//! Input auto-gain (raising a quiet mic's displayed/processed level) is a
-//! separate, not-yet-made owner decision and is out of scope here.
+//! The input meter shows the RMS of the post-DC-block, post-auto-gain
+//! capture signal — exactly the same conditioned samples the active engine
+//! receives (see `crate::audio::LevelReport::input_rms`). Quiet mics (for
+//! example laptop DMICs, with speech around -40 dBFS) truthfully sit near
+//! the [`DBFS_MIN`] floor before an inaudible DC offset would otherwise
+//! inflate them.
+//!
+//! With Automatic mic volume ON (the default, see `crate::dsp::AutoGain`), a
+//! quiet mic's speech rises toward a normal conferencing level after a few
+//! seconds of talking, so the meter is not a fixed function of the raw mic
+//! signal — it reflects the same speech-gated, boost-only leveling the
+//! engine sees. With it OFF, the meter shows the mic's own DC-free level,
+//! unboosted.
 
 /// Minimum display level in dBFS. Values below this are treated as silence.
 /// Set to -36 dBFS so typical USB mic self-noise (~-40 dBFS) falls below the

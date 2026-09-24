@@ -28,6 +28,9 @@ pub enum TrayCommand {
     SetEngine(EngineType),
     /// Toggle the monitor (listen-to-processed-mic) output.
     ToggleMonitor,
+    /// Toggle automatic mic volume (speech-gated input boost for too-quiet
+    /// mics — see [`crate::dsp::AutoGain`]). Quick task 260923-x24.
+    ToggleAutoGain,
     /// Bring the main window to the front (or show it if hidden).
     OpenWindow,
     /// Quit the application gracefully.
@@ -74,6 +77,11 @@ pub struct TrayState {
     pub mode: ProcessingMode,
     /// Whether the monitor output is enabled.
     pub monitor_enabled: bool,
+    /// Whether automatic mic volume (speech-gated input boost for too-quiet
+    /// mics) is enabled. Mirrors the Paramètres toggle (quick task
+    /// 260923-x24). `TrayState::new`'s signature is kept at 5 args for
+    /// compatibility; callers set this field via [`set_auto_gain_enabled`](Self::set_auto_gain_enabled).
+    pub auto_gain_enabled: bool,
     /// Independent per-engine availability/reason map (D-02/D-08),
     /// superseding the previous Khip-only `khip_available: bool` special
     /// case. Populated from [`crate::engine::all_engine_availability`].
@@ -96,6 +104,7 @@ impl Default for TrayState {
             engine: EngineType::DeepFilterNet,
             mode: ProcessingMode::Balanced,
             monitor_enabled: false,
+            auto_gain_enabled: true,
             availability: default_tray_availability(),
             audio_available: true,
             update_available: None,
@@ -117,6 +126,7 @@ impl TrayState {
             engine,
             mode,
             monitor_enabled,
+            auto_gain_enabled: true,
             availability,
             audio_available: true,
             update_available: None,
@@ -144,6 +154,13 @@ impl TrayState {
     /// Toggle the monitor flag and return `&mut self` for chaining.
     pub fn set_monitor_enabled(&mut self, enabled: bool) -> &mut Self {
         self.monitor_enabled = enabled;
+        self
+    }
+
+    /// Toggle the automatic-mic-volume flag and return `&mut self` for
+    /// chaining.
+    pub fn set_auto_gain_enabled(&mut self, enabled: bool) -> &mut Self {
+        self.auto_gain_enabled = enabled;
         self
     }
 
@@ -315,11 +332,27 @@ pub fn build_menu(state: &TrayState) -> Vec<MenuItem> {
         TrayCommand::ToggleMonitor,
     );
 
+    // ── Automatic mic volume ──────────────────────────────────────────────
+    // Reuses Task 2's msgid — the tray already mirrors the Paramètres
+    // Monitor toggle, so auto-gain is mirrored too (quick task 260923-x24).
+    let auto_gain_item = MenuItem::check(
+        gettext("Automatic mic volume"),
+        state.auto_gain_enabled,
+        state.audio_available,
+        TrayCommand::ToggleAutoGain,
+    );
+
     // ── Window + Quit ─────────────────────────────────────────────────────
     let open_item = MenuItem::action(gettext("Open CleanMic"), TrayCommand::OpenWindow);
     let quit_item = MenuItem::action(gettext("Quit"), TrayCommand::Quit);
 
-    let mut items = vec![toggle_item, engine_submenu, monitor_item, open_item];
+    let mut items = vec![
+        toggle_item,
+        engine_submenu,
+        monitor_item,
+        auto_gain_item,
+        open_item,
+    ];
 
     // Persistent update indicator — clicking opens Releases page (per 08.3 D-04).
     if let Some(ref version) = state.update_available {
@@ -711,6 +744,7 @@ mod tests {
             TrayCommand::SetEngine(EngineType::Dpdfnet8),
             TrayCommand::SetEngine(EngineType::Khip),
             TrayCommand::ToggleMonitor,
+            TrayCommand::ToggleAutoGain,
             TrayCommand::OpenWindow,
             TrayCommand::Quit,
             TrayCommand::OpenReleasesPage,
@@ -718,8 +752,9 @@ mod tests {
         // Just verify they can be constructed and compared.
         assert_eq!(cmds[0], TrayCommand::Toggle);
         assert_eq!(cmds[6], TrayCommand::ToggleMonitor);
-        assert_eq!(cmds[7], TrayCommand::OpenWindow);
-        assert_eq!(cmds[8], TrayCommand::Quit);
+        assert_eq!(cmds[7], TrayCommand::ToggleAutoGain);
+        assert_eq!(cmds[8], TrayCommand::OpenWindow);
+        assert_eq!(cmds[9], TrayCommand::Quit);
     }
 
     #[test]
@@ -736,9 +771,9 @@ mod tests {
         let state = TrayState::default();
         let menu = build_menu(&state);
 
-        // Expected order: toggle, engine submenu, monitor, open, check-for-updates,
-        // separator, quit.
-        assert_eq!(menu.len(), 7);
+        // Expected order: toggle, engine submenu, monitor, auto-gain, open,
+        // check-for-updates, separator, quit.
+        assert_eq!(menu.len(), 8);
 
         // Toggle item is a Check.
         assert!(matches!(menu[0], MenuItem::Check { .. }));
@@ -749,9 +784,18 @@ mod tests {
         // Monitor item.
         assert!(matches!(&menu[2], MenuItem::Check { .. }));
 
-        // Open window.
+        // Automatic mic volume item.
         assert!(matches!(
             &menu[3],
+            MenuItem::Check {
+                command: TrayCommand::ToggleAutoGain,
+                ..
+            }
+        ));
+
+        // Open window.
+        assert!(matches!(
+            &menu[4],
             MenuItem::Action {
                 command: TrayCommand::OpenWindow,
                 ..
@@ -760,7 +804,7 @@ mod tests {
 
         // Check for updates (always present).
         assert!(matches!(
-            &menu[4],
+            &menu[5],
             MenuItem::Action {
                 command: TrayCommand::CheckForUpdates,
                 ..
@@ -768,11 +812,11 @@ mod tests {
         ));
 
         // Separator.
-        assert!(matches!(menu[5], MenuItem::Separator));
+        assert!(matches!(menu[6], MenuItem::Separator));
 
         // Quit.
         assert!(matches!(
-            &menu[6],
+            &menu[7],
             MenuItem::Action {
                 command: TrayCommand::Quit,
                 ..
@@ -983,6 +1027,50 @@ mod tests {
     }
 
     #[test]
+    fn menu_auto_gain_toggle_reflects_state() {
+        let mut state = TrayState::default();
+        state.set_auto_gain_enabled(false);
+        let menu = build_menu(&state);
+
+        assert!(
+            matches!(
+                &menu[3],
+                MenuItem::Check {
+                    checked: false,
+                    command: TrayCommand::ToggleAutoGain,
+                    label,
+                    ..
+                } if label == "Automatic mic volume" // i18n-ignore
+            ),
+            "auto-gain item should be unchecked when disabled"
+        );
+
+        state.set_auto_gain_enabled(true);
+        let menu = build_menu(&state);
+        assert!(
+            matches!(
+                &menu[3],
+                MenuItem::Check {
+                    checked: true,
+                    command: TrayCommand::ToggleAutoGain,
+                    ..
+                }
+            ),
+            "auto-gain item should be checked when enabled"
+        );
+    }
+
+    #[test]
+    fn tray_state_set_auto_gain_enabled() {
+        let mut state = TrayState::default();
+        assert!(state.auto_gain_enabled, "TrayState::default starts ON");
+        state.set_auto_gain_enabled(false);
+        assert!(!state.auto_gain_enabled);
+        state.set_auto_gain_enabled(true);
+        assert!(state.auto_gain_enabled);
+    }
+
+    #[test]
     fn tray_command_set_engine_carries_type() {
         let cmd = TrayCommand::SetEngine(EngineType::Khip);
         assert_eq!(cmd, TrayCommand::SetEngine(EngineType::Khip));
@@ -994,8 +1082,8 @@ mod tests {
         let mut state = TrayState::default();
         state.set_update_available(Some("v1.2.0".to_owned()));
         let menu = build_menu(&state);
-        // update-indicator + check-for-updates = 2 extra items → total 8.
-        assert_eq!(menu.len(), 8);
+        // Base menu (8 items, including auto-gain) + the update indicator = 9.
+        assert_eq!(menu.len(), 9);
         // Verify update indicator label contains "v1.2.0" and binds to OpenReleasesPage
         // (per 08.3 D-04 — clicking the indicator opens the Releases page directly,
         // not re-runs the update check).
