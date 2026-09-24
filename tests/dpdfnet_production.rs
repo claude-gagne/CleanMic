@@ -32,7 +32,7 @@
 mod dpdfnet_production {
     use cleanmic::audio::AudioPipeline;
     use cleanmic::engine::dpdfnet::{DpdfnetEngine, DpdfnetVariant};
-    use cleanmic::engine::{self, EngineType, NoiseEngine};
+    use cleanmic::engine::{self, EngineType, NoiseEngine, ProcessingMode};
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -198,6 +198,19 @@ mod dpdfnet_production {
             );
             return;
         };
+        // The pinned reference renderer infers every hop -- it has no D-03
+        // decimation concept at all. Before quick-260923-v4q this test left
+        // the engine at its constructor-default `ProcessingMode::Balanced`
+        // (ratio 2, decimated), silently comparing a decimated-path output
+        // against an every-hop reference: it failed for dpdfnet8 at HEAD
+        // 0363956 (max|diff| 1.3e-3 > the 1e-3 OUTPUT_EPSILON) and passed for
+        // dpdfnet2 only because that fixture's output peak (8.4e-4) happens
+        // to sit under OUTPUT_EPSILON, not because the comparison was
+        // actually valid. Pinning MaxQuality here is the correct fix: this
+        // test is a golden-vector parity check against the always-infers
+        // reference, not a decimation regression test (that's covered by the
+        // in-module D-03 tests in `src/engine/dpdfnet.rs`).
+        engine.set_mode(ProcessingMode::MaxQuality);
 
         let samples = regenerate_fixture_samples(golden.fixture.sample_rate, golden.fixture.hops);
         assert_eq!(samples.len(), golden.hop_records.len() * HOP);
