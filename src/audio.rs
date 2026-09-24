@@ -14,6 +14,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 
+use crate::dsp::DcBlocker;
 use crate::engine::NoiseEngine;
 use crate::pipewire::monitor::MonitorOutput;
 use crate::pipewire::ringbuf::{RingBufReader, RingBufWriter};
@@ -23,6 +24,20 @@ const BUFFER_SIZE: usize = 480;
 
 /// Sample rate used throughout the pipeline.
 const SAMPLE_RATE: u32 = 48_000;
+
+/// Cutoff frequency for the input DC blocker ([`DcBlocker`]) that runs on
+/// every captured block before it reaches the engine and the input level
+/// meter.
+///
+/// Fixes a laptop DMIC ("Ryzen HD Audio Controller Digital Microphone")
+/// reported to carry ~0.109 FS of DC at typical software volume boost, which
+/// filled the input meter (reading about half full in a silent room) and was
+/// amplified into every suppression engine (DeepFilterNet's LADSPA plugin
+/// logged "Possible clipping detected"). 20 Hz settles a DC step to within
+/// 1e-3 of the step in ~55 ms (vs ~110 ms at 10 Hz), costs at most ~0.25 dB
+/// at 80 Hz (well inside the 0.5 dB passband budget down to 100 Hz), and
+/// removes sub-sonic rumble (fan/desk vibration) before the suppressors.
+const INPUT_DC_BLOCK_CUTOFF_HZ: f32 = 20.0;
 
 /// Duration of the crossfade window in samples (~10 ms at 48 kHz).
 const CROSSFADE_SAMPLES: usize = 480;
@@ -138,12 +153,8 @@ impl AudioPipeline {
         let heartbeat = Arc::new(AtomicU64::new(0));
         let heartbeat_thread = heartbeat.clone();
 
-        let thread_handle = thread::Builder::new()
-            .name("cleanmic-audio".into())
-            .spawn(move || {
-                audio_thread_main(cmd_rx, level_tx, None, None, heartbeat_thread);
-            })
-            .context("failed to spawn audio thread")?;
+        let thread_handle =
+            spawn_audio_thread(cmd_rx, level_tx, None, None, heartbeat_thread, true)?;
 
         Ok(Self {
             cmd_tx,
@@ -166,24 +177,46 @@ impl AudioPipeline {
         capture_reader: RingBufReader,
         output_writer: RingBufWriter,
     ) -> Result<Self> {
+        Self::with_ring_buffers_impl(capture_reader, output_writer, true)
+    }
+
+    /// Test-only constructor that skips input DC blocking on the real-capture
+    /// path.
+    ///
+    /// Production always filters (see [`with_ring_buffers`](Self::with_ring_buffers)).
+    /// This exists solely for the index-stamped latency/backlog harness
+    /// (`FakePipeWire`), whose capture samples are a ramp (`value = sample
+    /// index`): the DC blocker correctly turns a ramp into a near-constant,
+    /// which would defeat that harness's latency measurement. The latency
+    /// measurement itself is independent of input conditioning, so bypassing
+    /// the filter there does not weaken those regression tests.
+    #[cfg(test)]
+    pub(crate) fn with_ring_buffers_unfiltered(
+        capture_reader: RingBufReader,
+        output_writer: RingBufWriter,
+    ) -> Result<Self> {
+        Self::with_ring_buffers_impl(capture_reader, output_writer, false)
+    }
+
+    fn with_ring_buffers_impl(
+        capture_reader: RingBufReader,
+        output_writer: RingBufWriter,
+        filter_input_dc: bool,
+    ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let (level_tx, level_rx) = mpsc::channel::<LevelReport>();
         let channel_alive = Arc::new(AtomicBool::new(true));
         let heartbeat = Arc::new(AtomicU64::new(0));
         let heartbeat_thread = heartbeat.clone();
 
-        let thread_handle = thread::Builder::new()
-            .name("cleanmic-audio".into())
-            .spawn(move || {
-                audio_thread_main(
-                    cmd_rx,
-                    level_tx,
-                    Some(capture_reader),
-                    Some(output_writer),
-                    heartbeat_thread,
-                );
-            })
-            .context("failed to spawn audio thread")?;
+        let thread_handle = spawn_audio_thread(
+            cmd_rx,
+            level_tx,
+            Some(capture_reader),
+            Some(output_writer),
+            heartbeat_thread,
+            filter_input_dc,
+        )?;
 
         Ok(Self {
             cmd_tx,
@@ -358,6 +391,35 @@ impl Drop for AudioPipeline {
             let _ = handle.join();
         }
     }
+}
+
+/// Spawn the audio processing thread. Shared by [`AudioPipeline::new`],
+/// [`AudioPipeline::with_ring_buffers`] and the test-only
+/// `with_ring_buffers_unfiltered` constructor so the spawn body is not
+/// duplicated. `filter_input_dc` is always `true` in production; it is only
+/// `false` for the index-stamped latency/backlog test harness (see
+/// `with_ring_buffers_unfiltered`'s doc comment).
+fn spawn_audio_thread(
+    cmd_rx: mpsc::Receiver<AudioCommand>,
+    level_tx: mpsc::Sender<LevelReport>,
+    capture_reader: Option<RingBufReader>,
+    output_writer: Option<RingBufWriter>,
+    heartbeat: Arc<AtomicU64>,
+    filter_input_dc: bool,
+) -> Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("cleanmic-audio".into())
+        .spawn(move || {
+            audio_thread_main(
+                cmd_rx,
+                level_tx,
+                capture_reader,
+                output_writer,
+                heartbeat,
+                filter_input_dc,
+            );
+        })
+        .context("failed to spawn audio thread")
 }
 
 /// Process a single buffer through the engine (or passthrough).
@@ -548,6 +610,7 @@ fn audio_thread_main(
     capture_reader: Option<RingBufReader>,
     output_writer: Option<RingBufWriter>,
     heartbeat: Arc<AtomicU64>,
+    filter_input_dc: bool,
 ) {
     let mut running = false;
     let mut engine: Option<Box<dyn NoiseEngine>> = None;
@@ -567,6 +630,11 @@ fn audio_thread_main(
     let mut input_buf = vec![0.0f32; BUFFER_SIZE];
     let mut output_buf = vec![0.0f32; BUFFER_SIZE];
     let mut crossfade_old_buf = vec![0.0f32; BUFFER_SIZE];
+
+    // DC-blocks the real-capture path before the engine and the input level
+    // meter (see `INPUT_DC_BLOCK_CUTOFF_HZ`). `filter_input_dc` is only
+    // `false` for the index-stamped latency/backlog test harness.
+    let mut input_dc_block = DcBlocker::new(INPUT_DC_BLOCK_CUTOFF_HZ, SAMPLE_RATE);
 
     let tick_duration = std::time::Duration::from_secs_f64(BUFFER_SIZE as f64 / SAMPLE_RATE as f64);
 
@@ -678,6 +746,15 @@ fn audio_thread_main(
                     let read = reader.read(&mut input_buf);
                     for s in &mut input_buf[read..] {
                         *s = 0.0;
+                    }
+
+                    // DC-block the finalized block before it reaches the
+                    // engine (passthrough, crossfade, or panic fallback all
+                    // read `input_buf` below) and before the input-level
+                    // accumulation, so every path and the meter share the
+                    // same DC-free samples.
+                    if filter_input_dc {
+                        input_dc_block.process_in_place(&mut input_buf);
                     }
 
                     let process_result =
@@ -1645,7 +1722,9 @@ mod tests {
     fn first_start_discards_capture_queued_during_startup() {
         let (cw, cr) = ring_buffer(65_536);
         let (ow, or_) = ring_buffer(65_536);
-        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        // Index stamps are a ramp, which the DC blocker correctly removes;
+        // the latency measurement is independent of input conditioning.
+        let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
         let pw = FakePipeWire::start(cw, or_);
         thread::sleep(Duration::from_millis(150)); // streaming, not started
         pipeline.start();
@@ -1667,7 +1746,9 @@ mod tests {
     fn restart_after_short_stop_does_not_replay_stale_capture() {
         let (cw, cr) = ring_buffer(65_536);
         let (ow, or_) = ring_buffer(65_536);
-        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        // Index stamps are a ramp, which the DC blocker correctly removes;
+        // the latency measurement is independent of input conditioning.
+        let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
         let pw = FakePipeWire::start(cw, or_);
         pipeline.start();
         thread::sleep(Duration::from_millis(300));
@@ -1693,7 +1774,9 @@ mod tests {
         // 16384-slot ring (341 ms) keeps the test short; production is 65536.
         let (cw, cr) = ring_buffer(16_384);
         let (ow, or_) = ring_buffer(16_384);
-        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        // Index stamps are a ramp, which the DC blocker correctly removes;
+        // the latency measurement is independent of input conditioning.
+        let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
         let pw = FakePipeWire::start(cw, or_);
         pipeline.start();
         thread::sleep(Duration::from_millis(300));
@@ -1725,7 +1808,9 @@ mod tests {
     fn engine_stall_backlog_is_shed_not_kept_forever() {
         let (cw, cr) = ring_buffer(65_536);
         let (ow, or_) = ring_buffer(65_536);
-        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        // Index stamps are a ramp, which the DC blocker correctly removes;
+        // the latency measurement is independent of input conditioning.
+        let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
         let pw = FakePipeWire::start(cw, or_);
         pipeline.start();
         thread::sleep(Duration::from_millis(300));
@@ -1762,7 +1847,9 @@ mod tests {
     fn slower_than_realtime_engine_keeps_latency_bounded_and_thread_responsive() {
         let (cw, cr) = ring_buffer(65_536);
         let (ow, or_) = ring_buffer(65_536);
-        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        // Index stamps are a ramp, which the DC blocker correctly removes;
+        // the latency measurement is independent of input conditioning.
+        let pipeline = AudioPipeline::with_ring_buffers_unfiltered(cr, ow).unwrap();
         let pw = FakePipeWire::start(cw, or_);
         let slow = Arc::new(AtomicBool::new(true));
         pipeline.set_engine(Box::new(SlowEngine {
@@ -1794,6 +1881,213 @@ mod tests {
             worst < 300.0,
             "latency reached {worst:.1} ms after ~2.3 s with an RTF 1.25 engine: \
              the capture backlog is unbounded"
+        );
+    }
+
+    // --- Input DC blocker end-to-end harness -------------------------------
+    //
+    // Regression coverage for the laptop DMIC DC-offset fix (quick task
+    // 260923-voj): a paced feeder plays a DC + 1 kHz tone into the capture
+    // ring at real-time cadence, deliberately separate from `FakePipeWire`
+    // (whose index-stamped ramp the DC blocker would flatten). The engine
+    // sees the filtered input via a probe, and the output ring is drained
+    // the same way the live output callback does (`BacklogLimiter::read_padded`).
+
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU32;
+
+    /// Feeds `dc + 0.01*sin(2*pi*1000*n/48000)` into a capture ring at
+    /// real-time cadence (one `PW_QUANTUM` every ~21.3 ms), like the real
+    /// PipeWire capture callback. `dc` is held in a shared atomic so tests can
+    /// change it mid-run (device retarget / reconnect scenarios).
+    struct PacedDcToneFeeder {
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl PacedDcToneFeeder {
+        fn start(capture_writer: RingBufWriter, initial_dc: f32) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let dc_bits = Arc::new(AtomicU32::new(initial_dc.to_bits()));
+            let (stop_t, dc_t) = (stop.clone(), dc_bits);
+            let handle = thread::spawn(move || {
+                let period = Duration::from_secs_f64(PW_QUANTUM as f64 / f64::from(SAMPLE_RATE));
+                let mut n: u64 = 0;
+                let mut buf = vec![0.0f32; PW_QUANTUM];
+                let mut next = Instant::now();
+                while !stop_t.load(Ordering::Acquire) {
+                    let dc = f32::from_bits(dc_t.load(Ordering::Acquire));
+                    for s in buf.iter_mut() {
+                        let phase =
+                            2.0 * std::f64::consts::PI * 1000.0 * n as f64 / f64::from(SAMPLE_RATE);
+                        *s = dc + 0.01 * phase.sin() as f32;
+                        n += 1;
+                    }
+                    capture_writer.write(&buf);
+                    next += period;
+                    if let Some(d) = next.checked_duration_since(Instant::now()) {
+                        thread::sleep(d);
+                    }
+                }
+            });
+            Self {
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for PacedDcToneFeeder {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Drains an output (or monitor) ring the same way the live PipeWire
+    /// callback does — through `BacklogLimiter::read_padded` — and accumulates
+    /// every sample into a shared `Vec` for later inspection.
+    struct OutputDrain {
+        stop: Arc<AtomicBool>,
+        samples: Arc<Mutex<Vec<f32>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl OutputDrain {
+        fn start(output_reader: RingBufReader) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let samples = Arc::new(Mutex::new(Vec::new()));
+            let (stop_t, samples_t) = (stop.clone(), samples.clone());
+            let handle = thread::spawn(move || {
+                let period = Duration::from_secs_f64(PW_QUANTUM as f64 / f64::from(SAMPLE_RATE));
+                let mut limiter = BacklogLimiter::new();
+                let mut buf = vec![0.0f32; PW_QUANTUM];
+                let mut next = Instant::now();
+                while !stop_t.load(Ordering::Acquire) {
+                    limiter.read_padded(&output_reader, &mut buf);
+                    samples_t.lock().unwrap().extend_from_slice(&buf);
+                    next += period;
+                    if let Some(d) = next.checked_duration_since(Instant::now()) {
+                        thread::sleep(d);
+                    }
+                }
+            });
+            Self {
+                stop,
+                samples,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for OutputDrain {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Records the running sum/count of the input it receives (skipping the
+    /// first `skip_remaining` samples of settling time), then copies input to
+    /// output unchanged. Used as the "engine-input probe" for the DC-blocker
+    /// e2e tests.
+    struct InputProbeEngine {
+        stats: Arc<Mutex<(f64, usize)>>,
+        skip_remaining: usize,
+    }
+
+    impl NoiseEngine for InputProbeEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            let skip = self.skip_remaining.min(input.len());
+            if skip < input.len() {
+                let mut s = self.stats.lock().unwrap();
+                for &x in &input[skip..] {
+                    s.0 += f64::from(x);
+                }
+                s.1 += input.len() - skip;
+            }
+            self.skip_remaining -= skip;
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _: f32) {}
+        fn set_mode(&mut self, _: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    /// 100 ms of settling time (matches the DC blocker's settling bound) to
+    /// skip before accumulating engine-input statistics.
+    const PROBE_SETTLE_SAMPLES: usize = SAMPLE_RATE as usize / 10;
+
+    /// End-to-end: a laptop-DMIC-like 0.109 DC + 1 kHz 0.01-amplitude tone,
+    /// fed through the production (filtered) constructor. The engine, the
+    /// output ring, and `poll_levels().input_rms` must all show the DC-free
+    /// signal. Pre-fix, `input_rms` climbs toward ~0.109.
+    #[test]
+    fn dc_offset_is_removed_before_engine_and_input_meter() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+
+        let stats: Arc<Mutex<(f64, usize)>> = Arc::new(Mutex::new((0.0, 0)));
+        pipeline.set_engine(Box::new(InputProbeEngine {
+            stats: stats.clone(),
+            skip_remaining: PROBE_SETTLE_SAMPLES,
+        }));
+
+        // Start before feeding: the Start-edge fix discards capture queued
+        // while stopped, so the very first fed samples are the ones measured.
+        pipeline.start();
+        let feeder = PacedDcToneFeeder::start(cw, 0.109);
+        let drain = OutputDrain::start(or_);
+        let drain_samples = drain.samples.clone();
+
+        thread::sleep(Duration::from_millis(600));
+
+        let level = pipeline.poll_levels();
+
+        drop(feeder);
+        drop(drain);
+        pipeline.shutdown();
+
+        // Engine-input probe.
+        let (sum, count) = *stats.lock().unwrap();
+        assert!(count > 0, "engine never received any (post-settling) input");
+        let engine_mean = sum / count as f64;
+        assert!(
+            engine_mean.abs() < 1e-3,
+            "engine-input mean = {engine_mean}, expected near 0 (DC removed before the engine)"
+        );
+
+        // Output ring, excluding the first 100 ms (4800 samples).
+        let out = drain_samples.lock().unwrap();
+        assert!(
+            out.len() > PROBE_SETTLE_SAMPLES,
+            "not enough output samples captured: {}",
+            out.len()
+        );
+        let tail = &out[PROBE_SETTLE_SAMPLES..];
+        let out_mean = tail.iter().map(|&s| f64::from(s)).sum::<f64>() / tail.len() as f64;
+        assert!(
+            out_mean.abs() < 1e-3,
+            "output mean (after 100ms) = {out_mean}, expected near 0"
+        );
+
+        // Input meter.
+        let level = level.expect("should have received at least one level report");
+        assert!(
+            level.input_rms < 0.03,
+            "input_rms = {}, expected < 0.03 (pre-fix it climbs toward ~0.109)",
+            level.input_rms
         );
     }
 }
