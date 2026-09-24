@@ -319,9 +319,9 @@ fn route_available(entries: &[serde_json::Value], node_props: &serde_json::Value
             })
             .collect();
         if !matching.is_empty() {
-            return matching.iter().any(|r| {
-                r.get("available").and_then(|v| v.as_str()) != Some("no")
-            });
+            return matching
+                .iter()
+                .any(|r| r.get("available").and_then(|v| v.as_str()) != Some("no"));
         }
     }
 
@@ -333,19 +333,16 @@ fn route_available(entries: &[serde_json::Value], node_props: &serde_json::Value
                 r.get("direction").and_then(|v| v.as_str()) == Some("Input")
                     && r.get("devices")
                         .and_then(|v| v.as_array())
-                        .map(|devs| {
-                            devs.iter()
-                                .any(|d| d.as_u64() == Some(card_profile_device))
-                        })
+                        .map(|devs| devs.iter().any(|d| d.as_u64() == Some(card_profile_device)))
                         .unwrap_or(false)
             })
             .collect();
         if matching.is_empty() {
             return true;
         }
-        return matching.iter().any(|r| {
-            r.get("available").and_then(|v| v.as_str()) != Some("no")
-        });
+        return matching
+            .iter()
+            .any(|r| r.get("available").and_then(|v| v.as_str()) != Some("no"));
     }
 
     // No route information at all — fail open.
@@ -379,7 +376,9 @@ pub fn picker_devices(
     let mut kept: Vec<InputDevice> = devices
         .iter()
         .filter(|d| {
-            d.available || Some(d.name.as_str()) == pinned || Some(d.name.as_str()) == system_default
+            d.available
+                || Some(d.name.as_str()) == pinned
+                || Some(d.name.as_str()) == system_default
         })
         .cloned()
         .collect();
@@ -680,7 +679,10 @@ mod tests {
         ];
         let devices = parse_pw_dump(&entries);
         assert_eq!(devices.len(), 1);
-        assert!(!devices[0].available, "active Route 'no' must win over EnumRoute 'unknown'");
+        assert!(
+            !devices[0].available,
+            "active Route 'no' must win over EnumRoute 'unknown'"
+        );
     }
 
     #[test]
