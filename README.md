@@ -158,6 +158,25 @@ make build
 make appimage
 ```
 
+### Testing
+
+- `make test` — the Rust unit/integration test suite (`cargo test --all-features`).
+- `make harness-test` — offline checks for the silent E2E test harness itself
+  (shell syntax, a sandboxed self-test of the screen/scale/owner-process
+  guards, and the Python metric/report unit tests). No X server, no
+  PipeWire, no network.
+- `make e2e-audio` — a real, **silent** end-to-end audio test: a nested
+  Xephyr display plus a virtual test microphone (no sound reaches your
+  speakers, and it never touches your real CleanMic or its config). Runs the
+  `baseline` scenario by default; pass `SCENARIOS="baseline swaps toggle
+  modes dc autogain"` (or `all`) for the full suite. Writes a Markdown
+  report to `target/e2e-audio/<timestamp>/report.md`.
+- `make nested-run` / `make nested-stop` — start/stop the same nested
+  CleanMic session by hand, for manual poking.
+
+See `scripts/e2e/README.md` for the full safety model, scenario list,
+thresholds, and exit codes.
+
 ## Support
 
 CleanMic is built in the hours around a day job. If it helps you out, you can [buy me a coffee](https://buymeacoffee.com/claudegagne) to help keep it maintained.
