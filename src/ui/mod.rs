@@ -20,6 +20,10 @@ pub mod status;
 #[cfg(feature = "gui")]
 pub mod window;
 
+/// Shared GTK thread so any number of unit tests can construct real widgets.
+#[cfg(all(test, feature = "gui"))]
+pub(crate) mod gtk_test;
+
 pub mod meters;
 pub mod welcome;
 

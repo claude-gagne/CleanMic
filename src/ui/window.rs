@@ -805,25 +805,48 @@ fn build_device_row(state: &UiState) -> ComboRow {
     let row = ComboRow::new();
     row.set_title(&tr!("Microphone"));
 
-    let model = build_device_model(
-        &state.available_devices,
-        state.system_default_name.as_deref(),
-        state.input_device.as_deref(),
-    );
-
-    let list = gtk4::StringList::new(&model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    row.set_model(Some(&list));
-    row.set_selected(model.selected_idx);
-    row.set_sensitive(!model.no_input);
-
     // OWNER-LOCK: device names must never be truncated or ellipsized —
     // start, middle, or end — anywhere in the picker. See
     // `apply_no_truncation`'s doc for why the device row uses
     // `CollapsedValue::Subtitle` (45-57-char device names cannot fit beside
     // the title) while Mode/Strength use `CollapsedValue::Suffix`.
+    //
+    // MUST run before the model is installed below: libadwaita writes the
+    // `use-subtitle` subtitle only when the selection changes, so enabling
+    // it afterwards left the row blank on first paint (debug session
+    // mic-row-blank-single-device).
     apply_no_truncation(&row, CollapsedValue::Subtitle);
 
+    let model = build_device_model(
+        &state.available_devices,
+        state.system_default_name.as_deref(),
+        state.input_device.as_deref(),
+    );
+    install_device_model(&row, &model);
+
     row
+}
+
+/// Install a computed [`DevicePickerModel`] on the device picker row.
+///
+/// The single code path for both the initial build ([`build_device_row`])
+/// and every runtime refresh ([`WindowHandles::update_device_list`]), so the
+/// first paint can never diverge from a refresh again. `row` must already
+/// have `apply_no_truncation(CollapsedValue::Subtitle)` applied: the
+/// `set_model`/`set_selected` below are what make libadwaita write the
+/// selected entry's full name into the row's subtitle.
+///
+/// With a single entry libadwaita deliberately hides the row's arrow and
+/// makes it non-activatable (there is nothing to choose); the name is still
+/// shown. With 2+ entries the row is openable.
+///
+/// Does not touch the `device_updating` guard or `device_targets` — callers
+/// own those.
+fn install_device_model(row: &ComboRow, model: &DevicePickerModel) {
+    let list = gtk4::StringList::new(&model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    row.set_model(Some(&list));
+    row.set_selected(model.selected_idx);
+    row.set_sensitive(!model.no_input);
 }
 
 /// Where a [`full_name_factory`]'s label is rendered: in the popup list, or
@@ -1012,6 +1035,13 @@ enum CollapsedValue {
 /// (D-04/15.2-02): `use-subtitle` there would silently delete that hint on
 /// every selection. Mode and Strength therefore use
 /// [`CollapsedValue::Suffix`], which leaves the row's own subtitle alone.
+///
+/// Ordering contract for [`CollapsedValue::Subtitle`]: call this BEFORE the
+/// row's model is installed. libadwaita writes the `use-subtitle` subtitle
+/// only from its selection-changed handler — turning `use-subtitle` on for a
+/// row whose model and selection already exist leaves the subtitle blank
+/// until the selection next changes (debug session
+/// mic-row-blank-single-device). Debug builds assert this.
 fn apply_no_truncation(row: &ComboRow, collapsed: CollapsedValue) {
     // T-voj-05 (parity with T-tua-01): translated selector values always
     // render as plain text, never interpreted as Pango markup.
@@ -1019,6 +1049,10 @@ fn apply_no_truncation(row: &ComboRow, collapsed: CollapsedValue) {
 
     match collapsed {
         CollapsedValue::Subtitle => {
+            debug_assert!(
+                row.model().is_none(),
+                "apply_no_truncation(Subtitle) must run before the row's model is installed"
+            );
             row.set_use_subtitle(true);
             row.set_subtitle_lines(0);
         }
@@ -1371,22 +1405,19 @@ impl WindowHandles {
         system_default_name: Option<&str>,
     ) {
         let model = build_device_model(devices, system_default_name, current_device);
-        let list =
-            gtk4::StringList::new(&model.strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
         // G-05: guard the selected-item-notify handler so the programmatic
-        // set_model / set_selected calls below don't emit a spurious
-        // UiEvent::DeviceChanged. Resetting to false after both calls complete
-        // ensures user clicks captured after this update still fire normally.
+        // set_model / set_selected calls inside `install_device_model` don't
+        // emit a spurious UiEvent::DeviceChanged. Resetting to false after
+        // they complete ensures user clicks captured after this update still
+        // fire normally.
         self.device_updating.set(true);
         // Assign the new targets in their own statement so the RefCell
         // borrow is released before set_model/set_selected run (both may
         // synchronously fire selected-item-notify, whose handler also
         // borrows `device_targets`).
-        *self.device_targets.borrow_mut() = model.targets;
-        self.device_row.set_model(Some(&list));
-        self.device_row.set_selected(model.selected_idx);
+        *self.device_targets.borrow_mut() = model.targets.clone();
+        install_device_model(&self.device_row, &model);
         self.device_updating.set(false);
-        self.device_row.set_sensitive(!model.no_input);
     }
 
     /// Control the "input available" UI state for D-10.
@@ -1426,14 +1457,14 @@ pub fn device_display_name<'a>(node: &'a str, devices: &'a [DeviceInfo]) -> &'a 
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
-// GTK only permits initialization from a single OS thread ever, and this
-// crate's test binary already spends its one allowed `gtk4::init()` call in
-// `app::tests::quit_and_report_issue_actions_are_registered` (see
-// `src/ui/meters.rs`'s own documented precedent for why a second
-// GTK-widget-constructing test is not added here). Every test below is a
-// pure/helper test exercising the plain-data decision logic that the real
-// `connect_toggled`/`connect_selected_notify` closures delegate to — no
-// `ActionRow`/`CheckButton`/`ComboRow` is constructed.
+// GTK only permits initialization from a single OS thread ever, while `cargo
+// test` runs each `#[test]` on its own thread. Most tests below are therefore
+// pure/helper tests exercising the plain-data decision logic that the real
+// `connect_toggled`/`connect_selected_notify` closures delegate to. Tests that
+// must inspect a REAL widget (the device-row section) go through
+// `crate::ui::gtk_test::run`, which executes them on the crate's one shared
+// GTK thread and skips cleanly when no display server is available. Never
+// call `gtk4::init()` directly from a test.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,6 +1575,223 @@ mod tests {
         assert_eq!(model.strings, vec![tr!("No input device available")]);
         assert_eq!(model.targets, vec![PickerTarget::NoInput]);
         assert!(model.no_input);
+    }
+
+    // ── Device picker scenarios (debug session mic-row-blank-single-device) ─
+    //
+    // The session's "also verify" matrix: 1 device, 2+ devices, default =
+    // CleanMic's own virtual source (self-loop), default = None, the saved
+    // device unplugged (still enumerated) and the saved device gone (no
+    // longer enumerated). Each `devices` list is the post-`picker_devices`
+    // list the window actually receives.
+
+    fn mic(name: &str, description: &str, available: bool) -> DeviceInfo {
+        DeviceInfo {
+            name: name.into(),
+            description: description.into(),
+            available,
+        }
+    }
+
+    struct PickerScenario {
+        label: &'static str,
+        devices: Vec<DeviceInfo>,
+        system_default: Option<&'static str>,
+        pinned: Option<&'static str>,
+        /// The full, untruncated string the collapsed row must show.
+        expected_shown: String,
+        /// Number of entries in the popup list.
+        expected_len: usize,
+    }
+
+    fn picker_scenarios() -> Vec<PickerScenario> {
+        let internal = || mic("internal.mic", "internal mic", true);
+        let headset = || mic("bt.headset", "bt headset", true);
+        vec![
+            PickerScenario {
+                // The environment that exposed the bug: one visible mic, and
+                // the OS default is CleanMic itself. `current_system_default_name`
+                // already filters that to None upstream; passing the raw
+                // name here also proves the window can never turn it into a
+                // Default entry or a pickable target.
+                label: "one device, os default is cleanmic (self-loop)",
+                devices: vec![internal()],
+                system_default: Some(crate::pipewire::NODE_NAME),
+                pinned: Some("internal.mic"),
+                expected_shown: "internal mic".into(),
+                expected_len: 1,
+            },
+            PickerScenario {
+                label: "one device, no default, following default",
+                devices: vec![internal()],
+                system_default: None,
+                pinned: None,
+                expected_shown: "internal mic".into(),
+                expected_len: 1,
+            },
+            PickerScenario {
+                label: "two devices, second pinned, no default",
+                devices: vec![internal(), headset()],
+                system_default: None,
+                pinned: Some("bt.headset"),
+                expected_shown: "bt headset".into(),
+                expected_len: 2,
+            },
+            PickerScenario {
+                label: "two devices, following a resolvable default",
+                devices: vec![internal(), headset()],
+                system_default: Some("internal.mic"),
+                pinned: None,
+                expected_shown: format!("{} ({})", tr!("Default"), "internal mic"),
+                expected_len: 3,
+            },
+            PickerScenario {
+                label: "saved device unplugged but still enumerated",
+                devices: vec![internal(), mic("jack.mic", "jack mic", false)],
+                system_default: None,
+                pinned: Some("jack.mic"),
+                expected_shown: format!("jack mic ({})", tr!("unplugged")),
+                expected_len: 2,
+            },
+            PickerScenario {
+                label: "saved device gone from enumeration",
+                devices: vec![internal()],
+                system_default: None,
+                pinned: Some("gone.mic"),
+                expected_shown: "internal mic".into(),
+                expected_len: 1,
+            },
+            PickerScenario {
+                label: "no input device at all",
+                devices: vec![],
+                system_default: None,
+                pinned: None,
+                expected_shown: tr!("No input device available"),
+                expected_len: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn device_picker_scenarios_select_the_expected_full_name() {
+        for sc in picker_scenarios() {
+            let model = build_device_model(&sc.devices, sc.system_default, sc.pinned);
+            assert_eq!(model.strings.len(), sc.expected_len, "{}", sc.label);
+            assert_eq!(model.targets.len(), model.strings.len(), "{}", sc.label);
+            let shown = model
+                .strings
+                .get(model.selected_idx as usize)
+                .unwrap_or_else(|| panic!("{}: selected_idx out of range", sc.label));
+            assert_eq!(shown, &sc.expected_shown, "{}", sc.label);
+            // Self-loop guard: CleanMic's own virtual source is never offered.
+            assert!(
+                !model
+                    .targets
+                    .contains(&PickerTarget::Device(crate::pipewire::NODE_NAME.into())),
+                "{}",
+                sc.label
+            );
+        }
+    }
+
+    /// What a device `ComboRow` actually displays, read back on the GTK thread.
+    #[derive(Debug)]
+    struct DeviceRowView {
+        subtitle: String,
+        n_items: u32,
+        activatable: bool,
+        sensitive: bool,
+    }
+
+    fn device_row_view(row: &ComboRow) -> DeviceRowView {
+        DeviceRowView {
+            subtitle: row.subtitle().map(|s| s.to_string()).unwrap_or_default(),
+            n_items: row.model().map(|m| m.n_items()).unwrap_or(0),
+            activatable: row.is_activatable(),
+            sensitive: row.is_sensitive(),
+        }
+    }
+
+    fn scenario_state(sc: &PickerScenario) -> UiState {
+        let mut state = UiState::from_config(&Config::default());
+        state.available_devices = sc.devices.clone();
+        state.system_default_name = sc.system_default.map(Into::into);
+        state.input_device = sc.pinned.map(Into::into);
+        state
+    }
+
+    /// Regression (debug session mic-row-blank-single-device): the collapsed
+    /// Microphone row must show the selected entry's full name on FIRST
+    /// paint, in every scenario. libadwaita writes the `use-subtitle`
+    /// subtitle only on a selection change, so enabling it after the model
+    /// was installed left the row blank until an unrelated refresh — and
+    /// the 1500 ms timer never refreshes a stable environment. The row must
+    /// also be openable whenever there is anything to choose (2+ entries).
+    #[test]
+    fn device_row_shows_selected_full_name_on_first_paint() {
+        let ran = crate::ui::gtk_test::run(|| {
+            for sc in picker_scenarios() {
+                let row = build_device_row(&scenario_state(&sc));
+                let view = device_row_view(&row);
+                assert_eq!(
+                    view.subtitle, sc.expected_shown,
+                    "{}: collapsed row must show the selected full name ({view:?})",
+                    sc.label
+                );
+                assert_eq!(view.n_items as usize, sc.expected_len, "{}", sc.label);
+                if sc.expected_len >= 2 {
+                    assert!(
+                        view.activatable,
+                        "{}: row must be openable when there is a choice",
+                        sc.label
+                    );
+                }
+                assert_eq!(view.sensitive, !sc.devices.is_empty(), "{}", sc.label);
+            }
+        });
+        if ran.is_none() {
+            eprintln!("skipped: no display server for GTK");
+        }
+    }
+
+    /// The refresh path (`update_device_list` -> `install_device_model`)
+    /// keeps the selected full name visible through device-count changes:
+    /// 1 device -> 2 (e.g. a Bluetooth headset connects: the row becomes
+    /// openable) -> back to 1 (it disconnects: the row falls back to the
+    /// remaining mic) -> no device at all (D-10 placeholder, insensitive).
+    #[test]
+    fn device_row_refresh_keeps_selected_full_name_across_device_count_changes() {
+        let ran = crate::ui::gtk_test::run(|| {
+            let one = vec![mic("internal.mic", "internal mic", true)];
+            let two = vec![
+                mic("internal.mic", "internal mic", true),
+                mic("bt.headset", "bt headset", true),
+            ];
+            let mut state = UiState::from_config(&Config::default());
+            state.available_devices = one.clone();
+            state.input_device = Some("internal.mic".into());
+            let row = build_device_row(&state);
+            assert_eq!(device_row_view(&row).subtitle, "internal mic");
+
+            install_device_model(&row, &build_device_model(&two, None, Some("bt.headset")));
+            let view = device_row_view(&row);
+            assert_eq!(view.subtitle, "bt headset", "{view:?}");
+            assert_eq!(view.n_items, 2);
+            assert!(view.activatable, "two entries must be openable: {view:?}");
+
+            install_device_model(&row, &build_device_model(&one, None, Some("bt.headset")));
+            let view = device_row_view(&row);
+            assert_eq!(view.subtitle, "internal mic", "{view:?}");
+            assert!(view.sensitive);
+
+            install_device_model(&row, &build_device_model(&[], None, None));
+            let view = device_row_view(&row);
+            assert_eq!(view.subtitle, tr!("No input device available"));
+            assert!(!view.sensitive);
+        });
+        if ran.is_none() {
+            eprintln!("skipped: no display server for GTK");
+        }
     }
 
     #[test]

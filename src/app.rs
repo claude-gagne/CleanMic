@@ -81,10 +81,7 @@ fn resolve_runtime_capture_target(
 /// Used by both the runtime resolver wrapper and the 1500ms polling timer.
 fn current_system_default_name(pw: &PipeWireManager, devices: &[InputDevice]) -> Option<String> {
     let raw = pw.configured_default_source();
-    let resolved = raw
-        .as_ref()
-        .filter(|name| devices.iter().any(|d| &d.name == *name))
-        .cloned();
+    let resolved = resolve_system_default(raw.as_deref(), devices);
     log::debug!(
         "current_system_default_name: pw-metadata raw={:?} -> resolved={:?} (devices={})",
         raw,
@@ -92,6 +89,16 @@ fn current_system_default_name(pw: &PipeWireManager, devices: &[InputDevice]) ->
         devices.len()
     );
     resolved
+}
+
+/// Pure half of [`current_system_default_name`]: keep the raw OS default
+/// only when it names an enumerated (hence non-CleanMic) device. When the
+/// OS default is CleanMic's own virtual source this returns `None`, so it can
+/// never become a capture target or the picker's "Default (…)" entry
+/// (self-loop guard).
+fn resolve_system_default(raw: Option<&str>, devices: &[InputDevice]) -> Option<String> {
+    raw.filter(|name| devices.iter().any(|d| d.name == *name))
+        .map(str::to_string)
 }
 
 /// Resolve the initial capture target at startup or reconnect.
@@ -2357,6 +2364,63 @@ mod tests {
         }
     }
 
+    // ── System default + picker input (debug session mic-row-blank-single-device) ─
+
+    /// The environment that exposed the blank Microphone row: two enumerated
+    /// sources, one of them route-unavailable, and the OS default set to
+    /// CleanMic's own virtual source.
+    fn one_visible_mic_env() -> Vec<InputDevice> {
+        vec![
+            InputDevice {
+                id: 1,
+                name: "internal.mic".into(),
+                description: "internal mic".into(),
+                is_default: false,
+                available: true,
+            },
+            InputDevice {
+                id: 2,
+                name: "jack.mic".into(),
+                description: "jack mic".into(),
+                is_default: false,
+                available: false,
+            },
+        ]
+    }
+
+    /// Self-loop guard: an OS default of CleanMic itself (never enumerated)
+    /// resolves to `None`; a real enumerated default passes through; no
+    /// default stays `None`.
+    #[test]
+    fn resolve_system_default_filters_cleanmic_self_loop() {
+        let devices = one_visible_mic_env();
+        assert_eq!(
+            resolve_system_default(Some(crate::pipewire::NODE_NAME), &devices),
+            None
+        );
+        assert_eq!(
+            resolve_system_default(Some("internal.mic"), &devices),
+            Some("internal.mic".to_string())
+        );
+        assert_eq!(resolve_system_default(None, &devices), None);
+    }
+
+    /// In that environment the picker receives exactly one visible device
+    /// (the pinned, available one) and capture resolves to that same device
+    /// — never CleanMic — so the row's single entry matches what is live.
+    #[test]
+    fn one_visible_mic_env_picker_and_capture_agree() {
+        let devices = one_visible_mic_env();
+        let default = resolve_system_default(Some(crate::pipewire::NODE_NAME), &devices);
+        for pinned in [Some("internal.mic"), None] {
+            let picker = picker_device_infos(&devices, pinned, default.as_deref());
+            let names: Vec<&str> = picker.iter().map(|d| d.name.as_str()).collect();
+            assert_eq!(names, vec!["internal.mic"], "pinned={pinned:?}");
+            let target = resolve_runtime_capture_target(&devices, pinned, None, default.as_deref());
+            assert_eq!(target.as_deref(), Some("internal.mic"), "pinned={pinned:?}");
+        }
+    }
+
     // ── resolve_runtime_capture_target (R1) ───────────────────────────────
 
     /// Step 4 with no config pin, no last_explicit, and no default: the
@@ -2893,44 +2957,46 @@ mod tests {
     /// available when that feature is on (matches existing convention for
     /// UI-touching tests in this file). Skips cleanly when there is no
     /// display server available (headless CI / sandbox).
+    ///
+    /// Runs on the crate's single shared GTK test thread
+    /// (`crate::ui::gtk_test`) so it can coexist with other widget tests —
+    /// calling `gtk4::init()` directly here would make any second GTK test
+    /// panic with "Attempted to initialize GTK from two different threads".
     #[cfg(feature = "gui")]
     #[test]
     fn quit_and_report_issue_actions_are_registered() {
-        use gtk4::prelude::*;
-        use libadwaita::prelude::*;
+        // `None` = no DISPLAY/WAYLAND_DISPLAY (headless CI / sandbox): skip.
+        crate::ui::gtk_test::run(|| {
+            use gtk4::prelude::*;
 
-        // Skip cleanly if no DISPLAY/WAYLAND_DISPLAY (headless CI / sandbox).
-        if gtk4::init().is_err() {
-            return;
-        }
+            let app = libadwaita::Application::builder()
+                .application_id("com.cleanmic.CleanMic.test")
+                .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
 
-        let app = libadwaita::Application::builder()
-            .application_id("com.cleanmic.CleanMic.test")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
+            // Mirror the registration code path from `run_with_gui` for the
+            // two actions added in this commit.
+            let report_issue_action = gtk4::gio::SimpleAction::new("report-issue", None);
+            app.add_action(&report_issue_action);
 
-        // Mirror the registration code path from `run_with_gui` for the two
-        // actions added in this commit.
-        let report_issue_action = gtk4::gio::SimpleAction::new("report-issue", None);
-        app.add_action(&report_issue_action);
+            let quit_action = gtk4::gio::SimpleAction::new("quit", None);
+            app.add_action(&quit_action);
+            app.set_accels_for_action("app.quit", &["<Control>q"]);
 
-        let quit_action = gtk4::gio::SimpleAction::new("quit", None);
-        app.add_action(&quit_action);
-        app.set_accels_for_action("app.quit", &["<Control>q"]);
-
-        assert!(
-            app.lookup_action("report-issue").is_some(),
-            "app.report-issue action should be registered"
-        );
-        assert!(
-            app.lookup_action("quit").is_some(),
-            "app.quit action should be registered"
-        );
-        assert_eq!(
-            app.accels_for_action("app.quit"),
-            vec!["<Control>q".to_owned()],
-            "Ctrl+Q should be bound as the app.quit accelerator"
-        );
+            assert!(
+                app.lookup_action("report-issue").is_some(),
+                "app.report-issue action should be registered"
+            );
+            assert!(
+                app.lookup_action("quit").is_some(),
+                "app.quit action should be registered"
+            );
+            assert_eq!(
+                app.accels_for_action("app.quit"),
+                vec!["<Control>q".to_owned()],
+                "Ctrl+Q should be bound as the app.quit accelerator"
+            );
+        });
     }
 
     // ── wait_for_sni_watcher retry-loop tests ──────────────────────────────
