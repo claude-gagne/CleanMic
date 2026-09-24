@@ -78,10 +78,13 @@
 //! `ENGINE_FALLBACK_GRACE` timer (not this guard) is what decides whether a
 //! brief bypass/shadow episode is tolerated or ends in a runtime fallback.
 //!
-//! Once the plugin has calmed down, a ONE-TIME re-instantiation
-//! ([`SHED_MIN_UNDERRUNS`]+ underruns already paid for, [`SHED_CALM_CALLS`]
-//! on-time calls, [`SHED_QUIET_FRAMES`] quiet PROCESSED-output frames) sheds
-//! the +10 ms/underrun latency upstream never removes on its own (R4).
+//! R4 (quick 260924-n4s) evaluated a one-time "shed" re-instantiation once
+//! the plugin had calmed down, to remove the +10 ms/underrun latency
+//! upstream never sheds on its own. Measured on this engine's real baseline
+//! (130 ms quiet pre-change vs 123 ms quiet post-change, both 0 holes,
+//! comparable lag_corr): a ~7 ms drop, well under the plan's 20 ms bar for
+//! keeping it. Per the plan's own decision rule the shed was REMOVED; the
+//! existing 140 ms / 8-hole thresholds stay as they were.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -206,21 +209,6 @@ const RECOVERY_CONFIRM_CALLS: u32 = 100;
 const SHADOW_UNDERRUN_CEILING: u32 = 40;
 const _: () = assert!(SHADOW_UNDERRUN_CEILING < PLUGIN_PANIC_UNDERRUNS - 1);
 
-/// R4: a one-time plugin re-instantiation, once things have calmed down,
-/// sheds the +10 ms/underrun latency upstream never removes on its own.
-/// Needs at least this many underruns already paid for (otherwise there is
-/// nothing worth shedding).
-const SHED_MIN_UNDERRUNS: u32 = 3;
-/// R4: consecutive ON-TIME [`GuardMode::Normal`] calls (3 s) before the shed
-/// is considered — the overload must be well behind us, not still ongoing.
-const SHED_CALM_CALLS: u32 = 300;
-/// R4: consecutive quiet PROCESSED-OUTPUT frames (100 ms) required so the
-/// shed's ~10 ms prefill block and latency skip land in suppressed silence,
-/// not audible speech, even in a noisy room.
-const SHED_QUIET_FRAMES: u32 = 10;
-/// R4: a frame's RMS below this (dBFS) counts as "quiet" for the shed gate.
-const SHED_QUIET_DBFS: f32 = -50.0;
-
 /// What [`UnderrunGuard::observe`] wants the engine to do after a `run()`
 /// in [`GuardMode::Normal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,13 +272,10 @@ struct UnderrunGuard {
     underruns: u32,
     /// `run()` calls on the current instance (Normal mode only).
     calls: u64,
-    /// Consecutive ON-TIME Normal-mode calls (reset by any underrun) — the
-    /// R4 shed's "things have calmed down" signal.
-    calm: u32,
     /// Consecutive instances that burned the budget within [`FAST_TRIP_CALLS`].
     fast_trips: u32,
-    /// In-place re-instantiations over this engine's lifetime (includes the
-    /// one-time R4 shed and a Shadow recovery-with-restart).
+    /// In-place re-instantiations over this engine's lifetime (includes a
+    /// Shadow recovery-with-restart).
     reinstantiations: u32,
     mode: GuardMode,
 }
@@ -320,10 +305,8 @@ impl UnderrunGuard {
         }
         self.calls += 1;
         if wall + UNDERRUN_MARGIN < BLOCK_DURATION {
-            self.calm += 1;
             return GuardAction::Continue;
         }
-        self.calm = 0;
         self.underruns += 1;
         if self.underruns < UNDERRUN_BUDGET {
             return GuardAction::Continue;
@@ -346,7 +329,6 @@ impl UnderrunGuard {
         self.reinstantiations += 1;
         self.underruns = 0;
         self.calls = 0;
-        self.calm = 0;
         GuardAction::Reinstantiate
     }
 
@@ -402,7 +384,6 @@ impl UnderrunGuard {
     /// instantiation upper-bound it. A subsequent overload on that same
     /// instance must keep adding to the SAME count it already had.
     fn recover(&mut self) -> ShadowAction {
-        self.calm = 0;
         self.mode = GuardMode::Normal;
         if self.reinstantiations >= MAX_REINSTANTIATIONS {
             ShadowAction::RecoverInPlace
@@ -412,25 +393,6 @@ impl UnderrunGuard {
             self.calls = 0;
             ShadowAction::RecoverWithRestart
         }
-    }
-
-    /// R4: is a one-time latency shed due right now? Pure — the engine
-    /// supplies the "quiet processed output" evidence separately (this
-    /// guard has no audio to look at).
-    fn shed_due(&self) -> bool {
-        matches!(self.mode, GuardMode::Normal)
-            && self.underruns >= SHED_MIN_UNDERRUNS
-            && self.calm >= SHED_CALM_CALLS
-            && self.reinstantiations < MAX_REINSTANTIATIONS
-    }
-
-    /// Apply a shed: counts as a reinstantiation, fresh accounting. Does
-    /// NOT touch `fast_trips` (a calm shed is not an overload event).
-    fn note_shed(&mut self) {
-        self.reinstantiations += 1;
-        self.underruns = 0;
-        self.calls = 0;
-        self.calm = 0;
     }
 }
 
@@ -497,12 +459,6 @@ pub struct DeepFilterEngine {
     /// Shadow keeps the engine's actual output dry. Allocated once in
     /// [`Self::new`], never on the hot path.
     shadow_scratch: [f32; FRAME_SIZE],
-    /// R4: the one-time latency shed has already happened (per engine
-    /// instance, i.e. per `DeepFilterEngine`, not per plugin instance).
-    shed_done: bool,
-    /// R4: consecutive quiet (< [`SHED_QUIET_DBFS`]) PROCESSED-output
-    /// frames, tracked only while [`GuardMode::Normal`].
-    quiet_streak: u32,
 }
 
 // SAFETY: Only accessed from the single audio thread.
@@ -524,53 +480,6 @@ impl DeepFilterEngine {
             sample_rate: 48_000,
             guard: UnderrunGuard::default(),
             shadow_scratch: [0.0; FRAME_SIZE],
-            shed_done: false,
-            quiet_streak: 0,
-        }
-    }
-
-    /// A block's RMS is below [`SHED_QUIET_DBFS`] (R4's "safe to shed"
-    /// evidence: the ~10 ms prefill block and latency skip land here, not
-    /// in audible speech).
-    fn frame_is_quiet(block: &[f32]) -> bool {
-        if block.is_empty() {
-            return true;
-        }
-        let sum_sq: f32 = block.iter().map(|&s| s * s).sum();
-        let rms = (sum_sq / block.len() as f32).sqrt();
-        let db = 20.0 * rms.max(1e-9).log10();
-        db < SHED_QUIET_DBFS
-    }
-
-    /// Pure shed decision, split out from the FFI-touching
-    /// [`Self::maybe_shed`] so it's unit-testable without a real plugin
-    /// handle: whether a shed should be attempted given the current quiet
-    /// streak (never twice, only in Normal mode, only once the guard
-    /// itself is calm — see [`UnderrunGuard::shed_due`]).
-    fn shed_would_apply(&self, quiet_streak: u32) -> bool {
-        !self.shed_done && quiet_streak >= SHED_QUIET_FRAMES && self.guard.shed_due()
-    }
-
-    /// After a Normal-mode call: update the quiet-output streak and shed
-    /// once due (re-instantiating the plugin, one time, per engine).
-    fn maybe_shed(&mut self, output_block: &[f32]) {
-        if Self::frame_is_quiet(output_block) {
-            self.quiet_streak = self.quiet_streak.saturating_add(1);
-        } else {
-            self.quiet_streak = 0;
-        }
-        if self.shed_would_apply(self.quiet_streak) {
-            let underruns_shed = self.guard.underruns;
-            if self.reinstantiate() {
-                self.guard.note_shed();
-                self.shed_done = true;
-                self.quiet_streak = 0;
-                log::info!(
-                    "DeepFilterNet: shed {} ms of accumulated plugin latency (one-time restart {}/{MAX_REINSTANTIATIONS})",
-                    u64::from(underruns_shed) * BLOCK_DURATION.as_millis() as u64,
-                    self.guard.reinstantiations,
-                );
-            }
         }
     }
 
@@ -710,8 +619,6 @@ impl NoiseEngine for DeepFilterEngine {
         self.handle = handle;
         self.sample_rate = sample_rate as u64;
         self.guard = UnderrunGuard::default();
-        self.shed_done = false;
-        self.quiet_streak = 0;
 
         // Activate the plugin (allocates internal buffers, initializes state).
         unsafe {
@@ -771,9 +678,7 @@ impl NoiseEngine for DeepFilterEngine {
                     let wall = t0.elapsed();
 
                     match self.guard.observe(wall) {
-                        GuardAction::Continue => {
-                            self.maybe_shed(&output[pos..pos + FRAME_SIZE]);
-                        }
+                        GuardAction::Continue => {}
                         GuardAction::Reinstantiate => {
                             if self.reinstantiate() {
                                 log::warn!(
@@ -1381,99 +1286,6 @@ mod tests {
             overloaded <= bound,
             "blocks spent Overloaded should be bounded (<= {bound}), got {overloaded}"
         );
-    }
-
-    // ── R4: one-time latency shed ───────────────────────────────────────────
-
-    #[test]
-    fn frame_is_quiet_below_and_above_the_threshold() {
-        let quiet = vec![0.001f32; FRAME_SIZE]; // ~ -60 dBFS
-        assert!(DeepFilterEngine::frame_is_quiet(&quiet));
-        let loud = vec![0.5f32; FRAME_SIZE]; // ~ -6 dBFS
-        assert!(!DeepFilterEngine::frame_is_quiet(&loud));
-        assert!(DeepFilterEngine::frame_is_quiet(&[]));
-    }
-
-    #[test]
-    fn shed_applies_after_calm_underruns_and_quiet_output() {
-        let mut engine = DeepFilterEngine::new();
-        engine.guard.mode = GuardMode::Normal;
-        engine.guard.underruns = SHED_MIN_UNDERRUNS;
-        engine.guard.calm = SHED_CALM_CALLS;
-        assert!(engine.shed_would_apply(SHED_QUIET_FRAMES));
-    }
-
-    #[test]
-    fn shed_never_applies_while_output_is_not_quiet() {
-        let mut engine = DeepFilterEngine::new();
-        engine.guard.mode = GuardMode::Normal;
-        engine.guard.underruns = SHED_MIN_UNDERRUNS;
-        engine.guard.calm = SHED_CALM_CALLS;
-        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES - 1));
-    }
-
-    #[test]
-    fn shed_never_applies_with_fewer_than_the_minimum_underruns() {
-        let mut engine = DeepFilterEngine::new();
-        engine.guard.mode = GuardMode::Normal;
-        engine.guard.underruns = SHED_MIN_UNDERRUNS - 1;
-        engine.guard.calm = SHED_CALM_CALLS;
-        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES));
-    }
-
-    #[test]
-    fn shed_never_applies_a_second_time() {
-        let mut engine = DeepFilterEngine::new();
-        engine.guard.mode = GuardMode::Normal;
-        engine.guard.underruns = SHED_MIN_UNDERRUNS;
-        engine.guard.calm = SHED_CALM_CALLS;
-        engine.shed_done = true;
-        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES));
-    }
-
-    #[test]
-    fn shed_never_applies_outside_normal_mode() {
-        let mut engine = DeepFilterEngine::new();
-        engine.guard.underruns = SHED_MIN_UNDERRUNS;
-        engine.guard.calm = SHED_CALM_CALLS;
-        for mode in [
-            GuardMode::Bypassed {
-                calls_left: BYPASS_HOLD_CALLS,
-            },
-            GuardMode::Shadow { clean: 0 },
-            GuardMode::GaveUp,
-        ] {
-            engine.guard.mode = mode;
-            assert!(
-                !engine.shed_would_apply(SHED_QUIET_FRAMES),
-                "must not shed in {mode:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn shed_never_applies_at_the_lifetime_cap() {
-        let mut engine = DeepFilterEngine::new();
-        engine.guard.mode = GuardMode::Normal;
-        engine.guard.underruns = SHED_MIN_UNDERRUNS;
-        engine.guard.calm = SHED_CALM_CALLS;
-        engine.guard.reinstantiations = MAX_REINSTANTIATIONS;
-        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES));
-    }
-
-    #[test]
-    fn note_shed_counts_toward_reinstantiations_and_resets_accounting() {
-        let mut guard = UnderrunGuard::default();
-        guard.underruns = 5;
-        guard.calls = 400;
-        guard.calm = SHED_CALM_CALLS;
-        let reinst_before = guard.reinstantiations;
-        guard.note_shed();
-        assert_eq!(guard.reinstantiations, reinst_before + 1);
-        assert_eq!(guard.underruns, 0);
-        assert_eq!(guard.calls, 0);
-        assert_eq!(guard.calm, 0);
-        assert_eq!(guard.mode(), GuardMode::Normal, "health stays Healthy");
     }
 
     /// Full init → process → teardown. Requires libdeep_filter_ladspa.so.
