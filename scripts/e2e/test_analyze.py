@@ -284,6 +284,100 @@ def test_dc_and_autogain_rules():
     assert analyze.eval_autogain_noise_diff(-40, -46, 3) == "FAIL"
 
 
+def test_dead_speech():
+    rng = np.random.default_rng(21)
+    n = FS * 3
+    inp = rng.standard_normal(n) * 0.2  # speech-level input throughout
+    out = inp * 0.5
+    assert analyze.dead_speech(inp, out, FS) == (0.0, 0.0)
+    # One 10 ms plugin hole: dead, but a 10 ms run.
+    out1 = out.copy()
+    out1[FS : FS + 480] = 0.0
+    assert analyze.dead_speech(inp, out1, FS) == (10.0, 10.0)
+    # The old crash: output gone for the last 2 s.
+    out2 = out.copy()
+    out2[FS:] = 0.0
+    run, total = analyze.dead_speech(inp, out2, FS)
+    assert run == total == 2000.0
+    # Deep but real suppression (-79 dBFS out for a loud noise-only input,
+    # as RNNoise did in the first stress run) is NOT dead output.
+    out_supp = out.copy()
+    out_supp[FS : 2 * FS] = 1.1e-4 * rng.standard_normal(FS)  # ~ -79 dBFS
+    assert analyze.dead_speech(inp, out_supp, FS) == (0.0, 0.0)
+    # Denoised pauses (quiet input, near-silent output) are not dead, and do
+    # not break a dead run that spans them.
+    inp3 = inp.copy()
+    inp3[FS : FS + 4800] *= 1e-4  # 100 ms pause at -94 dBFS
+    out3 = np.zeros_like(inp3)
+    run3, total3 = analyze.dead_speech(inp3, out3, FS)
+    assert run3 == total3 == 2900.0
+
+
+def test_logscan_fallback_and_plugin_abort():
+    log_text = (
+        "[2026-09-24T15:24:14.000Z WARN  cleanmic::engine::deepfilter] DeepFilterNet: plugin fell behind real time 8 times\n"
+        "[2026-09-24T15:24:14.500Z WARN  cleanmic::engine::deepfilter] DeepFilterNet cannot keep up with real time on this computer\n"
+        "[2026-09-24T15:24:14.600Z WARN  cleanmic::app] Engine fallback: DeepFilterNet -> RNNoise (Overloaded)\n"
+        "thread '<unnamed>' panicked at 'DF 1 | Processing too slow! Please upgrade your CPU.', ladspa/src/lib.rs:444:17\n"
+    )
+    r = analyze.logscan(log_text)
+    assert r["dfn_restarts"] == 1 and r["dfn_gave_up"] == 1 and r["plugin_aborts"] == 1
+    assert len(r["fallbacks"]) == 1
+    fb = r["fallbacks"][0]
+    assert (fb["from"], fb["to"], fb["reason"]) == ("DeepFilterNet", "RNNoise", "Overloaded")
+    assert abs(fb["t"] - 1790263454.6) < 1e-3
+    assert analyze.active_engine_after(r, "DeepFilterNet") == "RNNoise"
+    assert analyze.active_engine_after({"fallbacks": []}, "DeepFilterNet") == "DeepFilterNet"
+
+    rows = {x["metric"]: x for x in analyze.evaluate_stress(r, True, fb["t"] - 3.0, 10)}
+    assert rows["app_alive"]["result"] == "PASS"
+    assert rows["plugin_abort_lines"]["result"] == "FAIL"
+    assert rows["recovery_s"]["value"] == 3.0 and rows["recovery_s"]["result"] == "PASS"
+    slow = {x["metric"]: x for x in analyze.evaluate_stress(r, False, fb["t"] - 30.0, 10)}
+    assert slow["app_alive"]["result"] == "FAIL" and slow["recovery_s"]["result"] == "FAIL"
+    early = {x["metric"]: x for x in analyze.evaluate_stress(r, True, fb["t"] + 0.7, 10)}
+    assert early["recovery_s"]["value"] == 0.0 and early["recovery_s"]["result"] == "PASS"
+    assert "before the synthetic load" in early["recovery_s"]["note"]
+    none = {x["metric"]: x for x in analyze.evaluate_stress({"fallbacks": []}, True, 0.0, 10)}
+    assert none["recovery_s"]["result"] == "INFO"
+
+
+def test_stress_load_rule_and_cpu_flag():
+    th = {"stress_dead_run_max_ms": 200, "load_flag_busy_pct": 25}
+    ok = analyze.evaluate({"kind": "stress_load", "dead_run_ms": 20.0, "cpu_busy_pct": "61.5"}, th)
+    by = {r.metric: r for r in ok}
+    assert by["dead_run_ms"].result == "PASS"
+    assert by["cpu_busy_pct"].result == "INFO" and by["cpu_busy_pct"].note == "ran under load"
+    pinned = analyze.evaluate({"kind": "stress_load", "dead_run_ms": 0.0, "cpu_busy_pct": "15", "stress_spinners": "6"}, th)
+    assert "synthetic load" in {r.metric: r for r in pinned}["cpu_busy_pct"].note
+    bad = analyze.evaluate({"kind": "stress_load", "dead_run_ms": 15380.0}, th)
+    assert {r.metric: r for r in bad}["dead_run_ms"].result == "FAIL"
+    quiet = analyze.evaluate({"kind": "speech", "latency_ms": 50, "lag_corr": 0.6, "latency_spread_ms": 2, "cpu_busy_pct": "12"}, th)
+    assert {r.metric: r for r in quiet}["cpu_busy_pct"].note == ""
+    assert analyze.load_summary([{"cpu_busy_pct": "12"}, {"cpu_busy_pct": "61.5"}], th) == ("61.5", "yes")
+    assert analyze.load_summary([{}], th) == ("n/a", "unknown")
+
+
+def test_speech_rule_flags_a_dead_mic():
+    th = {"latency_max_ms": 120, "lag_corr_min": 0.5, "dead_run_max_ms": 200}
+    base = {"kind": "speech", "latency_ms": 60, "lag_corr": 0.6, "latency_spread_ms": 2}
+    ok = {r.metric: r for r in analyze.evaluate(dict(base, dead_run_ms=10.0), th)}
+    assert ok["dead_run_ms"].result == "PASS"
+    crashed = {r.metric: r for r in analyze.evaluate(dict(base, dead_run_ms=13150.0), th)}
+    assert crashed["dead_run_ms"].result == "FAIL"
+    # Older measurement JSON without the field: no row, no false FAIL.
+    assert "dead_run_ms" not in {r.metric for r in analyze.evaluate(base, th)}
+
+
+def test_per_engine_holes_override():
+    th = {"latency_max_ms": 120, "lag_corr_min": 0.5, "holes_max": 0, "holes_max_deepfilternet": 8}
+    base = {"kind": "speech", "latency_ms": 60, "lag_corr": 0.6, "latency_spread_ms": 2, "holes": 3}
+    dfn = {r.metric: r for r in analyze.evaluate(dict(base, engine="DeepFilterNet"), th)}
+    assert dfn["holes"].result == "PASS" and dfn["holes"].threshold == "<= 8"
+    other = {r.metric: r for r in analyze.evaluate(dict(base, engine="Dpdfnet8"), th)}
+    assert other["holes"].result == "FAIL" and other["holes"].threshold == "<= 0"
+
+
 def _run_all():
     failures = []
     for name, fn in sorted(globals().items()):

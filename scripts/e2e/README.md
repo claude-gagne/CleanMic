@@ -204,16 +204,31 @@ noise), `speech_loop60.wav` (tiled ×3, for the swaps-during recording).
 | `modes` | LowCpu, Balanced, LowCpu, Balanced; each mode's own latency allowance, plus a same-mode-repeat drift check |
 | `dc` | Speech+DC and silence+DC; both must show the DC blocker removing the offset |
 | `autogain` | ON boosts a quiet (-40 dBFS) mic; OFF is near-unity; ON vs OFF must not audibly pump steady pink noise |
+| `stress` | Per `$STRESS_ENGINES` entry (default DeepFilterNet): fresh launch, settle, then **controlled synthetic CPU load** — every thread of the harness's own CleanMic pinned (`taskset -a`) to one CPU next to `$STRESS_SPINNERS` busy loops — while recording; unload; record again. Asserts the app survives, the vendored DeepFilterNet plugin never reaches its "Processing too slow!" abort, the mic never goes dead (`dead_run_ms`), a runtime fallback (if any) lands within `$STRESS_RECOVERY_MAX_S`, and the post-load recording passes the normal speech rules for whichever engine is then active. Spinners are killed and the app's affinity restored on every exit path. |
 | `monitor` (needs `--monitor-null-sink`) | `CleanMic-monitor` routed ONLY to a second, audited, RDP-safe null-sink loopback |
-| `all` | `baseline swaps toggle modes dc autogain`, plus `monitor` when `--monitor-null-sink` is given |
+| `all` | `baseline swaps toggle modes dc autogain stress`, plus `monitor` when `--monitor-null-sink` is given |
 
 **Metrics** (`scripts/e2e/analyze.py`): `latency_ms`/`lag_corr` (band-passed
 log-envelope cross-correlation, ±5 ms accuracy), `latency_spread_ms` (drift
 across 5 s windows), `exact_repeat_frac` (the decimated-mode "held frame"
 bug signature), `holes` (brief silent gaps inside loud audio), `zero_run_ms`,
-`out_dc`/`in_dc`, `settled_gain_db` (auto-gain), and a log scan for
-fell-behind/error/panic/Discarded counts and the ordered engine/mode-change
-sequence.
+`out_dc`/`in_dc`, `settled_gain_db` (auto-gain), `dead_run_ms` (longest
+stretch of digital silence, < -100 dBFS out, while the mic carried speech,
+> -35 dBFS in — speech pauses skipped; the pre-fix DeepFilterNet crash scored
+13150 ms), and a log scan for fell-behind/error/panic/Discarded counts, the
+ordered engine/mode-change sequence, runtime `Engine fallback:` lines,
+DeepFilterNet guard restarts, and the vendored plugin's abort message.
+
+**Load flag:** every recording samples `/proc/stat` and `/proc/loadavg`
+before and after; its report gets an INFO `cpu_busy_pct` row (all-core busy
+share, steal, 1-min load average), noted "ran under load" above
+`LOAD_FLAG_BUSY_PCT`, and the Environment table gets `max_cpu_busy_pct` /
+`ran_under_load`. A recording that ran next to someone else's build is
+therefore visible as such instead of looking like a regression.
+
+**App death:** `record_pair` re-checks the harness's own app pid after every
+recording; a dead app adds an `app_alive = DIED` FAIL row and aborts with
+exit 5 (it used to surface only as "latency unmeasurable").
 
 **Thresholds:** one block at the top of `scripts/e2e-audio.sh`, every value
 env-overridable, each with a one-line rationale citing the measurement it

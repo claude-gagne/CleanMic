@@ -15,7 +15,7 @@
 # config, and without ever touching their real CleanMic.
 #
 # USAGE
-#   scripts/e2e-audio.sh [options] <baseline|swaps|toggle|modes|dc|autogain|monitor|all>...
+#   scripts/e2e-audio.sh [options] <baseline|swaps|toggle|modes|dc|autogain|stress|monitor|all>...
 #
 # OPTIONS
 #   --out DIR             must not exist, or must be empty (default:
@@ -65,10 +65,21 @@ err() { echo "[e2e] $*" >&2; }
 : "${LATENCY_MAX_MS:=120}"
 # Per-engine overrides, all measured post-fix (29f5397) on 2026-09-24 at
 # q1024, MaxQuality, fresh launch -- see the debug file's Evidence section.
-: "${LATENCY_MAX_MS_RNNOISE:=70}"           # measured 41-48 ms
+# RNNoise: 41-48 ms on the base-latency session's hand-built rig, but THIS
+# harness (pw-loopback test mic, Xephyr) measures 63-71 ms on a quiet machine
+# with the pre- and post-dfn-panic-under-load binaries alike (8 runs,
+# 2026-09-24); 70 sat inside that distribution and failed at random.
+# Max measured + 9 ms (estimator +/-5 ms, quantum jitter).
+: "${LATENCY_MAX_MS_RNNOISE:=80}"
 : "${LATENCY_MAX_MS_DPDFNET2:=120}"         # measured 82-98 ms (algorithmic delay ~50 ms + quanta)
 : "${LATENCY_MAX_MS_DPDFNET8:=120}"         # measured 90-100 ms
-: "${LATENCY_MAX_MS_DEEPFILTERNET:=90}"     # measured 71-73 ms (LADSPA, pre-existing RTF underrun warnings aside)
+# DeepFilterNet (vendored LADSPA plugin): every plugin "underrun" adds 10 ms
+# it never sheds; a quiet launch in this harness takes 4-6 of them during
+# the window-build CPU spike, so quiet runs measure 106-128 ms (8 runs,
+# 2026-09-24; ~65 ms + 10 ms per underrun). The underrun guard
+# (src/engine/deepfilter.rs) restarts the plugin before an 8th, so the
+# plugin can add at most 70 ms: ~65 + 70 = 135 -> 140.
+: "${LATENCY_MAX_MS_DEEPFILTERNET:=140}"
 # Balanced/LowCpu allowance on top of the engine's MaxQuality threshold.
 # Derived from src/engine/dpdfnet.rs's decimation ratios (Balanced=2,
 # LowCpu=4): 4*(ratio-1) hops of 10 ms, plus one hop -- Balanced
@@ -89,6 +100,17 @@ err() { echo "[e2e] $*" >&2; }
 
 : "${REPEAT_FRAC_MAX:=0.001}"              # decimated-mode "held frame" bug signature; near-zero in healthy audio
 : "${HOLES_MAX:=0}"                        # brief silent gaps surrounded by loud audio: never expected
+# ...except DeepFilterNet's own: the vendored plugin appends one 10 ms block
+# of zeros per underrun (upstream ladspa/src/lib.rs), and the underrun guard
+# allows at most 7 per plugin instance before restarting it (which adds one
+# prefill block). Quiet runs measured 0-3 (2026-09-24). A per-engine
+# HOLES_MAX_<ENGINE> overrides HOLES_MAX for that engine's recordings.
+: "${HOLES_MAX_DEEPFILTERNET:=8}"
+# Longest stretch of digital silence (< -100 dBFS out) while the mic carried
+# speech (> -35 dBFS in), speech pauses skipped: the "dead virtual mic"
+# signature. The 2026-09-24 DeepFilterNet crash scored 13150 ms; a healthy
+# quiet run scores 0-10 ms (an isolated plugin gap).
+: "${DEAD_RUN_MAX_MS:=200}"
 : "${SWAP_ZERO_MS_PER_SWAP_MAX:=20}"       # a known ~10 ms silent block per engine swap (crossfade), times headroom
 : "${OUT_DC_MAX:=0.001}"                   # the DC blocker should remove essentially all offset
 : "${SILENCE_OUT_MAX_DB:=-60}"             # processed silence should stay near the noise floor
@@ -100,10 +122,41 @@ err() { echo "[e2e] $*" >&2; }
 : "${LOG_PANIC_MAX:=0}"
 : "${BASELINE_ENGINES:=Dpdfnet2 Dpdfnet8 DeepFilterNet RNNoise}"
 
+# Load flag (every scenario): a recording whose average CPU busy share (all
+# cores, /proc/stat user+nice+system+irq+softirq+steal) exceeds this is
+# flagged "ran under load" in the report. The 2026-09-24 run in which the
+# DeepFilterNet plugin aborted the app had a ~3.7 load average on 12
+# threads (~30 %); quiet runs sit well below.
+: "${LOAD_FLAG_BUSY_PCT:=25}"
+
+# `stress` scenario (debug session dfn-panic-under-load): controlled
+# synthetic CPU load. EVERY thread of the harness's own CleanMic is pinned
+# (taskset -a) to ONE CPU, next to STRESS_SPINNERS busy loops pinned there
+# too -- deterministic starvation, unlike an unpinned `stress-ng`, whose
+# effect depends on the scheduler and the core count. The unguarded plugin
+# aborted within ~4 s with 12 spinners and accumulated +860 ms with 6
+# (examples/probe_dfn_overload.rs). Spinners are killed and the app's
+# affinity restored on every exit path (on_exit).
+: "${STRESS_ENGINES:=DeepFilterNet}"
+: "${STRESS_SPINNERS:=6}"
+: "${STRESS_CPU:=}"                # default: the last CPU
+: "${STRESS_SETTLE_S:=3}"          # let the startup/window-build spike pass before loading
+# While loaded, the mic may never go dead for longer than this (longest run
+# of speech-active 10 ms frames whose output is below -70 dBFS). A guarded
+# DeepFilterNet inserts isolated 10 ms plugin gaps before it hands over; the
+# pre-fix crash produced a 15 s dead run.
+: "${STRESS_DEAD_RUN_MAX_MS:=200}"
+# From load start to the logged "Engine fallback: X -> Y", when one happens.
+# The guard gives up ~1 s after sustained overload (tests/deepfilter_overload.rs);
+# the GTK main loop is starved too, so allow several seconds.
+: "${STRESS_RECOVERY_MAX_S:=10}"
+# Under deliberate load the audio thread itself may fall behind: informational.
+: "${STRESS_LOG_FELL_BEHIND_MAX:=1000000}"
+
 : "${E2E_DISPLAY:=:47}"
 : "${E2E_LANG:=fr}"
 
-KNOWN_SCENARIOS="baseline swaps toggle modes dc autogain monitor all"
+KNOWN_SCENARIOS="baseline swaps toggle modes dc autogain stress monitor all"
 
 # ---------------------------------------------------------------------------
 # Option parsing
@@ -130,7 +183,7 @@ while [ "$#" -gt 0 ]; do
       sed -n '2,45p' "$0"
       exit 0
       ;;
-    baseline | swaps | toggle | modes | dc | autogain | monitor | all)
+    baseline | swaps | toggle | modes | dc | autogain | stress | monitor | all)
       SCENARIOS+=("$1"); shift
       ;;
     *)
@@ -150,6 +203,17 @@ for s in "${SCENARIOS[@]}"; do
     exit 2
   fi
 done
+
+# --appimage/--binary must reach EVERY `nested-run.sh launch`: without this
+# they only labelled the report, while nested-run launched the newest
+# build/CleanMic-*.AppImage (found during dfn-panic-under-load, when an A/B
+# run of a pre-fix AppImage silently ran the fixed one).
+declare -a BIN_ARGS=()
+if [ -n "$BINARY" ]; then
+  BIN_ARGS=(--binary "$BINARY")
+elif [ -n "$APPIMAGE" ]; then
+  BIN_ARGS=(--appimage "$APPIMAGE")
+fi
 
 if [ -z "$OUT" ]; then
   OUT="$REPO_ROOT/target/e2e-audio/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -182,11 +246,16 @@ declare -a THRESHOLD_ARGS=(
   --threshold "monitor_latency_max_ms=$MONITOR_LATENCY_MAX_MS"
   --threshold "repeat_frac_max=$REPEAT_FRAC_MAX"
   --threshold "holes_max=$HOLES_MAX"
+  --threshold "holes_max_deepfilternet=$HOLES_MAX_DEEPFILTERNET"
+  --threshold "dead_run_max_ms=$DEAD_RUN_MAX_MS"
   --threshold "out_dc_max=$OUT_DC_MAX"
   --threshold "silence_out_max_db=$SILENCE_OUT_MAX_DB"
   --threshold "autogain_min_boost_db=$AUTOGAIN_MIN_BOOST_DB"
   --threshold "autogain_off_max_dev_db=$AUTOGAIN_OFF_MAX_DEV_DB"
   --threshold "autogain_noise_max_diff_db=$AUTOGAIN_NOISE_MAX_DIFF_DB"
+  --threshold "load_flag_busy_pct=$LOAD_FLAG_BUSY_PCT"
+  --threshold "stress_dead_run_max_ms=$STRESS_DEAD_RUN_MAX_MS"
+  --threshold "stress_recovery_max_s=$STRESS_RECOVERY_MAX_S"
 )
 declare -a META_ARGS=()
 
@@ -232,7 +301,8 @@ CLEANUP_DONE=0
 # `main` -- an abort mid-scenario used to skip report generation entirely.
 render_final_report() {
   local bin_used report_rc=0
-  bin_used="${APPIMAGE:-${BINARY:-$(ls -t "$REPO_ROOT"/build/CleanMic-*.AppImage 2>/dev/null | head -1 || true)}}"
+  # Same precedence as nested-run.sh launch: --binary, --appimage, newest build.
+  bin_used="${BINARY:-${APPIMAGE:-$(ls -t "$REPO_ROOT"/build/CleanMic-*.AppImage 2>/dev/null | head -1 || true)}}"
   build_environment_meta "$bin_used"
   local -a aborted_arg=()
   [ -n "$ABORT_MESSAGE" ] && aborted_arg=(--aborted "$ABORT_MESSAGE")
@@ -255,6 +325,7 @@ on_exit() {
     return
   fi
   CLEANUP_DONE=1
+  stop_cpu_load
   [ -n "$RECORDER_PID" ] && kill -INT "$RECORDER_PID" 2>/dev/null
   [ -n "$PLAYER_PID" ] && kill -TERM "$PLAYER_PID" 2>/dev/null
   sleep 0.3
@@ -296,6 +367,48 @@ on_exit() {
   fi
   exit "$report_rc"
 }
+# ---------------------------------------------------------------------------
+# Synthetic CPU load (stress scenario). Declared before the trap so on_exit
+# can always call stop_cpu_load, which is idempotent.
+# ---------------------------------------------------------------------------
+
+LOAD_PIDS=()
+LOAD_APP_PID=""
+LOAD_SPINNER_CMD='while :; do :; done'
+
+# start_cpu_load APP_PID -- pin every thread of APP_PID and STRESS_SPINNERS
+# busy loops to one CPU.
+start_cpu_load() {
+  local app_pid="$1" cpu="$STRESS_CPU" i
+  [ -z "$cpu" ] && cpu=$(( $(nproc) - 1 ))
+  LOAD_APP_PID="$app_pid"
+  taskset -a -p -c "$cpu" "$app_pid" >/dev/null
+  for i in $(seq 1 "$STRESS_SPINNERS"); do
+    taskset -c "$cpu" bash -c "$LOAD_SPINNER_CMD" &
+    LOAD_PIDS+=("$!")
+  done
+  log "stress: app pid $app_pid + $STRESS_SPINNERS spinner(s) pinned to CPU $cpu"
+}
+
+# stop_cpu_load -- kill OUR spinners (verified by command line) and give the
+# app back every CPU. Safe to call any number of times, on any exit path.
+stop_cpu_load() {
+  local pid
+  for pid in "${LOAD_PIDS[@]}"; do
+    if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$LOAD_SPINNER_CMD"; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "${LOAD_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  LOAD_PIDS=()
+  if [ -n "$LOAD_APP_PID" ] && kill -0 "$LOAD_APP_PID" 2>/dev/null; then
+    taskset -a -p -c "0-$(( $(nproc) - 1 ))" "$LOAD_APP_PID" >/dev/null 2>&1 || true
+  fi
+  LOAD_APP_PID=""
+}
+
 trap on_exit EXIT
 trap 'ABORT_CODE=130; exit 130' INT
 trap 'ABORT_CODE=143; exit 143' TERM
@@ -390,10 +503,42 @@ audit_graph() {
 # ---------------------------------------------------------------------------
 
 RECORD_START_EPOCH=""
+# Set by record_pair, appended to the next measure_and_add: CPU busy/steal
+# share and 1-min load average over the recording (the "ran under load" flag).
+declare -a LAST_CPU_META=()
+
+# app_alive PID -- 0 when PID exists and is really running. A crashed app
+# can linger for many seconds while apport/systemd-coredump drains its core
+# (the pre-fix DeepFilterNet abort did), and `kill -0` alone reports it
+# alive the whole time; the kernel's CoreDumping flag (Linux >= 4.15) and a
+# zombie state both mean "dead".
+app_alive() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null || return 1
+  local st
+  st="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || echo X)"
+  case "$st" in Z | X | x) return 1 ;; esac
+  if grep -Eq '^CoreDumping:[[:space:]]*1' "/proc/$pid/status" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+# Prints "busy total steal" jiffies from the aggregate /proc/stat line.
+cpu_sample() {
+  local _cpu user nice system idle iowait irq softirq steal _rest
+  read -r _cpu user nice system idle iowait irq softirq steal _rest </proc/stat
+  local total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+  echo "$((total - idle - iowait)) $total $steal"
+}
 
 record_pair() {
   local name="$1" wav="$2" source_port="${3:-CleanMic:capture_MONO}" driver_func="${4:-}"
   local rec_wav="$OUT/rec/$name.wav"
+  # The app must survive every recording: a dead app used to show up only
+  # as an "unmeasurable latency" (dfn-panic-under-load), never as exit 5.
+  local app_pid=""
+  app_pid="$(bash "$NESTED_RUN" app-pid "$DISPLAY_ARG" 2>/dev/null)" || app_pid=""
 
   # NOT disowned: `wait "$RECORDER_PID"` below needs bash to still track this
   # as one of its children. A disowned job returns instantly (rc 0) from
@@ -449,6 +594,9 @@ with wave.open('$wav', 'rb') as w:
   fi
 
   RECORD_START_EPOCH="$(date +%s.%N)"
+  local cpu_a load_a
+  cpu_a="$(cpu_sample)"
+  load_a="$(cut -d' ' -f1 /proc/loadavg)"
   local driver_pid=""
   if [ -n "$driver_func" ]; then
     "$driver_func" &
@@ -467,10 +615,30 @@ with wave.open('$wav', 'rb') as w:
     fi
   fi
 
+  local cpu_b load_b ba ta sa bb tb sb
+  cpu_b="$(cpu_sample)"
+  load_b="$(cut -d' ' -f1 /proc/loadavg)"
+  read -r ba ta sa <<<"$cpu_a"
+  read -r bb tb sb <<<"$cpu_b"
+  LAST_CPU_META=(
+    --meta "cpu_busy_pct=$(python3 -c "print(round(100 * ($bb - $ba) / max(1, $tb - $ta), 1))")"
+    --meta "cpu_steal_pct=$(python3 -c "print(round(100 * ($sb - $sa) / max(1, $tb - $ta), 1))")"
+    --meta "loadavg_1m=$(python3 -c "print(max($load_a, $load_b))")"
+  )
+
   sleep 0.8
   kill -INT "$RECORDER_PID" 2>/dev/null || true
   wait "$RECORDER_PID" 2>/dev/null || true
   RECORDER_PID=""
+
+  if [ -n "$app_pid" ] && ! app_alive "$app_pid"; then
+    local died_json="$OUT/rec/${name}_app_alive.json"
+    python3 "$E2E_DIR/analyze.py" check --scenario "${CURRENT_SCENARIO:-unknown}" --recording "$name" \
+      --metric app_alive --value DIED --threshold-desc "== yes" --result FAIL \
+      --note "cleanmic pid $app_pid exited during the recording" --json-out "$died_json" || true
+    [ -s "$died_json" ] && MEASURED_JSON+=("$died_json")
+    abort 5 "the app (pid $app_pid) died during recording '$name' -- see its app.log."
+  fi
 
   if [ ! -s "$rec_wav" ]; then
     abort 5 "recording '$name' is missing or empty."
@@ -528,7 +696,7 @@ launch_and_wait() {
   # the recorded Xephyr along with the app -- reopen it first. A no-op reuse
   # when it is already alive (e.g. this run's very first launch).
   run_nested xephyr "$DISPLAY_ARG"
-  run_nested launch "$DISPLAY_ARG" --lang "$LANG_ARG" \
+  run_nested launch "$DISPLAY_ARG" --lang "$LANG_ARG" "${BIN_ARGS[@]}" \
     --config "engine = \"$engine\"" --config "mode = \"$mode\"" "$@"
   APP_LOG="$CLEANMIC_HARNESS_STATE/display-${DISPLAY_ARG#:}/app.log"
   if ! wait_for_log "Audio processing started" 30 "$APP_LOG"; then
@@ -544,7 +712,7 @@ measure_and_add() {
   local json="$OUT/rec/${recording}.json"
   if ! python3 "$E2E_DIR/analyze.py" measure "$OUT/rec/${recording}.wav" \
     --scenario "$scenario" --recording "$recording" --kind "$kind" \
-    "$@" --json-out "$json"; then
+    "$@" "${LAST_CPU_META[@]}" --json-out "$json"; then
     abort 5 "analyze.py measure failed for $recording."
   fi
   MEASURED_JSON+=("$json")
@@ -554,12 +722,12 @@ measure_and_add() {
 # app.log and appends the resulting checks to MEASURED_JSON. Never aborts:
 # a log-scan hiccup shouldn't take down an otherwise-complete run.
 scenario_log_checks() {
-  local scenario="$1" recording="$2" app_log="$3"
+  local scenario="$1" recording="$2" app_log="$3" fell_behind_max="${4:-$LOG_FELL_BEHIND_MAX}"
   local logscan_json="$OUT/logs/${recording}.logscan.json"
   python3 "$E2E_DIR/analyze.py" logscan "$app_log" --json-out "$logscan_json" || true
   local check_json="$OUT/rec/${recording}_logcheck.json"
   python3 "$E2E_DIR/analyze.py" log-check --logscan "$logscan_json" \
-    --fell-behind-max "$LOG_FELL_BEHIND_MAX" --error-max "$LOG_ERROR_MAX" --panic-max "$LOG_PANIC_MAX" \
+    --fell-behind-max "$fell_behind_max" --error-max "$LOG_ERROR_MAX" --panic-max "$LOG_PANIC_MAX" \
     --scenario "$scenario" --recording "$recording" --json-out "$check_json" || true
   [ -s "$check_json" ] && MEASURED_JSON+=("$check_json")
 }
@@ -588,7 +756,7 @@ scenario_baseline() {
     # first (a no-op reuse when it's still alive, e.g. this loop's first
     # pass right after start_graph's own xephyr).
     run_nested xephyr "$DISPLAY_ARG"
-    run_nested launch "$DISPLAY_ARG" --lang "$LANG_ARG" \
+    run_nested launch "$DISPLAY_ARG" --lang "$LANG_ARG" "${BIN_ARGS[@]}" \
       --config "engine = \"$engine\"" --config "mode = \"$mode\""
     APP_LOG="$CLEANMIC_HARNESS_STATE/display-${DISPLAY_ARG#:}/app.log"
     if ! wait_for_log "Audio processing started" 30 "$APP_LOG"; then
@@ -872,6 +1040,76 @@ scenario_autogain() {
 }
 
 # ---------------------------------------------------------------------------
+# SCENARIO: stress -- controlled synthetic CPU load (debug session
+# dfn-panic-under-load). Per $STRESS_ENGINES entry: fresh launch, settle,
+# pin the app next to busy loops (start_cpu_load), record while loaded,
+# unload, record again. Invariants: the app survives, the vendored
+# DeepFilterNet plugin never reaches its abort, the virtual mic never goes
+# dead for longer than STRESS_DEAD_RUN_MAX_MS, a runtime fallback (if any)
+# lands within STRESS_RECOVERY_MAX_S of the load starting, and the post-load
+# recording passes the normal speech rules for whichever engine is active.
+# ---------------------------------------------------------------------------
+
+scenario_stress() {
+  command -v taskset >/dev/null 2>&1 || abort 3 "the stress scenario needs taskset (util-linux)."
+  local engine mode="MaxQuality"
+  for engine in $STRESS_ENGINES; do
+    log "scenario stress: launching $engine/$mode"
+    launch_and_wait "$engine" "$mode"
+    local actual_engine=""
+    actual_engine="$(grep -Eo 'Engine set to [A-Za-z0-9]+' "$APP_LOG" 2>/dev/null | tail -1 | awk '{print $NF}')" || true
+    if [ "$actual_engine" != "$engine" ]; then
+      log "stress: $engine not available in this build (got '${actual_engine:-none}') -- SKIP"
+      run_nested stop "$DISPLAY_ARG"
+      local skip_json="$OUT/rec/stress_${engine}_skip.json"
+      python3 "$E2E_DIR/analyze.py" check --scenario stress --recording "stress_${engine}" \
+        --metric availability --value "${actual_engine:-none}" --threshold-desc "== $engine" \
+        --result SKIP --note "not available in this build" --json-out "$skip_json"
+      MEASURED_JSON+=("$skip_json")
+      continue
+    fi
+    wait_for_log "Linked cmtest_mic:capture_MONO -> CleanMic-capture:input_MONO" 10 "$APP_LOG" || true
+    sleep "$STRESS_SETTLE_S"
+
+    local app_pid=""
+    app_pid="$(bash "$NESTED_RUN" app-pid "$DISPLAY_ARG" 2>/dev/null)" || abort 5 "stress: no harness app pid for $engine."
+    local load_start; load_start="$(date +%s.%N)"
+    start_cpu_load "$app_pid"
+    record_pair "stress_${engine}_load" "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+    stop_cpu_load
+    measure_and_add stress "stress_${engine}_load" stress_load --meta "engine=$engine" --meta "mode=$mode" \
+      --meta "stress_spinners=$STRESS_SPINNERS"
+
+    sleep 2
+    local mid_scan="$OUT/logs/stress_${engine}_mid.logscan.json"
+    python3 "$E2E_DIR/analyze.py" logscan "$APP_LOG" --json-out "$mid_scan" >/dev/null || true
+    local active="$engine"
+    active="$(python3 "$E2E_DIR/analyze.py" active-engine --logscan "$mid_scan" --started-with "$engine" 2>/dev/null)" || active="$engine"
+    log "stress: active engine after load: $active"
+    record_pair "stress_${engine}_post" "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+    measure_and_add stress "stress_${engine}_post" speech --meta "engine=$active" --meta "mode=$mode"
+    # Informational: the engine selector must show the engine really running
+    # (a runtime fallback is session-only, so config.toml keeps the user's
+    # choice and check-layout would rightly disagree -- not run here).
+    bash "$NESTED_RUN" scroll "$DISPLAY_ARG" top >/dev/null 2>&1 || true
+    bash "$NESTED_RUN" shot "$DISPLAY_ARG" "$OUT/shots/stress_${engine}_after.png" >/dev/null 2>&1 || true
+
+    local alive="yes"
+    app_alive "$app_pid" || alive="no"
+    run_nested stop "$DISPLAY_ARG"
+    cp "$APP_LOG" "$OUT/logs/stress_${engine}.log" 2>/dev/null || true
+    local scan="$OUT/logs/stress_${engine}.logscan.json"
+    python3 "$E2E_DIR/analyze.py" logscan "$APP_LOG" --json-out "$scan" >/dev/null || true
+    local check_json="$OUT/rec/stress_${engine}_check.json"
+    python3 "$E2E_DIR/analyze.py" stress-check --logscan "$scan" --app-alive "$alive" \
+      --load-start "$load_start" --recovery-max-s "$STRESS_RECOVERY_MAX_S" \
+      --scenario stress --recording "stress_${engine}" --json-out "$check_json" || true
+    [ -s "$check_json" ] && MEASURED_JSON+=("$check_json")
+    scenario_log_checks stress "stress_${engine}" "$APP_LOG" "$STRESS_LOG_FELL_BEHIND_MAX"
+  done
+}
+
+# ---------------------------------------------------------------------------
 # SCENARIO: monitor (--monitor-null-sink only) -- CleanMic-monitor routed
 # ONLY to a second, audited, RDP-safe null-sink loopback.
 # ---------------------------------------------------------------------------
@@ -943,11 +1181,12 @@ start_graph
 
 RUN_LIST="${SCENARIOS[*]}"
 if [[ " $RUN_LIST " == *" all "* ]]; then
-  RUN_LIST="baseline swaps toggle modes dc autogain"
+  RUN_LIST="baseline swaps toggle modes dc autogain stress"
   [ "$MONITOR_NULL_SINK" = 1 ] && RUN_LIST="$RUN_LIST monitor"
 fi
 
 for s in $RUN_LIST; do
+  CURRENT_SCENARIO="$s"
   case "$s" in
     baseline) scenario_baseline ;;
     swaps) scenario_swaps ;;
@@ -955,6 +1194,7 @@ for s in $RUN_LIST; do
     modes) scenario_modes ;;
     dc) scenario_dc ;;
     autogain) scenario_autogain ;;
+    stress) scenario_stress ;;
     monitor) scenario_monitor ;;
     all) : ;;
     *) abort 2 "unknown scenario '$s'." ;;

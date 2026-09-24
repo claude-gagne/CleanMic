@@ -9,6 +9,9 @@ display or any recorded audio (see test_analyze.py). The `measure` and
 USAGE
   analyze.py measure REC.wav --scenario S --recording R --kind K \
       [--meta k=v]... --json-out OUT.json
+  analyze.py stress-check --logscan L.json --app-alive yes|no --load-start EPOCH \
+      --recovery-max-s N --scenario S --recording R --json-out OUT.json
+  analyze.py active-engine --logscan L.json --started-with ENGINE
   analyze.py report --out report.md [--threshold k=v]... [--meta k=v]... \
       [--aborted REASON] MEASURED.json...
 
@@ -232,6 +235,37 @@ def holes(o: np.ndarray, fs: int = 48000, frame_ms: float = 10.0) -> int:
     return count
 
 
+def dead_speech(inp: np.ndarray, out: np.ndarray, fs: int = 48000, frame_ms: float = 10.0) -> tuple[float, float]:
+    """(longest_run_ms, total_ms) of "dead output": 10 ms frames where the
+    INPUT carries speech-level signal (> -35 dBFS) but the output is digital
+    silence (< -100 dBFS). Every observed failure is exact zeros -- the
+    dfn-panic-under-load crash (process died -> the virtual source vanished
+    -> 15 s of zeros), the plugin's inserted 10 ms blocks, output-ring
+    underruns -- while legitimate suppression bottoms out far higher: in the
+    first stress run RNNoise took loud noise-only stretches down to -70..-79
+    dBFS and a fresh RNNoise's onset frames to -89 dBFS, so -70 dBFS would
+    have flagged real denoising as "dead". Frames with a quiet input neither
+    extend nor break a run (a dead engine stays dead through speech pauses).
+    `inp` and `out` must already be scoped to the same (active) region."""
+    frame = int(fs * frame_ms / 1000)
+    m = min(len(inp), len(out)) // frame
+    if frame <= 0 or m == 0:
+        return 0.0, 0.0
+    lvl = lambda x: 20 * np.log10(np.sqrt(np.mean(x[: m * frame].reshape(m, frame) ** 2, axis=1)) + 1e-12)  # noqa: E731
+    in_db, out_db = lvl(inp), lvl(out)
+    run = longest = total = 0
+    for k in range(m):
+        if in_db[k] <= -35:
+            continue
+        if out_db[k] < -100:
+            run += 1
+            total += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return longest * frame_ms, total * frame_ms
+
+
 def dc_offset(x: np.ndarray, fs: int = 48000) -> float:
     """Mean over the active region, excluding its first 1 s (onset
     transients / DC-blocker settling should not bias the measurement)."""
@@ -270,6 +304,13 @@ _LOG_ERROR_RE = re.compile(r" ERROR ")
 _LOG_PANIC_RE = re.compile(r"panicked")
 _LOG_WARN_RE = re.compile(r".*\bWARN\b.*")
 _LOG_UNDERRUN_RE = re.compile(r"underrun|xrun", re.IGNORECASE)
+# dfn-panic-under-load: the runtime engine fallback (src/app.rs), the vendored
+# DeepFilterNet plugin's own abort message (must never appear again), and the
+# DeepFilterNet underrun guard's restart / give-up lines (src/engine/deepfilter.rs).
+_LOG_FALLBACK_RE = re.compile(r"^\[(\S+) [A-Z]+ +[^\]]*\] Engine fallback: (\w+) -> (\w+) \((\w+)\)", re.MULTILINE)
+_LOG_PLUGIN_ABORT_RE = re.compile(r"Processing too slow! Please upgrade your CPU")
+_LOG_DFN_RESTART_RE = re.compile(r"DeepFilterNet: plugin fell behind real time")
+_LOG_DFN_GAVE_UP_RE = re.compile(r"DeepFilterNet cannot keep up with real time")
 
 
 def logscan(log_text: str) -> dict[str, Any]:
@@ -295,7 +336,67 @@ def logscan(log_text: str) -> dict[str, Any]:
         "mode_changed": _LOG_MODE_CHANGED_RE.findall(log_text),
         "warn_top10": unique_warns,
         "underrun_mentions": len(_LOG_UNDERRUN_RE.findall(log_text)),
+        "fallbacks": [
+            {"t": _log_epoch(ts), "from": a, "to": b, "reason": why}
+            for ts, a, b, why in _LOG_FALLBACK_RE.findall(log_text)
+        ],
+        "plugin_aborts": len(_LOG_PLUGIN_ABORT_RE.findall(log_text)),
+        "dfn_restarts": len(_LOG_DFN_RESTART_RE.findall(log_text)),
+        "dfn_gave_up": len(_LOG_DFN_GAVE_UP_RE.findall(log_text)),
     }
+
+
+def _log_epoch(ts: str) -> float | None:
+    """env_logger's `2026-09-24T15:24:07.616Z` -> Unix seconds (None if unparsable)."""
+    try:
+        return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def evaluate_stress(
+    logscan_result: dict[str, Any],
+    app_alive: bool,
+    load_start_epoch: float,
+    recovery_max_s: float,
+) -> list[dict[str, Any]]:
+    """Log/process-level verdicts for one `stress` run (the recording-level
+    dead-output verdict is the `stress_load` measure rule). Returns check
+    dicts (kind=check) for the report."""
+    rows: list[dict[str, Any]] = []
+
+    def row(metric: str, value: Any, desc: str, result: str, note: str = "") -> None:
+        rows.append({"kind": "check", "metric": metric, "value": value, "threshold_desc": desc, "result": result, "note": note})
+
+    row("app_alive", "yes" if app_alive else "DIED", "== yes", "PASS" if app_alive else "FAIL")
+    aborts = logscan_result.get("plugin_aborts", 0)
+    row("plugin_abort_lines", aborts, "== 0", "PASS" if aborts == 0 else "FAIL", "vendored DeepFilterNet 'Processing too slow!' panic")
+    fallbacks = logscan_result.get("fallbacks", [])
+    if fallbacks:
+        first = fallbacks[0]
+        t = first.get("t")
+        if t is None:
+            row("recovery_s", "unparsable", f"<= {recovery_max_s}", "FAIL")
+        else:
+            note = f"{first['from']} -> {first['to']} ({first['reason']})"
+            if t < load_start_epoch:
+                # The machine was already too busy for the engine before the
+                # synthetic load began (e.g. someone else's build): recovery
+                # happened even earlier.
+                note += "; before the synthetic load started (machine already overloaded)"
+            rec = round(max(0.0, t - load_start_epoch), 2)
+            row("recovery_s", rec, f"<= {recovery_max_s}", "PASS" if rec <= recovery_max_s else "FAIL", note)
+    else:
+        row("recovery_s", "no fallback", f"<= {recovery_max_s}", "INFO", "engine kept up (no runtime fallback logged)")
+    row("dfn_restarts", logscan_result.get("dfn_restarts", 0), "(informational)", "INFO")
+    return rows
+
+
+def active_engine_after(logscan_result: dict[str, Any], started_with: str) -> str:
+    """The engine running at the end of a log: the last runtime fallback's
+    target, else `started_with`."""
+    fallbacks = logscan_result.get("fallbacks", [])
+    return fallbacks[-1]["to"] if fallbacks else started_with
 
 
 def evaluate_swap_sequence(expected: list[tuple[str, str]], logged: list[tuple[str, str]]) -> tuple[str, str]:
@@ -385,6 +486,8 @@ def measure_recording(path: str, scenario: str, recording: str, kind: str, meta:
         "exact_repeat_frac": round(repeat_frac, 4),
         "evaluated_hops": evaluated_hops,
         "holes": holes(out_active, fs),
+        "dead_run_ms": dead_speech(inp[start:end], out_active, fs)[0],
+        "dead_ms": dead_speech(inp[start:end], out_active, fs)[1],
         "zero_runs": len(zr),
         "zero_run_ms": round(sum(length for _, length in zr) / fs * 1000, 1),
         "in_dc": round(dc_offset(inp, fs), 6),
@@ -469,11 +572,20 @@ def eval_speech(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Ro
         repeat_ok = repeat is not None and repeat <= repeat_max
         rows.append(Row("exact_repeat_frac", repeat, f"<= {repeat_max}", "PASS" if repeat_ok else "FAIL", ""))
 
-    holes_max = thresholds.get("holes_max")
+    # Per-engine override (holes_max_<engine>), e.g. DeepFilterNet's plugin
+    # inserts one 10 ms gap per underrun by design.
+    engine_key = f"holes_max_{str(measured.get('engine', '')).lower()}"
+    holes_max = thresholds.get(engine_key, thresholds.get("holes_max"))
     if holes_max is not None:
         h = measured.get("holes")
         holes_ok = h is not None and h <= holes_max
         rows.append(Row("holes", h, f"<= {holes_max}", "PASS" if holes_ok else "FAIL", ""))
+
+    dead_max = thresholds.get("dead_run_max_ms")
+    if dead_max is not None and "dead_run_ms" in measured:
+        d = measured.get("dead_run_ms")
+        dead_ok = d is not None and d <= dead_max
+        rows.append(Row("dead_run_ms", d, f"<= {dead_max}", "PASS" if dead_ok else "FAIL", ""))
 
     return rows
 
@@ -549,6 +661,44 @@ def eval_swaps_during(measured: dict[str, Any], thresholds: dict[str, Any]) -> l
     return [Row("exact_repeat_frac", repeat, f"<= {repeat_max}", "PASS" if ok else "FAIL", "")]
 
 
+def eval_stress_load(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """The recording taken WHILE the app runs under synthetic CPU load
+    (`stress` scenario). Latency/holes are expected to suffer (an overloaded
+    engine inserts 10 ms gaps before the fallback lands), so they are
+    INFO; the invariant is that the virtual mic never goes dead."""
+    run_max = thresholds.get("stress_dead_run_max_ms", 200)
+    run = measured.get("dead_run_ms")
+    ok = run is not None and run <= run_max
+    return [
+        Row("dead_run_ms", run, f"<= {run_max}", "PASS" if ok else "FAIL", "longest dead-output stretch while the mic carried speech"),
+        Row("dead_ms", measured.get("dead_ms"), "(informational)", "INFO", ""),
+        Row("holes", measured.get("holes"), "(informational)", "INFO", ""),
+        Row("zero_run_ms", measured.get("zero_run_ms"), "(informational)", "INFO", ""),
+    ]
+
+
+def _cpu_row(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """INFO row flagging a recording that ran under CPU load (average busy
+    share of all cores during the recording, from /proc/stat)."""
+    busy = measured.get("cpu_busy_pct")
+    if busy is None:
+        return []
+    flag = float(thresholds.get("load_flag_busy_pct", 25))
+    try:
+        loaded = float(busy) > flag
+    except ValueError:
+        loaded = False
+    extra = f", steal {measured.get('cpu_steal_pct', '?')}%, loadavg {measured.get('loadavg_1m', '?')}"
+    notes = []
+    if loaded:
+        notes.append("ran under load")
+    if measured.get("stress_spinners"):
+        # The stress scenario's load is ONE saturated CPU (the app pinned next
+        # to busy loops), which barely moves the all-core average.
+        notes.append(f"synthetic load: app pinned to one CPU with {measured['stress_spinners']} busy loops")
+    return [Row("cpu_busy_pct", f"{busy}{extra}", f"flag > {flag:g}", "INFO", "; ".join(notes))]
+
+
 def eval_check(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
     """A precomputed cross-recording or log-based check (see `check`,
     `diff-check`, `swap-check`, `log-check`): just echo its own verdict."""
@@ -573,13 +723,30 @@ RULES_BY_KIND = {
     "ag_off": eval_ag_off,
     "ag_pink": eval_ag_pink,
     "check": eval_check,
+    "stress_load": eval_stress_load,
 }
 
 
 def evaluate(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
     kind = measured.get("kind", "speech")
     rule = RULES_BY_KIND.get(kind, eval_speech)
-    return rule(measured, thresholds)
+    return rule(measured, thresholds) + _cpu_row(measured, thresholds)
+
+
+def load_summary(measurements: list[dict[str, Any]], thresholds: dict[str, Any]) -> tuple[str, str]:
+    """(max cpu_busy_pct across recordings, "yes"/"no" ran-under-load flag)
+    for the report's Environment table."""
+    flag = float(thresholds.get("load_flag_busy_pct", 25))
+    vals = []
+    for m in measurements:
+        try:
+            vals.append(float(m["cpu_busy_pct"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not vals:
+        return "n/a", "unknown"
+    peak = max(vals)
+    return f"{peak:g}", "yes" if peak > flag else "no"
 
 
 def render_report(
@@ -601,6 +768,9 @@ def render_report(
     ):
         if key in meta:
             lines.append(f"| {key} | {meta[key]} |")
+    peak_busy, under_load = load_summary(measurements, thresholds)
+    lines.append(f"| max_cpu_busy_pct | {peak_busy} |")
+    lines.append(f"| ran_under_load | {under_load} |")
     lines.append("")
 
     lines.append("## Thresholds")
@@ -781,6 +951,25 @@ def cmd_log_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stress_check(args: argparse.Namespace) -> int:
+    with open(args.logscan, encoding="utf-8") as fh:
+        scanned = json.load(fh)
+    rows = evaluate_stress(scanned, args.app_alive == "yes", args.load_start, args.recovery_max_s)
+    for r in rows:
+        r["scenario"] = args.scenario
+        r["recording"] = args.recording
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, indent=2)
+    return 0
+
+
+def cmd_active_engine(args: argparse.Namespace) -> int:
+    with open(args.logscan, encoding="utf-8") as fh:
+        scanned = json.load(fh)
+    print(active_engine_after(scanned, args.started_with))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -842,6 +1031,19 @@ def main(argv: list[str] | None = None) -> int:
     p_logcheck.add_argument("--recording", default="log")
     p_logcheck.add_argument("--json-out", required=True)
 
+    p_stress = sub.add_parser("stress-check")
+    p_stress.add_argument("--logscan", required=True)
+    p_stress.add_argument("--app-alive", required=True, choices=["yes", "no"])
+    p_stress.add_argument("--load-start", type=float, required=True, help="Unix epoch the load started")
+    p_stress.add_argument("--recovery-max-s", type=float, required=True)
+    p_stress.add_argument("--scenario", required=True)
+    p_stress.add_argument("--recording", required=True)
+    p_stress.add_argument("--json-out", required=True)
+
+    p_active = sub.add_parser("active-engine")
+    p_active.add_argument("--logscan", required=True)
+    p_active.add_argument("--started-with", required=True)
+
     args = parser.parse_args(argv)
 
     try:
@@ -859,6 +1061,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_swap_check(args)
         if args.cmd == "log-check":
             return cmd_log_check(args)
+        if args.cmd == "stress-check":
+            return cmd_stress_check(args)
+        if args.cmd == "active-engine":
+            return cmd_active_engine(args)
     except (OSError, ValueError) as exc:
         print(f"analyze: {exc}", file=sys.stderr)
         return 2
