@@ -25,7 +25,7 @@ use pw::spa::param::audio::{AudioFormat, AudioInfoRaw};
 use pw::spa::pod::Pod;
 use pw::stream::{Stream, StreamFlags};
 
-use super::ringbuf::{RingBufReader, RingBufWriter};
+use super::ringbuf::{BacklogLimiter, RingBufReader, RingBufWriter};
 use super::{NODE_CHANNELS, NODE_NAME, NODE_SAMPLE_RATE, PipeWireError};
 
 /// Handle to the PipeWire main-loop thread and shared state needed to
@@ -530,6 +530,11 @@ impl LivePipeWireManager {
         let stream = Stream::new(core, "CleanMic-output", props)
             .map_err(|e| PipeWireError::NodeCreationFailed(format!("Stream::new failed: {e}")))?;
 
+        // This stream follows the CleanMic null-sink's clock while the audio
+        // thread follows the mic's clock: shed any standing backlog so a
+        // transient can never become permanent latency (see BacklogLimiter).
+        let mut limiter = BacklogLimiter::new();
+
         let listener = stream
             .add_local_listener()
             .state_changed(|_stream, _data: &mut (), old, new| {
@@ -552,10 +557,7 @@ impl LivePipeWireManager {
                         let n_samples = data.maxsize as usize / std::mem::size_of::<f32>();
                         let slice =
                             std::slice::from_raw_parts_mut(data.data as *mut f32, n_samples);
-                        let read = output_reader.read(slice);
-                        for s in &mut slice[read..] {
-                            *s = 0.0;
-                        }
+                        limiter.read_padded(&output_reader, slice);
                         if !data.chunk.is_null() {
                             let chunk = &mut *data.chunk;
                             chunk.offset = 0;
@@ -714,6 +716,10 @@ impl LivePipeWireManager {
         let stream = Stream::new(core, "CleanMic-monitor", props)
             .map_err(|e| PipeWireError::NodeCreationFailed(format!("Stream::new failed: {e}")))?;
 
+        // Follows the playback sink's clock (e.g. Bluetooth), not the mic's:
+        // shed standing backlog like the output stream does.
+        let mut limiter = BacklogLimiter::new();
+
         let listener = stream
             .add_local_listener()
             .state_changed(|_stream, _data: &mut (), old, new| {
@@ -752,11 +758,8 @@ impl LivePipeWireManager {
                             // Read mono frames into the first half of a stack
                             // scratch buffer, then interleave into the output.
                             let mut mono_buf = vec![0f32; n_mono_frames];
-                            let read = monitor_reader.read(&mut mono_buf);
-                            // Zero any unread frames (ring buffer underrun).
-                            for s in &mut mono_buf[read..] {
-                                *s = 0.0;
-                            }
+                            // Zero-pads unread frames (ring buffer underrun).
+                            limiter.read_padded(&monitor_reader, &mut mono_buf);
                             // Interleave: out[2*i] = FL, out[2*i+1] = FR
                             for (i, &sample) in mono_buf.iter().enumerate() {
                                 out[2 * i] = sample;

@@ -148,6 +148,123 @@ impl RingBufReader {
         let w = inner.write_pos.load(Ordering::Acquire);
         w.wrapping_sub(r) & mask
     }
+
+    /// Drop up to `n` of the OLDEST queued samples without copying them,
+    /// returning how many were dropped.
+    ///
+    /// SPSC-safe: only the reader ever moves `read_pos`, and we never move it
+    /// past the write cursor we observed. RT-safe: two atomics, no allocation.
+    pub fn discard(&self, n: usize) -> usize {
+        let inner = &*self.inner;
+        let mask = inner.capacity - 1;
+        let r = inner.read_pos.load(Ordering::Relaxed);
+        let w = inner.write_pos.load(Ordering::Acquire);
+        let n = n.min(w.wrapping_sub(r) & mask);
+        inner.read_pos.store((r + n) & mask, Ordering::Release);
+        n
+    }
+
+    /// Drop everything currently queued (skip to the writer's cursor),
+    /// returning how many samples were dropped.
+    pub fn discard_all(&self) -> usize {
+        self.discard(usize::MAX)
+    }
+}
+
+/// Observation window of [`BacklogLimiter`], in samples requested by the
+/// consumer (1 s at 48 kHz).
+const LIMITER_WINDOW: usize = 48_000;
+/// Standing backlog tolerated before [`BacklogLimiter`] sheds (50 ms).
+const LIMITER_MAX_STANDING: usize = 2_400;
+/// Backlog [`BacklogLimiter`] leaves in place after shedding, as jitter
+/// headroom (20 ms).
+const LIMITER_KEEP: usize = 960;
+
+/// Consumer-side latency bound for a ring that bridges two independently
+/// clocked PipeWire graphs (e.g. the ALSA-mic-driven audio thread feeding the
+/// CleanMic-null-sink-driven output stream, or the Bluetooth-sink-driven
+/// monitor stream).
+///
+/// Without it, any transient that lets the producer run ahead (a stalled
+/// audio thread catching up, clock drift) leaves a backlog that both ends
+/// then preserve forever, because each runs at exactly real time — latency
+/// only ever ratchets up, until the ring saturates (65535 samples = 1.37 s).
+///
+/// It sheds only *standing* backlog: the minimum fill seen right after each
+/// read over a whole window. Normal burstiness (a producer delivering a full
+/// PipeWire quantum at once, a consumer pulling a large buffer) raises the
+/// peaks, not that minimum, so it never trims healthy jitter headroom. And it
+/// cannot oscillate: if shedding ever leaves too little headroom, the next
+/// underrun drives the window minimum to ~0, which never triggers a shed.
+pub struct BacklogLimiter {
+    window: usize,
+    max_standing: usize,
+    keep: usize,
+    /// Samples requested by the consumer since the window started.
+    elapsed: usize,
+    /// Lowest post-read fill seen in the current window.
+    min_fill: usize,
+    /// Total samples shed so far (diagnostics/tests).
+    shed_total: usize,
+}
+
+impl BacklogLimiter {
+    /// Create a limiter with the production tuning (1 s window, shed when
+    /// more than 50 ms stood unused for the whole window, keep 20 ms).
+    pub fn new() -> Self {
+        Self::with_params(LIMITER_WINDOW, LIMITER_MAX_STANDING, LIMITER_KEEP)
+    }
+
+    /// Create a limiter with explicit tuning (all values in samples).
+    pub fn with_params(window: usize, max_standing: usize, keep: usize) -> Self {
+        assert!(window > 0 && keep <= max_standing);
+        Self {
+            window,
+            max_standing,
+            keep,
+            elapsed: 0,
+            min_fill: usize::MAX,
+            shed_total: 0,
+        }
+    }
+
+    /// Consumer read: fill `out` from `reader`, zero-pad any shortfall
+    /// (underrun), shed standing backlog if a window just completed, and
+    /// return the number of real samples read.
+    ///
+    /// RT-safe: no allocation, no locks, no syscalls.
+    pub fn read_padded(&mut self, reader: &RingBufReader, out: &mut [f32]) -> usize {
+        let read = reader.read(out);
+        for s in &mut out[read..] {
+            *s = 0.0;
+        }
+
+        self.min_fill = self.min_fill.min(reader.available());
+        self.elapsed += out.len();
+        if self.elapsed >= self.window {
+            let standing = self.min_fill;
+            self.elapsed = 0;
+            self.min_fill = usize::MAX;
+            if standing > self.max_standing {
+                // Everything above `standing` was consumed at some point in
+                // the window, so dropping `standing - keep` of the oldest
+                // samples removes only audio that was never needed in time.
+                self.shed_total += reader.discard(standing - self.keep);
+            }
+        }
+        read
+    }
+
+    /// Total number of samples shed since creation.
+    pub fn shed_total(&self) -> usize {
+        self.shed_total
+    }
+}
+
+impl Default for BacklogLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +351,138 @@ mod tests {
         let mut buf = [0.0f32; 4];
         r.read(&mut buf);
         assert_eq!(r.available(), 6);
+    }
+
+    #[test]
+    fn discard_drops_oldest_and_is_clamped_to_available() {
+        let (w, r) = ring_buffer(64);
+        let input: Vec<f32> = (1..=10).map(|i| i as f32).collect();
+        w.write(&input);
+        assert_eq!(r.discard(4), 4);
+        let mut out = [0.0f32; 2];
+        r.read(&mut out);
+        assert_eq!(out, [5.0, 6.0], "discard must drop the OLDEST samples");
+        assert_eq!(r.discard(100), 4, "discard is clamped to what is queued");
+        assert_eq!(r.available(), 0);
+    }
+
+    #[test]
+    fn discard_all_skips_to_writer_across_wrap() {
+        let (w, r) = ring_buffer(8); // usable 7
+        w.write(&[1.0; 5]);
+        let mut out = [0.0f32; 5];
+        r.read(&mut out);
+        w.write(&[2.0; 6]); // wraps
+        assert_eq!(r.discard_all(), 6);
+        assert_eq!(r.available(), 0);
+        w.write(&[3.0; 3]);
+        let mut out = [0.0f32; 3];
+        assert_eq!(r.read(&mut out), 3);
+        assert_eq!(out, [3.0; 3], "ring stays coherent after discard_all");
+    }
+
+    /// Drive `limiter` for `callbacks` consumer reads of `read_len` samples,
+    /// with the producer adding `produce(i)` samples before read `i`.
+    fn drive(
+        limiter: &mut BacklogLimiter,
+        w: &RingBufWriter,
+        r: &RingBufReader,
+        read_len: usize,
+        callbacks: usize,
+        produce: impl Fn(usize) -> usize,
+    ) -> usize {
+        let mut out = vec![0.0f32; read_len];
+        let mut underruns = 0;
+        for i in 0..callbacks {
+            w.write(&vec![0.5f32; produce(i)]);
+            if limiter.read_padded(r, &mut out) < read_len {
+                underruns += 1;
+            }
+        }
+        underruns
+    }
+
+    #[test]
+    fn limiter_read_padded_zero_fills_underrun() {
+        let (w, r) = ring_buffer(64);
+        let mut limiter = BacklogLimiter::new();
+        w.write(&[1.0; 3]);
+        let mut out = [9.0f32; 5];
+        assert_eq!(limiter.read_padded(&r, &mut out), 3);
+        assert_eq!(out, [1.0, 1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn limiter_sheds_standing_backlog_down_to_keep() {
+        // 200 ms standing backlog (a stalled producer that caught up), then a
+        // steady producer/consumer at 1024 per callback.
+        let (w, r) = ring_buffer(65_536);
+        let mut limiter = BacklogLimiter::new();
+        w.write(&vec![0.5f32; 9_600]);
+        let underruns = drive(&mut limiter, &w, &r, 1024, 100, |_| 1024);
+        assert_eq!(underruns, 0);
+        assert_eq!(limiter.shed_total(), 9_600 - LIMITER_KEEP);
+        assert_eq!(r.available(), LIMITER_KEEP);
+    }
+
+    #[test]
+    fn limiter_ignores_bursty_but_healthy_traffic() {
+        // Producer delivers 8192 at once every 8th callback (large PipeWire
+        // quantum), consumer pulls 1024: fill swings 0..8192 but nothing
+        // stands unused — must never shed.
+        let (w, r) = ring_buffer(65_536);
+        let mut limiter = BacklogLimiter::new();
+        drive(&mut limiter, &w, &r, 1024, 2_000, |i| {
+            if i % 8 == 0 { 8192 } else { 0 }
+        });
+        assert_eq!(limiter.shed_total(), 0);
+
+        // Mirror case: consumer pulls a whole 8192-sample buffer every 8th
+        // quantum (live callbacks read `maxsize`), producer trickles 1024 per
+        // quantum, consumer phase offset by 3 quanta.
+        let (w, r) = ring_buffer(65_536);
+        let mut limiter = BacklogLimiter::new();
+        let mut out = vec![0.0f32; 8192];
+        let mut underruns = 0;
+        for q in 0..4_000 {
+            w.write(&[0.5f32; 1024]);
+            if q % 8 == 3 && limiter.read_padded(&r, &mut out) < out.len() {
+                underruns += 1;
+            }
+        }
+        assert_eq!(limiter.shed_total(), 0);
+        assert_eq!(
+            underruns, 1,
+            "only the very first (phase-offset) read is short"
+        );
+    }
+
+    #[test]
+    fn limiter_does_not_shed_while_underrunning() {
+        // Producer slower than consumer (drift in the draining direction, or
+        // pipeline stopped): the ring keeps running dry — never shed.
+        let (w, r) = ring_buffer(65_536);
+        let mut limiter = BacklogLimiter::new();
+        let underruns = drive(&mut limiter, &w, &r, 1024, 500, |i| {
+            if i % 10 == 0 { 0 } else { 1024 }
+        });
+        assert!(underruns > 0);
+        assert_eq!(limiter.shed_total(), 0);
+    }
+
+    #[test]
+    fn limiter_bounds_drift_accumulation() {
+        // Producer 1% faster than consumer: without shedding the fill would
+        // grow by ~10 samples per callback forever.
+        let (w, r) = ring_buffer(65_536);
+        let mut limiter = BacklogLimiter::new();
+        drive(&mut limiter, &w, &r, 1000, 20_000, |_| 1010);
+        assert!(
+            r.available() <= LIMITER_MAX_STANDING + 1010,
+            "fill {} not bounded",
+            r.available()
+        );
+        assert!(limiter.shed_total() > 0);
     }
 
     #[test]

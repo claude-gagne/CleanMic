@@ -496,6 +496,23 @@ pub fn shutdown(
     Ok(())
 }
 
+/// Apply the persisted settings to a freshly created engine before it is
+/// handed to the audio thread: the ACTUAL engine's own remembered strength
+/// (D-13) and the global processing Mode.
+///
+/// Shared by the startup path and the live engine-swap path so a swapped-in
+/// engine is configured exactly like one created at launch. The swap path
+/// used to skip `set_mode`, so a live-selected DPDFNet ran its constructor
+/// default (Balanced, decimated inference) while the UI showed MaxQuality.
+fn apply_engine_settings(
+    eng: &mut dyn engine::NoiseEngine,
+    config: &Config,
+    actual_type: EngineType,
+) {
+    eng.set_strength(config.strength_for(actual_type));
+    eng.set_mode(config.mode);
+}
+
 /// Dispatch a [`UiEvent`] to the audio pipeline and update config accordingly.
 ///
 /// `last_explicit` tracks the user's most recent explicit named-mic pick
@@ -530,11 +547,12 @@ fn handle_ui_event(
             }
             // Apply the ACTUAL engine's own remembered strength (D-13) —
             // never the previously-active engine's value and never a shared
-            // global.
-            eng.set_strength(config.strength_for(actual_type));
+            // global — and the current Mode, exactly as at startup.
+            apply_engine_settings(eng.as_mut(), config, actual_type);
             pipeline.set_engine(eng);
             config.engine = actual_type;
-            log::info!("Engine changed to {:?}", actual_type);
+            let mode = config.mode;
+            log::info!("Engine changed to {actual_type:?} (mode={mode:?})");
         }
         UiEvent::StrengthChanged(strength) => {
             pipeline.set_strength(strength);
@@ -927,8 +945,7 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
     // whatever the UI was showing at launch. Uses the ACTUAL engine's own
     // remembered strength (D-13) — never the requested engine's value when
     // a fallback occurred.
-    eng.set_strength(config.strength_for(actual_type));
-    eng.set_mode(config.mode);
+    apply_engine_settings(eng.as_mut(), &config, actual_type);
     pipeline.set_engine(eng);
     log::info!(
         "Engine set to {:?} (strength={:.2}, mode={:?})",
@@ -2283,6 +2300,62 @@ fn sync_tray_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── apply_engine_settings (live swap == startup configuration) ────────
+
+    /// Records the settings applied to it, so the test can see exactly what
+    /// a freshly created engine is configured with before it goes live.
+    struct SettingsSpy {
+        strength: Option<f32>,
+        mode: Option<crate::engine::ProcessingMode>,
+    }
+
+    impl engine::NoiseEngine for SettingsSpy {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, strength: f32) {
+            self.strength = Some(strength);
+        }
+        fn set_mode(&mut self, mode: crate::engine::ProcessingMode) {
+            self.mode = Some(mode);
+        }
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    /// Regression (debug session latency-grows-after-engine-swap, RC2): a
+    /// live-swapped engine must get the configured Mode, not its constructor
+    /// default (DPDFNet defaults to Balanced = decimated inference, audibly
+    /// robotic while the UI showed MaxQuality), plus its OWN strength.
+    #[test]
+    fn apply_engine_settings_applies_mode_and_the_engines_own_strength() {
+        use crate::engine::ProcessingMode;
+        for mode in [
+            ProcessingMode::MaxQuality,
+            ProcessingMode::Balanced,
+            ProcessingMode::LowCpu,
+        ] {
+            let mut config = Config {
+                mode,
+                ..Config::default()
+            };
+            config.set_strength_for(EngineType::Dpdfnet2, 0.83);
+            config.set_strength_for(EngineType::RNNoise, 0.17);
+            let mut spy = SettingsSpy {
+                strength: None,
+                mode: None,
+            };
+            apply_engine_settings(&mut spy, &config, EngineType::Dpdfnet2);
+            assert_eq!(spy.mode, Some(mode), "mode not applied to swapped engine");
+            assert_eq!(spy.strength, Some(0.83), "wrong engine's strength applied");
+        }
+    }
 
     // ── resolve_runtime_capture_target (R1) ───────────────────────────────
 

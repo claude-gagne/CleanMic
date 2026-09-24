@@ -27,6 +27,26 @@ const SAMPLE_RATE: u32 = 48_000;
 /// Duration of the crossfade window in samples (~10 ms at 48 kHz).
 const CROSSFADE_SAMPLES: usize = 480;
 
+/// Hard cap on queued capture audio (200 ms). Above this the audio thread is
+/// running behind (engine slower than real time, long stall) and the oldest
+/// audio is dropped rather than played out late. Must stay above the largest
+/// single PipeWire capture delivery (default max quantum 8192) plus one block
+/// so a normal large quantum is never trimmed.
+const CAPTURE_MAX_BACKLOG: usize = 9_600;
+
+/// Capture audio kept after trimming to [`CAPTURE_MAX_BACKLOG`] (20 ms).
+const CAPTURE_KEEP_AFTER_TRIM: usize = 2 * BUFFER_SIZE;
+
+/// Maximum blocks processed before the loop returns to service commands and
+/// the heartbeat. Covers a full [`CAPTURE_MAX_BACKLOG`] in one pass, while
+/// guaranteeing a slower-than-real-time engine cannot starve Stop/SetEngine.
+const MAX_BLOCKS_PER_PASS: usize = CAPTURE_MAX_BACKLOG / BUFFER_SIZE + 1;
+
+/// Convert a sample count to milliseconds for logging.
+fn samples_to_ms(samples: usize) -> f64 {
+    samples as f64 * 1000.0 / f64::from(SAMPLE_RATE)
+}
+
 /// Commands sent from the control thread to the audio thread.
 pub enum AudioCommand {
     /// Start processing audio.
@@ -560,6 +580,13 @@ fn audio_thread_main(
     // SetRingBuffers.
     let mut has_ring_buffers = capture_reader.is_some() && output_writer.is_some();
 
+    // PipeWire keeps filling the capture ring while we are not running (before
+    // the first Start — engine init can take seconds — and after every Stop).
+    // Set while idle, consumed by the first processing pass after Start, so
+    // that stale audio is discarded instead of being replayed late and turned
+    // into permanent output latency.
+    let mut capture_is_stale = true;
+
     loop {
         // Increment heartbeat counter so the health check can detect liveness.
         heartbeat.fetch_add(1, Ordering::Release);
@@ -611,18 +638,43 @@ fn audio_thread_main(
         if running {
             if has_ring_buffers {
                 // ----- Real PipeWire mode -----
-                // Process ALL available data in a tight loop before yielding.
+                // Process all available data in a tight loop before yielding.
                 // PipeWire delivers audio in quanta (typically 1024 samples) but
                 // we process in BUFFER_SIZE (480) chunks. Processing all available
                 // data at once prevents gaps in the output ring buffer that cause
                 // pulsating audio when PipeWire reads between our iterations.
+                // The pass is bounded (MAX_BLOCKS_PER_PASS) and the backlog is
+                // capped (CAPTURE_MAX_BACKLOG) so a slow engine can neither grow
+                // latency without limit nor starve the command loop.
                 let reader = capture_reader.as_ref().unwrap();
                 let mut processed_any = false;
                 let mut in_sum_sq = 0.0f32;
                 let mut out_sum_sq = 0.0f32;
                 let mut total_samples = 0usize;
 
-                while reader.available() >= BUFFER_SIZE {
+                if capture_is_stale {
+                    capture_is_stale = false;
+                    let dropped = reader.discard_all();
+                    if dropped > 0 {
+                        log::info!(
+                            "Discarded {:.0} ms of capture audio queued while processing was stopped",
+                            samples_to_ms(dropped)
+                        );
+                    }
+                }
+
+                let mut blocks = 0usize;
+                while blocks < MAX_BLOCKS_PER_PASS && reader.available() >= BUFFER_SIZE {
+                    blocks += 1;
+                    let backlog = reader.available();
+                    if backlog > CAPTURE_MAX_BACKLOG {
+                        let dropped = reader.discard(backlog - CAPTURE_KEEP_AFTER_TRIM);
+                        log::warn!(
+                            "Audio thread fell {:.0} ms behind (engine slower than real time?) — dropped the oldest {:.0} ms to keep latency bounded",
+                            samples_to_ms(backlog),
+                            samples_to_ms(dropped)
+                        );
+                    }
                     let read = reader.read(&mut input_buf);
                     for s in &mut input_buf[read..] {
                         *s = 0.0;
@@ -737,6 +789,7 @@ fn audio_thread_main(
                 std::thread::sleep(tick_duration);
             }
         } else {
+            capture_is_stale = true;
             // When not running, block briefly to avoid busy-waiting.
             match cmd_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(AudioCommand::SetRingBuffers {
@@ -1450,5 +1503,297 @@ mod tests {
         );
 
         pipeline.shutdown();
+    }
+
+    // --- Latency / backlog-bound harness ---------------------------------
+    //
+    // Regression coverage for "latency grows after engine swap" (debug
+    // session latency-grows-after-engine-swap): a fake PipeWire thread plays
+    // both RT callbacks on a real 1024-sample (21.3 ms) schedule around the
+    // REAL audio thread. Every capture sample is stamped with its 1-based
+    // index, so each output read reveals exactly how many samples old the
+    // audio is. The output side goes through the same `BacklogLimiter` the
+    // live output/monitor callbacks use.
+
+    use crate::pipewire::ringbuf::{BacklogLimiter, ring_buffer};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    const PW_QUANTUM: usize = 1024;
+
+    struct FakePipeWire {
+        stop: Arc<AtomicBool>,
+        /// Latest measured capture->output latency, in samples.
+        latency: Arc<AtomicUsize>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakePipeWire {
+        fn start(capture_writer: RingBufWriter, output_reader: RingBufReader) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let latency = Arc::new(AtomicUsize::new(usize::MAX));
+            let (stop_t, latency_t) = (stop.clone(), latency.clone());
+            let handle = thread::spawn(move || {
+                let period = Duration::from_secs_f64(PW_QUANTUM as f64 / f64::from(SAMPLE_RATE));
+                let mut limiter = BacklogLimiter::new();
+                let mut cap = vec![0.0f32; PW_QUANTUM];
+                let mut out = vec![0.0f32; PW_QUANTUM];
+                let mut produced = 0usize;
+                let mut next = Instant::now();
+                while !stop_t.load(Ordering::Acquire) {
+                    // Capture callback: the mic delivers one quantum.
+                    for (i, s) in cap.iter_mut().enumerate() {
+                        *s = (produced + i + 1) as f32;
+                    }
+                    capture_writer.write(&cap);
+                    produced += PW_QUANTUM;
+                    // Output callback (same driver clock: no drift).
+                    let n = limiter.read_padded(&output_reader, &mut out);
+                    if n > 0 {
+                        let newest = out[n - 1] as usize;
+                        latency_t.store(produced - newest, Ordering::Release);
+                    }
+                    next += period;
+                    if let Some(d) = next.checked_duration_since(Instant::now()) {
+                        thread::sleep(d);
+                    }
+                }
+            });
+            Self {
+                stop,
+                latency,
+                handle: Some(handle),
+            }
+        }
+
+        /// Median of `n` latency readings taken 20 ms apart, in ms.
+        fn latency_ms(&self, n: usize) -> f64 {
+            let mut v: Vec<usize> = (0..n)
+                .map(|_| {
+                    thread::sleep(Duration::from_millis(20));
+                    self.latency.load(Ordering::Acquire)
+                })
+                .collect();
+            v.sort_unstable();
+            v[n / 2] as f64 * 1000.0 / f64::from(SAMPLE_RATE)
+        }
+    }
+
+    impl Drop for FakePipeWire {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Passthrough engine that sleeps on its first `process()` call, like a
+    /// freshly swapped-in model's slow first inference / old-engine teardown.
+    struct StallOnceEngine {
+        stall: Option<Duration>,
+    }
+
+    impl NoiseEngine for StallOnceEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            if let Some(d) = self.stall.take() {
+                thread::sleep(d);
+            }
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _: f32) {}
+        fn set_mode(&mut self, _: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    /// Passthrough engine that takes `per_block` per 10 ms block while
+    /// `slow` is set (RTF > 1), like DeepFilterNet on a weak CPU.
+    struct SlowEngine {
+        per_block: Duration,
+        slow: Arc<AtomicBool>,
+    }
+
+    impl NoiseEngine for SlowEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            if self.slow.load(Ordering::Acquire) {
+                thread::sleep(self.per_block);
+            }
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _: f32) {}
+        fn set_mode(&mut self, _: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    /// Startup: PipeWire streams capture before the first Start (engine init
+    /// can take seconds; 180 ms on the owner's fresh launch, 1.8 s with
+    /// DeepFilterNet). That queued audio must be discarded at Start. The gap
+    /// is below CAPTURE_MAX_BACKLOG, so only the Start flush can catch it.
+    #[test]
+    fn first_start_discards_capture_queued_during_startup() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        let pw = FakePipeWire::start(cw, or_);
+        thread::sleep(Duration::from_millis(150)); // streaming, not started
+        pipeline.start();
+        thread::sleep(Duration::from_millis(150));
+        let after = pw.latency_ms(5);
+        drop(pw);
+        pipeline.shutdown();
+        assert!(
+            after < 60.0,
+            "latency {after:.1} ms after a 150 ms startup gap: capture queued before Start was replayed"
+        );
+    }
+
+    /// Activer off briefly, then on: the audio queued while stopped must be
+    /// discarded, not played out late. The gap is below CAPTURE_MAX_BACKLOG,
+    /// so only the Start flush can catch it (measured before the output
+    /// BacklogLimiter's 1 s window could shed it).
+    #[test]
+    fn restart_after_short_stop_does_not_replay_stale_capture() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        let pw = FakePipeWire::start(cw, or_);
+        pipeline.start();
+        thread::sleep(Duration::from_millis(300));
+        let baseline = pw.latency_ms(5);
+        pipeline.stop();
+        thread::sleep(Duration::from_millis(150));
+        pipeline.start();
+        thread::sleep(Duration::from_millis(150));
+        let after = pw.latency_ms(5);
+        drop(pw);
+        pipeline.shutdown();
+        assert!(
+            after < baseline + 50.0,
+            "latency after 150 ms Stop/Start = {after:.1} ms (baseline {baseline:.1} ms): \
+             stale capture backlog was replayed into the output"
+        );
+    }
+
+    /// Activer off for longer than the capture ring, then on (the owner's
+    /// 2.85 s toggle against a 1.37 s ring): must not replay stale audio.
+    #[test]
+    fn restart_after_long_stop_does_not_replay_stale_capture() {
+        // 16384-slot ring (341 ms) keeps the test short; production is 65536.
+        let (cw, cr) = ring_buffer(16_384);
+        let (ow, or_) = ring_buffer(16_384);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        let pw = FakePipeWire::start(cw, or_);
+        pipeline.start();
+        thread::sleep(Duration::from_millis(300));
+        let baseline = pw.latency_ms(5);
+        assert!(
+            baseline < 60.0,
+            "harness baseline too high: {baseline:.1} ms"
+        );
+
+        pipeline.stop();
+        thread::sleep(Duration::from_millis(600)); // capture ring fills up
+        pipeline.start();
+        // Measure well inside the first second: this must be the Start
+        // flush, not slow backlog shedding.
+        thread::sleep(Duration::from_millis(150));
+        let after = pw.latency_ms(5);
+        drop(pw);
+        pipeline.shutdown();
+        assert!(
+            after < baseline + 50.0,
+            "latency after Stop/Start = {after:.1} ms (baseline {baseline:.1} ms): \
+             stale capture backlog was replayed into the output"
+        );
+    }
+
+    /// One long audio-thread stall (engine swap first-inference/teardown):
+    /// the backlog it leaves must be shed, not kept as permanent latency.
+    #[test]
+    fn engine_stall_backlog_is_shed_not_kept_forever() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        let pw = FakePipeWire::start(cw, or_);
+        pipeline.start();
+        thread::sleep(Duration::from_millis(300));
+        let baseline = pw.latency_ms(5);
+
+        // 150 ms stays under CAPTURE_MAX_BACKLOG, so the backlog really
+        // reaches the output ring and only the consumer-side BacklogLimiter
+        // can remove it (longer stalls are trimmed on the capture side).
+        pipeline.set_engine(Box::new(StallOnceEngine {
+            stall: Some(Duration::from_millis(150)),
+        }));
+        thread::sleep(Duration::from_millis(400));
+        let right_after = pw.latency_ms(3);
+        assert!(
+            right_after > baseline + 100.0,
+            "harness sanity: a 150 ms stall should first add backlog \
+             (baseline {baseline:.1} ms, after stall {right_after:.1} ms)"
+        );
+
+        thread::sleep(Duration::from_millis(2_300));
+        let settled = pw.latency_ms(5);
+        drop(pw);
+        pipeline.shutdown();
+        assert!(
+            settled < baseline + 50.0,
+            "latency {settled:.1} ms (baseline {baseline:.1} ms) 2.7 s after a \
+             150 ms stall: the stall backlog became permanent latency"
+        );
+    }
+
+    /// An engine slower than real time must not grow latency without bound,
+    /// and must not starve the command loop (heartbeat/Stop/SetEngine).
+    #[test]
+    fn slower_than_realtime_engine_keeps_latency_bounded_and_thread_responsive() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        let pw = FakePipeWire::start(cw, or_);
+        let slow = Arc::new(AtomicBool::new(true));
+        pipeline.set_engine(Box::new(SlowEngine {
+            per_block: Duration::from_micros(12_500), // RTF 1.25
+            slow: slow.clone(),
+        }));
+        pipeline.start();
+
+        thread::sleep(Duration::from_millis(1_000));
+        let hb_1 = pipeline.heartbeat_count();
+        thread::sleep(Duration::from_millis(1_000));
+        let hb_2 = pipeline.heartbeat_count();
+        let mut worst = 0.0f64;
+        for _ in 0..5 {
+            worst = worst.max(pw.latency_ms(3));
+        }
+        // Let the pre-fix code drain so shutdown cannot hang.
+        slow.store(false, Ordering::Release);
+        thread::sleep(Duration::from_millis(200));
+        drop(pw);
+        pipeline.shutdown();
+
+        assert!(
+            hb_2 > hb_1,
+            "audio thread heartbeat froze ({hb_1} -> {hb_2}) while the engine \
+             was behind: commands (Stop/SetEngine/Shutdown) would never run"
+        );
+        assert!(
+            worst < 300.0,
+            "latency reached {worst:.1} ms after ~2.3 s with an RTF 1.25 engine: \
+             the capture backlog is unbounded"
+        );
     }
 }
