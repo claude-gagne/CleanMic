@@ -31,13 +31,20 @@ use crate::ui::welcome;
 ///    session, held in memory across window-level sessions only.)
 /// 3. `system_default_name` if it resolves to an enumerable non-CleanMic device.
 ///    When the OS default is CleanMic itself, this is `None` so we skip it.
-/// 4. The first enumerable non-CleanMic device.
+/// 4. The first AVAILABLE (R1) enumerable non-CleanMic device, falling back
+///    to the first device of any availability if none is available.
 /// 5. `None` → D-10 "no input device available" state.
 ///
 /// `list_input_devices()` already filters CleanMic out, so any name appearing
 /// in `devices` is guaranteed non-CleanMic — we cannot accidentally pin the
 /// capture stream to CleanMic itself. This function is pure; side effects
 /// (retargeting capture, updating UI) happen at call sites.
+///
+/// `devices` here MUST be the unfiltered enumeration (never the picker-only
+/// `picker_devices()` output) — R1's picker-only filter must never cause a
+/// silent capture retarget. If `config_input_device` or `last_explicit` names
+/// an unavailable-but-enumerated device, it is still returned as-is (no
+/// silent switch away from the user's explicit pin).
 fn resolve_runtime_capture_target(
     devices: &[InputDevice],
     config_input_device: Option<&str>,
@@ -61,7 +68,11 @@ fn resolve_runtime_capture_target(
     {
         return Some(name.to_string());
     }
-    devices.first().map(|d| d.name.clone())
+    devices
+        .iter()
+        .find(|d| d.available)
+        .or_else(|| devices.first())
+        .map(|d| d.name.clone())
 }
 
 /// Query the OS default source name, filtering it to `None` when the default
@@ -101,6 +112,27 @@ fn resolve_initial_capture_target(pw: &PipeWireManager, config: &Config) -> Opti
         None, // no prior-session last_explicit available at startup
         system_default_name.as_deref(),
     )
+}
+
+/// Compute the picker's device list (R1, R2, OWNER-LOCK) as `DeviceInfo`s
+/// ready for `UiState`/`WindowHandles::update_device_list`.
+///
+/// Thin wrapper over [`crate::pipewire::devices::picker_devices`] — never
+/// use this output for `resolve_runtime_capture_target` or D-10 detection,
+/// both of which need the unfiltered `devices` slice.
+fn picker_device_infos(
+    devices: &[InputDevice],
+    pinned: Option<&str>,
+    system_default: Option<&str>,
+) -> Vec<crate::ui::DeviceInfo> {
+    crate::pipewire::devices::picker_devices(devices, pinned, system_default)
+        .into_iter()
+        .map(|d| crate::ui::DeviceInfo {
+            name: d.name,
+            description: d.description,
+            available: d.available,
+        })
+        .collect()
 }
 
 /// Rate-limits GNOME desktop notifications to at most one per ID per 60 seconds (per D-03).
@@ -1256,13 +1288,11 @@ fn run_with_gui(
             // OS default see a visible picker flash as the entry appears late
             // and the selection jumps. Per WR-01.
             initial_state.system_default_name = current_system_default_name(&pw, &devices);
-            initial_state.available_devices = devices
-                .iter()
-                .map(|d| crate::ui::DeviceInfo {
-                    name: d.name.clone(),
-                    description: d.description.clone(),
-                })
-                .collect();
+            initial_state.available_devices = picker_device_infos(
+                &devices,
+                initial_state.input_device.as_deref(),
+                initial_state.system_default_name.as_deref(),
+            );
             initial_state.khip_available =
                 engine::is_engine_available(EngineType::Khip);
             // Independent five-engine availability/reason map (T-15.1-07/
@@ -1899,13 +1929,12 @@ fn run_with_gui(
             // this, the picker never refreshes on plug/unplug when the OS
             // default stays the same (common hot-unplug path with webcam mic
             // still enumerable).
-            let last_pushed_devices: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(Some(
-                initial_state
-                    .available_devices
-                    .iter()
-                    .map(|d| d.name.clone())
-                    .collect(),
-            )));
+            // Holds the last `Vec<DeviceInfo>` pushed to the picker (full
+            // struct, not just names) so availability flips (R1: jack
+            // plug/unplug does not change node names, only route
+            // availability) and pin/default changes both trigger a refresh.
+            let last_pushed_devices: Rc<RefCell<Option<Vec<crate::ui::DeviceInfo>>>> =
+                Rc::new(RefCell::new(Some(initial_state.available_devices.clone())));
             // Track whether Khip has been detected at runtime so the re-poll
             // inside the 1500ms timer can early-return once detected. Seeded
             // from the construction-time UiState value so the first tick is a
@@ -1924,18 +1953,25 @@ fn run_with_gui(
                     current_system_default_name(&pw_ref, &devices)
                 };
 
-                // Convert InputDevice → DeviceInfo for the UI layer.
-                let ui_devices: Vec<crate::ui::DeviceInfo> = devices
-                    .iter()
-                    .map(|d| crate::ui::DeviceInfo {
-                        name: d.name.clone(),
-                        description: d.description.clone(),
-                    })
-                    .collect();
+                // Read the persisted pin once at the top of the tick — reused
+                // both for the picker filter/labeling below and as
+                // `update_device_list`'s `current_device` argument, so both
+                // reflect the exact same snapshot within this tick.
+                let config_input_device_snapshot = {
+                    let cfg = config_timer_slow.borrow();
+                    cfg.input_device.clone()
+                };
 
-                // Snapshot the enumerated device names for G-02 change detection.
-                let current_device_names: Vec<String> =
-                    devices.iter().map(|d| d.name.clone()).collect();
+                // R1 picker-only filter + "(unplugged)" labeling. Never used
+                // for D-10 detection or capture-target resolution below —
+                // both of those MUST see the full unfiltered `devices` so an
+                // unavailable-but-pinned/default device is never silently
+                // dropped from capture (R1).
+                let ui_devices: Vec<crate::ui::DeviceInfo> = picker_device_infos(
+                    &devices,
+                    config_input_device_snapshot.as_deref(),
+                    system_default_name.as_deref(),
+                );
 
                 // Detect D-10 "no input device available" state transitions.
                 let is_no_input = devices.is_empty() && system_default_name.is_none();
@@ -1958,16 +1994,20 @@ fn run_with_gui(
                 }
 
                 // G-02: refresh the picker when either the OS default name
-                // changed OR the device enumeration changed (plug/unplug while
-                // default stays the same is the common hot-unplug path and must
-                // still refresh). Before G-02 (Plan 03) the gate was default-only
-                // and the picker would keep displaying an unplugged mic.
+                // changed OR the picker-facing device list changed (plug/unplug
+                // while default stays the same is the common hot-unplug path
+                // and must still refresh; R1 also makes an availability flip —
+                // e.g. jack plug/unplug, which never changes node names —
+                // routine, so comparing the full `Vec<DeviceInfo>` catches it
+                // where a names-only comparison would not). Before G-02
+                // (Plan 03) the gate was default-only and the picker would
+                // keep displaying an unplugged mic.
                 let last_pushed_default_snapshot = last_pushed_default.borrow().clone();
                 let current_default_as_opt_opt: Option<Option<String>> =
                     Some(system_default_name.clone());
                 let last_pushed_devices_snapshot = last_pushed_devices.borrow().clone();
-                let current_devices_as_opt: Option<Vec<String>> =
-                    Some(current_device_names.clone());
+                let current_devices_as_opt: Option<Vec<crate::ui::DeviceInfo>> =
+                    Some(ui_devices.clone());
 
                 let default_changed =
                     last_pushed_default_snapshot != current_default_as_opt_opt;
@@ -1975,13 +2015,9 @@ fn run_with_gui(
                     last_pushed_devices_snapshot != current_devices_as_opt;
 
                 if default_changed || devices_changed {
-                    let current_device = {
-                        let cfg = config_timer_slow.borrow();
-                        cfg.input_device.clone()
-                    };
                     handles_timer_slow.update_device_list(
                         &ui_devices,
-                        current_device.as_deref(),
+                        config_input_device_snapshot.as_deref(),
                         system_default_name.as_deref(),
                     );
                     *last_pushed_default.borrow_mut() = current_default_as_opt_opt;
@@ -2017,11 +2053,13 @@ fn run_with_gui(
                 // D-06: config.input_device is NEVER written by this branch.
                 // The user's declared intent stays authoritative for when
                 // their chosen mic comes back online.
-                let (config_input_device_snapshot, last_explicit_snapshot) = {
-                    let cfg = config_timer_slow.borrow();
-                    let last = last_explicit_slow.borrow().clone();
-                    (cfg.input_device.clone(), last)
-                };
+                //
+                // R1: `devices` here is the FULL unfiltered enumeration (not
+                // `ui_devices`/`picker_device_infos`'s picker-only output) —
+                // the resolver, and D-10 detection above, must never have an
+                // unavailable-but-pinned/default device silently disappear
+                // out from under capture just because the picker hides it.
+                let last_explicit_snapshot = last_explicit_slow.borrow().clone();
 
                 let desired_target = resolve_runtime_capture_target(
                     &devices,
@@ -2245,6 +2283,88 @@ fn sync_tray_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── resolve_runtime_capture_target (R1) ───────────────────────────────
+
+    /// Step 4 with no config pin, no last_explicit, and no default: the
+    /// resolver must prefer the first AVAILABLE device over an earlier
+    /// unavailable one, and lowercase fixture descriptions/dotted node names
+    /// keep the i18n Class B guard from tripping on this file.
+    #[test]
+    fn resolve_runtime_capture_target_step4_prefers_first_available_device() {
+        let devices = vec![
+            InputDevice {
+                id: 1,
+                name: "jack.mic".into(),
+                description: "jack mic".into(),
+                is_default: false,
+                available: false,
+            },
+            InputDevice {
+                id: 2,
+                name: "internal.mic".into(),
+                description: "internal mic".into(),
+                is_default: false,
+                available: true,
+            },
+        ];
+        let target = resolve_runtime_capture_target(&devices, None, None, None);
+        assert_eq!(target, Some("internal.mic".to_string()));
+    }
+
+    /// Step 4 falls back to the first device of any availability only when
+    /// NONE is available — the picker never claims no input while sources
+    /// exist, and capture must mirror that (R1).
+    #[test]
+    fn resolve_runtime_capture_target_step4_falls_back_when_none_available() {
+        let devices = vec![
+            InputDevice {
+                id: 1,
+                name: "jack.mic".into(),
+                description: "jack mic".into(),
+                is_default: false,
+                available: false,
+            },
+            InputDevice {
+                id: 2,
+                name: "other.jack.mic".into(),
+                description: "other jack mic".into(),
+                is_default: false,
+                available: false,
+            },
+        ];
+        let target = resolve_runtime_capture_target(&devices, None, None, None);
+        assert_eq!(target, Some("jack.mic".to_string()));
+    }
+
+    /// A config pin naming an unavailable-but-enumerated device is honored
+    /// as-is (no silent switch), matching R1's "never hide or retarget the
+    /// persisted pick" contract.
+    #[test]
+    fn resolve_runtime_capture_target_keeps_unavailable_pinned_device() {
+        let devices = vec![
+            InputDevice {
+                id: 1,
+                name: "jack.mic".into(),
+                description: "jack mic".into(),
+                is_default: false,
+                available: false,
+            },
+            InputDevice {
+                id: 2,
+                name: "internal.mic".into(),
+                description: "internal mic".into(),
+                is_default: false,
+                available: true,
+            },
+        ];
+        let target = resolve_runtime_capture_target(&devices, Some("jack.mic"), None, None);
+        assert_eq!(
+            target,
+            Some("jack.mic".to_string()),
+            "pinned device must never be silently switched away from"
+        );
+    }
 
     /// Truth table for the autostart hide-policy gate (260508-k7q).
     ///

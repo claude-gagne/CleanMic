@@ -84,6 +84,13 @@ pub struct DeviceInfo {
 
     /// Human-readable description shown in the UI (e.g., "Built-in Microphone").
     pub description: String,
+
+    /// Whether the device's port/route is currently usable (R1). `false`
+    /// means the source's port is unavailable (e.g. an unplugged headset
+    /// jack) — such a device only reaches the picker at all when it is the
+    /// pinned or system-default device (see
+    /// [`crate::pipewire::devices::picker_devices`]).
+    pub available: bool,
 }
 
 /// Snapshot of all state the UI needs to render itself.
@@ -407,6 +414,7 @@ mod tests {
         let d = DeviceInfo {
             name: "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic".into(),
             description: "Built-in Microphone".into(),
+            available: true,
         };
         assert_eq!(
             d.name,
@@ -421,10 +429,12 @@ mod tests {
         state.available_devices.push(DeviceInfo {
             name: "alsa_input.usb-Blue_Yeti".into(),
             description: "Blue Yeti".into(),
+            available: true,
         });
         state.available_devices.push(DeviceInfo {
             name: "alsa_input.pci-builtin".into(),
             description: "Built-in Microphone".into(),
+            available: true,
         });
         assert_eq!(state.available_devices.len(), 2);
     }
