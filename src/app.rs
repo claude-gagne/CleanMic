@@ -1013,6 +1013,16 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
         config.enabled = false;
     }
 
+    // Apply the persisted automatic-mic-volume preference before the
+    // pipeline (potentially) auto-starts below, so the very first processed
+    // block already reflects the user's saved choice rather than the audio
+    // thread's construction-time default (quick task 260923-x24).
+    pipeline.set_auto_gain(config.auto_gain_enabled);
+    log::info!(
+        "input auto-gain enabled at startup: {}",
+        config.auto_gain_enabled
+    );
+
     // Auto-start pipeline if enabled (including first run with default enabled=true).
     if config.enabled {
         pipeline.start();

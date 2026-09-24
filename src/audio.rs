@@ -8,9 +8,12 @@
 //! All processing is 48 kHz mono f32. The audio thread must remain lock-free:
 //! no allocations, no mutexes, no I/O on the hot path.
 //!
-//! Captured input is DC-blocked (20 Hz one-pole, see [`DcBlocker`]) before it
-//! reaches the engine, so a microphone's constant DC offset never gets
-//! amplified by a suppression engine or read as signal by the input meter.
+//! Captured input is DC-blocked (20 Hz one-pole, see [`DcBlocker`]) and then
+//! run through a speech-gated, boost-only input auto-gain (see [`AutoGain`])
+//! before it reaches the engine, so a microphone's constant DC offset never
+//! gets amplified by a suppression engine or read as signal by the input
+//! meter, and a too-quiet microphone's speech is brought up to a normal
+//! conferencing level before either sees it.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -18,7 +21,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 
-use crate::dsp::DcBlocker;
+use crate::dsp::{AutoGain, DcBlocker};
 use crate::engine::NoiseEngine;
 use crate::pipewire::monitor::MonitorOutput;
 use crate::pipewire::ringbuf::{RingBufReader, RingBufWriter};
@@ -82,6 +85,9 @@ pub enum AudioCommand {
     SetMode(crate::engine::ProcessingMode),
     /// Enable or disable monitor output.
     SetMonitor(bool),
+    /// Enable or disable the input auto-gain (speech-gated, boost-only
+    /// leveler for too-quiet mics — see [`crate::dsp::AutoGain`]).
+    SetAutoGain(bool),
     /// Attach (Some) or detach (None) the PipeWire ring-buffer writer for the
     /// monitor output. Must be sent *before* SetMonitor(true) so the first
     /// write has somewhere to go.
@@ -106,14 +112,17 @@ pub enum AudioCommand {
 /// Level information reported from the audio thread to the UI.
 #[derive(Debug, Clone, Copy)]
 pub struct LevelReport {
-    /// RMS level of the DC-blocked capture signal (linear, 0.0..=1.0+) —
-    /// exactly what the engine receives.
+    /// RMS level of the DC-blocked, auto-gained capture signal (linear,
+    /// 0.0..=1.0+) — exactly what the engine receives.
     ///
     /// A microphone's DC offset is inaudible (0 Hz) and is not sound, so
     /// including it in this level made a silent room read about half full on
     /// a laptop DMIC that carried ~0.109 FS of DC. With the offset removed,
     /// the input and output meters compare the same signal before and after
-    /// suppression.
+    /// suppression. Since quick task 260923-x24, a too-quiet mic's speech is
+    /// also boosted toward a normal conferencing level (see
+    /// [`crate::dsp::AutoGain`]) before this RMS is computed, so the meter
+    /// shows what the engine actually receives, not the mic's raw level.
     pub input_rms: f32,
     /// RMS level of the output buffer (linear, 0.0..=1.0+).
     pub output_rms: f32,
@@ -191,16 +200,17 @@ impl AudioPipeline {
         Self::with_ring_buffers_impl(capture_reader, output_writer, true)
     }
 
-    /// Test-only constructor that skips input DC blocking on the real-capture
-    /// path.
+    /// Test-only constructor that skips the whole input-conditioning chain
+    /// (DC blocking and auto-gain) on the real-capture path.
     ///
-    /// Production always filters (see [`with_ring_buffers`](Self::with_ring_buffers)).
+    /// Production always conditions (see [`with_ring_buffers`](Self::with_ring_buffers)).
     /// This exists solely for the index-stamped latency/backlog harness
     /// (`FakePipeWire`), whose capture samples are a ramp (`value = sample
     /// index`): the DC blocker correctly turns a ramp into a near-constant,
-    /// which would defeat that harness's latency measurement. The latency
+    /// and the auto-gain would react to that ramp's ever-growing energy —
+    /// either would defeat that harness's latency measurement. The latency
     /// measurement itself is independent of input conditioning, so bypassing
-    /// the filter there does not weaken those regression tests.
+    /// the whole chain there does not weaken those regression tests.
     #[cfg(test)]
     pub(crate) fn with_ring_buffers_unfiltered(
         capture_reader: RingBufReader,
@@ -212,7 +222,7 @@ impl AudioPipeline {
     fn with_ring_buffers_impl(
         capture_reader: RingBufReader,
         output_writer: RingBufWriter,
-        filter_input_dc: bool,
+        condition_input: bool,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let (level_tx, level_rx) = mpsc::channel::<LevelReport>();
@@ -226,7 +236,7 @@ impl AudioPipeline {
             Some(capture_reader),
             Some(output_writer),
             heartbeat_thread,
-            filter_input_dc,
+            condition_input,
         )?;
 
         Ok(Self {
@@ -311,6 +321,19 @@ impl AudioPipeline {
     pub fn set_monitor(&self, enabled: bool) {
         if self.cmd_tx.send(AudioCommand::SetMonitor(enabled)).is_err() {
             log::error!("audio thread channel closed - SetMonitor command dropped");
+            self.channel_alive.store(false, Ordering::Release);
+        }
+    }
+
+    /// Enable or disable the input auto-gain (speech-gated, boost-only
+    /// leveler for too-quiet mics). Mirrors [`set_monitor`](Self::set_monitor).
+    pub fn set_auto_gain(&self, enabled: bool) {
+        if self
+            .cmd_tx
+            .send(AudioCommand::SetAutoGain(enabled))
+            .is_err()
+        {
+            log::error!("audio thread channel closed - SetAutoGain command dropped");
             self.channel_alive.store(false, Ordering::Release);
         }
     }
@@ -407,7 +430,7 @@ impl Drop for AudioPipeline {
 /// Spawn the audio processing thread. Shared by [`AudioPipeline::new`],
 /// [`AudioPipeline::with_ring_buffers`] and the test-only
 /// `with_ring_buffers_unfiltered` constructor so the spawn body is not
-/// duplicated. `filter_input_dc` is always `true` in production; it is only
+/// duplicated. `condition_input` is always `true` in production; it is only
 /// `false` for the index-stamped latency/backlog test harness (see
 /// `with_ring_buffers_unfiltered`'s doc comment).
 fn spawn_audio_thread(
@@ -416,7 +439,7 @@ fn spawn_audio_thread(
     capture_reader: Option<RingBufReader>,
     output_writer: Option<RingBufWriter>,
     heartbeat: Arc<AtomicU64>,
-    filter_input_dc: bool,
+    condition_input: bool,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("cleanmic-audio".into())
@@ -427,7 +450,7 @@ fn spawn_audio_thread(
                 capture_reader,
                 output_writer,
                 heartbeat,
-                filter_input_dc,
+                condition_input,
             );
         })
         .context("failed to spawn audio thread")
@@ -544,6 +567,7 @@ fn handle_command(
     crossfade: &mut Option<CrossfadeState>,
     monitor: &mut MonitorOutput,
     input_device: &mut String,
+    auto_gain: &mut AutoGain,
 ) -> bool {
     match cmd {
         AudioCommand::Start => {
@@ -581,6 +605,13 @@ fn handle_command(
             } else if let Err(e) = monitor.disable() {
                 log::error!("Failed to disable monitor: {}", e);
             }
+        }
+        AudioCommand::SetAutoGain(enabled) => {
+            auto_gain.set_enabled(enabled);
+            log::info!(
+                "Input auto-gain {}",
+                if enabled { "enabled" } else { "disabled" }
+            );
         }
         AudioCommand::SetMonitorWriter(writer) => {
             if let Some(w) = writer {
@@ -621,7 +652,7 @@ fn audio_thread_main(
     capture_reader: Option<RingBufReader>,
     output_writer: Option<RingBufWriter>,
     heartbeat: Arc<AtomicU64>,
-    filter_input_dc: bool,
+    condition_input: bool,
 ) {
     let mut running = false;
     let mut engine: Option<Box<dyn NoiseEngine>> = None;
@@ -643,9 +674,15 @@ fn audio_thread_main(
     let mut crossfade_old_buf = vec![0.0f32; BUFFER_SIZE];
 
     // DC-blocks the real-capture path before the engine and the input level
-    // meter (see `INPUT_DC_BLOCK_CUTOFF_HZ`). `filter_input_dc` is only
+    // meter (see `INPUT_DC_BLOCK_CUTOFF_HZ`). `condition_input` is only
     // `false` for the index-stamped latency/backlog test harness.
     let mut input_dc_block = DcBlocker::new(INPUT_DC_BLOCK_CUTOFF_HZ, SAMPLE_RATE);
+
+    // Speech-gated, boost-only input auto-gain, run immediately after the DC
+    // blocker on the real-capture path (quick task 260923-x24). Starts
+    // enabled to match `Config::default().auto_gain_enabled` (ON); the app
+    // always sends the persisted value via `SetAutoGain` before `Start`.
+    let mut input_auto_gain = AutoGain::new(SAMPLE_RATE);
 
     let tick_duration = std::time::Duration::from_secs_f64(BUFFER_SIZE as f64 / SAMPLE_RATE as f64);
 
@@ -685,6 +722,10 @@ fn audio_thread_main(
                     // the one just torn down; priming on the next sample
                     // avoids injecting a DC step (a click) into the engine.
                     input_dc_block.reset();
+                    // A reconnect does not guarantee the same physical
+                    // device; carrying a learned gain across it risks
+                    // blasting a hot mic with a quiet mic's boost.
+                    input_auto_gain.reset();
                 }
                 Ok(AudioCommand::ReplaceCaptureReader(new_cr)) => {
                     log::info!("Audio thread: capture reader replaced (device retargeting)");
@@ -694,6 +735,9 @@ fn audio_thread_main(
                     // level; priming on the next sample avoids a DC-step
                     // click into the engine.
                     input_dc_block.reset();
+                    // A different physical mic can have a very different
+                    // sensitivity; never carry a learned gain onto it.
+                    input_auto_gain.reset();
                 }
                 Ok(cmd) => {
                     if handle_command(
@@ -703,6 +747,7 @@ fn audio_thread_main(
                         &mut crossfade,
                         &mut monitor,
                         &mut _input_device,
+                        &mut input_auto_gain,
                     ) {
                         return;
                     }
@@ -753,6 +798,12 @@ fn audio_thread_main(
                     // level. Priming on the next sample avoids injecting a
                     // DC step (a click) into the engine.
                     input_dc_block.reset();
+                    // Deliberately NOT resetting `input_auto_gain` here: a
+                    // Stop/Start (Activer off/on) is the same mic in the
+                    // same room, so the DC offset genuinely can jump but the
+                    // learned speech level does not. Re-learning it here
+                    // would make the user sound quiet again for several
+                    // seconds every time they re-enable CleanMic.
                 }
 
                 let mut blocks = 0usize;
@@ -772,13 +823,15 @@ fn audio_thread_main(
                         *s = 0.0;
                     }
 
-                    // DC-block the finalized block before it reaches the
-                    // engine (passthrough, crossfade, or panic fallback all
-                    // read `input_buf` below) and before the input-level
+                    // DC-block, then apply the speech-gated input auto-gain,
+                    // before the finalized block reaches the engine
+                    // (passthrough, crossfade, or panic fallback all read
+                    // `input_buf` below) and before the input-level
                     // accumulation, so every path and the meter share the
-                    // same DC-free samples.
-                    if filter_input_dc {
+                    // same conditioned samples.
+                    if condition_input {
                         input_dc_block.process_in_place(&mut input_buf);
+                        input_auto_gain.process_in_place(&mut input_buf);
                     }
 
                     let process_result =
@@ -904,6 +957,10 @@ fn audio_thread_main(
                     // See the busy-loop arm above: a new ring can carry a
                     // different DC level, so re-arm priming.
                     input_dc_block.reset();
+                    // See the busy-loop arm above: a reconnect does not
+                    // guarantee the same device, so never carry a learned
+                    // gain across it.
+                    input_auto_gain.reset();
                 }
                 Ok(AudioCommand::ReplaceCaptureReader(new_cr)) => {
                     log::info!("Audio thread: capture reader replaced (device retargeting, idle)");
@@ -912,6 +969,9 @@ fn audio_thread_main(
                     // See the busy-loop arm above: a different physical mic
                     // can carry a different DC level, so re-arm priming.
                     input_dc_block.reset();
+                    // See the busy-loop arm above: a different physical mic
+                    // can have a very different sensitivity.
+                    input_auto_gain.reset();
                 }
                 Ok(cmd) => {
                     if handle_command(
@@ -921,6 +981,7 @@ fn audio_thread_main(
                         &mut crossfade,
                         &mut monitor,
                         &mut _input_device,
+                        &mut input_auto_gain,
                     ) {
                         return;
                     }
@@ -1173,6 +1234,7 @@ mod tests {
         let mut crossfade: Option<CrossfadeState> = None;
         let mut monitor = MonitorOutput::new();
         let mut input_device = String::new();
+        let mut test_auto_gain = AutoGain::new(SAMPLE_RATE);
 
         // Enable monitor.
         handle_command(
@@ -1182,6 +1244,7 @@ mod tests {
             &mut crossfade,
             &mut monitor,
             &mut input_device,
+            &mut test_auto_gain,
         );
         assert!(monitor.is_enabled());
 
@@ -1193,6 +1256,7 @@ mod tests {
             &mut crossfade,
             &mut monitor,
             &mut input_device,
+            &mut test_auto_gain,
         );
 
         // Monitor must still be enabled after engine swap.
@@ -2312,6 +2376,241 @@ mod tests {
         assert!(
             max_abs < 0.05,
             "max |output| across all processing paths = {max_abs}, expected < 0.05"
+        );
+    }
+
+    // --- Input auto-gain (quick task 260923-x24) --------------------------
+
+    #[test]
+    fn set_auto_gain_command_updates_state() {
+        let mut running = true;
+        let mut engine: Option<Box<dyn NoiseEngine>> = None;
+        let mut crossfade: Option<CrossfadeState> = None;
+        let mut monitor = MonitorOutput::new();
+        let mut input_device = String::new();
+        let mut test_auto_gain = AutoGain::new(SAMPLE_RATE);
+        assert!(test_auto_gain.is_enabled(), "AutoGain starts enabled");
+
+        handle_command(
+            AudioCommand::SetAutoGain(false),
+            &mut running,
+            &mut engine,
+            &mut crossfade,
+            &mut monitor,
+            &mut input_device,
+            &mut test_auto_gain,
+        );
+        assert!(!test_auto_gain.is_enabled());
+
+        handle_command(
+            AudioCommand::SetAutoGain(true),
+            &mut running,
+            &mut engine,
+            &mut crossfade,
+            &mut monitor,
+            &mut input_device,
+            &mut test_auto_gain,
+        );
+        assert!(test_auto_gain.is_enabled());
+    }
+
+    /// dBFS levels of the auto-gain e2e feeder's mixed signal — a quiet
+    /// speech-like burst well above a steady noise floor, matching
+    /// `dsp::AutoGain`'s own reference test signals but fed through the real
+    /// ring-buffer/audio-thread pipeline instead of a bare function call.
+    const AUTO_GAIN_E2E_BURST_DBFS: f32 = -34.0;
+    const AUTO_GAIN_E2E_NOISE_DBFS: f32 = -75.0;
+
+    /// Advance an LCG state and return a uniform sample in `[-1, 1)`. Matches
+    /// `src/dsp.rs`'s test-only noise generator (kept as an independent copy
+    /// per the plan — this module must stay free of a `dsp::tests` dependency).
+    fn lcg_uniform(state: &mut u32) -> f64 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from(*state) / 2_147_483_648.0 - 1.0
+    }
+
+    /// One sample of the auto-gain e2e feeder's signal at absolute sample
+    /// index `n`: a 1 kHz, 500 ms-period burst (300 ms on, 200 ms off) at
+    /// [`AUTO_GAIN_E2E_BURST_DBFS`] plus LCG white noise at
+    /// [`AUTO_GAIN_E2E_NOISE_DBFS`].
+    fn auto_gain_e2e_sample(n: u64, lcg: &mut u32) -> f32 {
+        let t = n as f64 / f64::from(SAMPLE_RATE);
+        let phase = t.rem_euclid(0.5);
+        let burst_amp =
+            f64::from(10f32.powf(AUTO_GAIN_E2E_BURST_DBFS / 20.0)) * std::f64::consts::SQRT_2;
+        let noise_amp = f64::from(10f32.powf(AUTO_GAIN_E2E_NOISE_DBFS / 20.0)) * 3f64.sqrt();
+        let burst = if phase < 0.3 {
+            burst_amp * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()
+        } else {
+            0.0
+        };
+        let noise = noise_amp * lcg_uniform(lcg);
+        (burst + noise) as f32
+    }
+
+    /// Reference rms of `n` samples of the e2e feeder's signal, computed
+    /// independently (no threads, no ring buffers) for the OFF-window sanity
+    /// check in [`auto_gain_boosts_quiet_speech_before_engine_and_input_meter`].
+    fn reference_auto_gain_feed_rms(n: u64) -> f32 {
+        let mut lcg: u32 = 0xC0FF_EE42;
+        let signal: Vec<f32> = (0..n).map(|i| auto_gain_e2e_sample(i, &mut lcg)).collect();
+        rms(&signal)
+    }
+
+    /// Feeds the auto-gain e2e signal (see [`auto_gain_e2e_sample`]) into a
+    /// capture ring at real-time cadence, reusing `PacedDcToneFeeder`'s
+    /// pacing loop with a continuous sample index across the whole feed.
+    struct PacedAutoGainFeeder {
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl PacedAutoGainFeeder {
+        fn start(capture_writer: RingBufWriter) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_t = stop.clone();
+            let handle = thread::spawn(move || {
+                let period = Duration::from_secs_f64(PW_QUANTUM as f64 / f64::from(SAMPLE_RATE));
+                let mut n: u64 = 0;
+                let mut lcg: u32 = 0xC0FF_EE42;
+                let mut buf = vec![0.0f32; PW_QUANTUM];
+                let mut next = Instant::now();
+                while !stop_t.load(Ordering::Acquire) {
+                    for s in buf.iter_mut() {
+                        *s = auto_gain_e2e_sample(n, &mut lcg);
+                        n += 1;
+                    }
+                    capture_writer.write(&buf);
+                    next += period;
+                    if let Some(d) = next.checked_duration_since(Instant::now()) {
+                        thread::sleep(d);
+                    }
+                }
+            });
+            Self {
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for PacedAutoGainFeeder {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Records each processed block's mean-square (power) into a shared
+    /// `Vec`, then copies input to output unchanged — an "energy probe"
+    /// distinct from [`InputProbeEngine`] (which accumulates a running
+    /// mean, not per-block values) so per-window rms can be recomputed after
+    /// the fact.
+    struct EnergyProbeEngine {
+        blocks: Arc<Mutex<Vec<f32>>>,
+    }
+
+    impl NoiseEngine for EnergyProbeEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            let mean_sq = input.iter().map(|&s| s * s).sum::<f32>() / input.len() as f32;
+            self.blocks.lock().unwrap().push(mean_sq);
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _: f32) {}
+        fn set_mode(&mut self, _: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    /// Rms of a window of per-block mean-squares (equal-size blocks, so the
+    /// mean of means equals the overall mean-square).
+    fn window_rms(mean_squares: &[f32]) -> f32 {
+        let mean = mean_squares.iter().sum::<f32>() / mean_squares.len() as f32;
+        mean.sqrt()
+    }
+
+    /// End-to-end (real audio thread, production constructor): the input
+    /// auto-gain boosts a too-quiet mic's speech before both the engine and
+    /// the input level meter. Real-time by design (~5.5s: 1.5s OFF baseline
+    /// + 4s for the speech-gated adaptation to take hold).
+    #[test]
+    fn auto_gain_boosts_quiet_speech_before_engine_and_input_meter() {
+        let (cw, cr) = ring_buffer(65_536);
+        // The output side is never drained in this test — only the engine's
+        // input (via `EnergyProbeEngine`) and `poll_levels()` are inspected —
+        // so the reader half is intentionally unused (writes past capacity
+        // simply drop the oldest samples; see `write_more_than_capacity_drops_excess`).
+        let (ow, _or) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+
+        let blocks: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        pipeline.set_engine(Box::new(EnergyProbeEngine {
+            blocks: blocks.clone(),
+        }));
+        pipeline.set_auto_gain(false);
+        pipeline.start();
+
+        let feeder = PacedAutoGainFeeder::start(cw);
+
+        thread::sleep(Duration::from_millis(1_500));
+        let mark = blocks.lock().unwrap().len();
+        let off_level = pipeline
+            .poll_levels()
+            .expect("should have received an OFF-phase level report");
+
+        pipeline.set_auto_gain(true);
+        thread::sleep(Duration::from_millis(4_000));
+        let on_level = pipeline
+            .poll_levels()
+            .expect("should have received an ON-phase level report");
+
+        drop(feeder);
+        pipeline.shutdown();
+
+        let all_blocks = blocks.lock().unwrap();
+        assert!(mark >= 100, "not enough OFF-phase blocks: {mark}");
+        assert!(
+            all_blocks.len() >= mark + 100,
+            "not enough ON-phase blocks: {}",
+            all_blocks.len()
+        );
+
+        // The probe's rms just before the switch must be close to the raw
+        // (unboosted) fed signal's own reference rms.
+        let off_window = &all_blocks[mark - 100..mark];
+        let off_probe_rms = window_rms(off_window);
+        let reference_rms = reference_auto_gain_feed_rms(SAMPLE_RATE as u64);
+        let ref_diff_db =
+            20.0 * (f64::from(off_probe_rms) / f64::from(reference_rms).max(1e-12)).log10();
+        assert!(
+            ref_diff_db.abs() <= 1.0,
+            "OFF-phase probe rms differs from the reference feed rms by {ref_diff_db}dB"
+        );
+
+        // The probe's rms over the last 100 blocks (well into the ON phase)
+        // must exceed the OFF-window rms by the expected boost range.
+        let on_window = &all_blocks[all_blocks.len() - 100..];
+        let on_probe_rms = window_rms(on_window);
+        let boost_db =
+            20.0 * (f64::from(on_probe_rms) / f64::from(off_probe_rms).max(1e-12)).log10();
+        assert!(
+            (6.0..=14.5).contains(&boost_db),
+            "ON-minus-OFF probe boost = {boost_db}dB, expected 6.0..=14.5"
+        );
+
+        // The meter (LevelReport::input_rms) must show at least a 2x boost.
+        assert!(
+            on_level.input_rms >= 2.0 * off_level.input_rms,
+            "ON input_rms ({}) must be >= 2x OFF input_rms ({})",
+            on_level.input_rms,
+            off_level.input_rms
         );
     }
 }

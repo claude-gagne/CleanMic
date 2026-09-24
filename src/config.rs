@@ -1,8 +1,8 @@
 //! Settings persistence.
 //!
 //! Reads and writes user preferences (selected mic, engine, strength, mode,
-//! monitor state, autostart) in TOML format under the XDG config directory
-//! (`~/.config/cleanmic/config.toml`).
+//! monitor state, autostart, automatic mic volume) in TOML format under the
+//! XDG config directory (`~/.config/cleanmic/config.toml`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -142,6 +142,13 @@ pub struct Config {
     /// on every launch. Per D-06, D-12.
     pub last_seen_update_version: Option<String>,
 
+    /// Automatic speech-gated input boost for too-quiet mics (quick task
+    /// 260923-x24, see [`crate::dsp::AutoGain`]). ON by default; an older
+    /// config file without this key loads as ON via the struct-level
+    /// `#[serde(default)]`, since the feature is beneficial for essentially
+    /// every mic and safe (boost-only, never attenuates) for the rest.
+    pub auto_gain_enabled: bool,
+
     /// Whether the one-time DPDFNet-2 default migration (D-10) has already
     /// run on this config. Sticky once `true` — the migration must never
     /// repeat, even if the user later deliberately switches back to
@@ -175,6 +182,7 @@ impl Default for Config {
             tray_absent_notified: false,
             autostart_hidden_notified: false,
             last_seen_update_version: None,
+            auto_gain_enabled: true,
             dpdfnet_default_migration_complete: false,
         }
     }
@@ -372,6 +380,7 @@ mod tests {
         assert!(!cfg.monitor_enabled);
         assert!(cfg.enabled);
         assert!(!cfg.autostart);
+        assert!(cfg.auto_gain_enabled);
         assert!(!cfg.dpdfnet_default_migration_complete);
     }
 
@@ -465,6 +474,28 @@ mod tests {
         std::fs::write(&path, "engine = \"RNNoise\"\nstrength = 0.5\n").unwrap();
         let cfg = Config::load_from(&path).expect("load failed");
         assert!(!cfg.autostart_hidden_notified);
+    }
+
+    #[test]
+    fn auto_gain_enabled_defaults_to_true_from_partial_toml() {
+        let (_tmp, path) = temp_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Old config file (pre-260923-x24) without this field — should load as true.
+        std::fs::write(&path, "engine = \"RNNoise\"\nstrength = 0.5\n").unwrap();
+        let cfg = Config::load_from(&path).expect("load failed");
+        assert!(cfg.auto_gain_enabled);
+    }
+
+    #[test]
+    fn auto_gain_enabled_false_roundtrips() {
+        let (_tmp, path) = temp_config_path();
+        let original = Config {
+            auto_gain_enabled: false,
+            ..Config::default()
+        };
+        original.save_to(&path).expect("save failed");
+        let loaded = Config::load_from(&path).expect("load failed");
+        assert!(!loaded.auto_gain_enabled);
     }
 
     #[test]
