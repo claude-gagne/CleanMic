@@ -186,7 +186,24 @@ enum PipeWireCommand {
 impl LivePipeWireManager {
     /// Connect to the PipeWire daemon by initializing the library and spawning
     /// the main-loop thread.
+    ///
+    /// Guard: in the unit-test build (`cfg(test)`), the very first thing this
+    /// function does — before `pw::init()` and before spawning the PW thread
+    /// — is assert that the process opted in via `CLEANMIC_LIVE_PW_TESTS=1`.
+    /// This is what fails any non-`#[ignore]`d unit test that reaches the
+    /// live path instead of silently creating a real "CleanMic" node in the
+    /// developer's session. Use [`PipeWireManager::offline()`](super::PipeWireManager::offline)
+    /// for tests that don't need the daemon, or mark the test `#[ignore]`
+    /// and run it via `make test-live`.
     pub fn connect() -> Result<Self, PipeWireError> {
+        #[cfg(test)]
+        assert!(
+            super::live_pw_tests_opted_in(),
+            "a unit test reached the live PipeWire connect path, which would create a real \
+             CleanMic node in the developer's session; use PipeWireManager::offline(), or mark \
+             the test #[ignore] and run it via make test-live (CLEANMIC_LIVE_PW_TESTS=1)"
+        );
+
         pw::init();
 
         let stream_active = Arc::new(AtomicBool::new(false));
@@ -1169,6 +1186,12 @@ fn unlink_all_into_cleanmic_capture() {
 /// has never been written — e.g. a fresh GNOME install where the user hasn't
 /// explicitly picked a default device).
 fn pw_metadata_name(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if !super::live_pw_tests_opted_in() {
+        // Unit tests must never spawn `pw-metadata` against the real daemon.
+        return None;
+    }
+
     let output = std::process::Command::new("pw-metadata")
         .arg("0")
         .arg(key)
@@ -1388,6 +1411,32 @@ mod tests {
         assert_eq!(parse_pw_version("1.4.7-1ubuntu1"), Some((1, 4, 7)));
         assert_eq!(parse_pw_version(""), None);
         assert_eq!(parse_pw_version("garbage"), None);
+    }
+
+    /// The guard in `connect()` fails any non-opted-in unit test reaching
+    /// the live path, instead of silently creating a real "CleanMic" node.
+    #[test]
+    fn unit_tests_cannot_reach_the_live_connect_path_without_opt_in() {
+        if crate::pipewire::live_pw_tests_opted_in() {
+            eprintln!("CLEANMIC_LIVE_PW_TESTS=1: skipping guard check (live tests are opted in)");
+            return;
+        }
+
+        let err = match std::panic::catch_unwind(LivePipeWireManager::connect) {
+            Ok(_) => panic!(
+                "connect() must panic before touching the live PipeWire daemon when tests are not opted in"
+            ),
+            Err(e) => e,
+        };
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("CLEANMIC_LIVE_PW_TESTS"),
+            "panic message must name the opt-in env var, got: {msg}"
+        );
     }
 
     #[test]

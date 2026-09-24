@@ -49,6 +49,31 @@ pub enum PipeWireError {
 /// one full request to avoid silence padding in the output.
 const RING_BUF_CAPACITY: usize = 48000; // 1 second, rounds to 65536
 
+/// Environment variable that opts a test in to touching the real PipeWire
+/// daemon (creating/destroying a real "CleanMic" node, spawning `pw-dump` /
+/// `pw-metadata`). Unit tests must never reach any of these paths by
+/// default — see [`LivePipeWireManager::connect`](live::LivePipeWireManager::connect)'s
+/// cfg(test) guard, this module's `offline()`, and `make test-live`.
+///
+/// Only used from test code (the guard, the opt-in tests, and this module's
+/// own tests), so this whole block is `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) const LIVE_PW_TESTS_ENV: &str = "CLEANMIC_LIVE_PW_TESTS";
+
+/// Pure: `true` only when `value` is exactly `Some("1")`. Never trips on
+/// `None`, `""`, `"0"` or `"true"` — the env var must be exactly `"1"`.
+#[cfg(test)]
+pub(crate) fn live_pw_opt_in(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Whether the current test process has opted in to live PipeWire tests via
+/// `CLEANMIC_LIVE_PW_TESTS=1`.
+#[cfg(test)]
+pub(crate) fn live_pw_tests_opted_in() -> bool {
+    live_pw_opt_in(std::env::var(LIVE_PW_TESTS_ENV).ok().as_deref())
+}
+
 /// Manages the PipeWire client connection and the "CleanMic" virtual source.
 ///
 /// When the `pipewire` feature is enabled, this connects to a real PipeWire
@@ -79,8 +104,10 @@ pub struct PipeWireManager {
     /// Only consumed when the `pipewire` feature is active.
     #[cfg_attr(not(feature = "pipewire"), allow(dead_code))]
     output_reader: Option<RingBufReader>,
+    /// `None` only for a test-only [`Self::offline()`] manager. Always
+    /// `Some` after a real [`Self::connect()`].
     #[cfg(feature = "pipewire")]
-    inner: live::LivePipeWireManager,
+    inner: Option<live::LivePipeWireManager>,
 }
 
 impl PipeWireManager {
@@ -102,7 +129,7 @@ impl PipeWireManager {
                 capture_reader: Some(capture_reader),
                 output_writer: Some(output_writer),
                 output_reader: Some(output_reader),
-                inner,
+                inner: Some(inner),
             })
         }
 
@@ -121,6 +148,39 @@ impl PipeWireManager {
                 output_writer: Some(output_writer),
                 output_reader: Some(output_reader),
             })
+        }
+    }
+
+    /// Build a manager that never contacts the PipeWire daemon.
+    ///
+    /// Every unit test that does not specifically exercise the live path
+    /// (see the `live_pw_*` tests, opt-in via `CLEANMIC_LIVE_PW_TESTS=1` /
+    /// `make test-live`) must use this instead of [`Self::connect()`], which
+    /// under the `pipewire` feature reaches the real daemon and would create
+    /// a real "CleanMic" node in the developer's session on every
+    /// `cargo test --all-features` run.
+    ///
+    /// Builds the same ring buffers, device enumerator and monitor output as
+    /// [`Self::connect()`]; under the `pipewire` feature `inner` is `None`
+    /// (no daemon connection), so every delegating method behaves exactly
+    /// like the non-pipewire stub branch of that method (create/destroy flip
+    /// only `virtual_mic_active`, `cleanup_orphans` is `Ok`, `enable_monitor`
+    /// returns the writer without touching PipeWire, etc).
+    #[cfg(test)]
+    pub(crate) fn offline() -> Self {
+        let (capture_writer, capture_reader) = ringbuf::ring_buffer(RING_BUF_CAPACITY);
+        let (output_writer, output_reader) = ringbuf::ring_buffer(RING_BUF_CAPACITY);
+
+        Self {
+            virtual_mic_active: false,
+            device_enumerator: DeviceEnumerator::new(),
+            monitor_output: MonitorOutput::new(),
+            capture_writer: Some(capture_writer),
+            capture_reader: Some(capture_reader),
+            output_writer: Some(output_writer),
+            output_reader: Some(output_reader),
+            #[cfg(feature = "pipewire")]
+            inner: None,
         }
     }
 
@@ -160,8 +220,13 @@ impl PipeWireManager {
             }
             let capture_writer = self.capture_writer.take().expect("just ensured Some above");
             let output_reader = self.output_reader.take().expect("just ensured Some above");
-            self.inner
-                .create_virtual_mic(capture_writer, output_reader, capture_target)?;
+            if let Some(inner) = self.inner.as_mut() {
+                inner.create_virtual_mic(capture_writer, output_reader, capture_target)?;
+            } else {
+                log::debug!(
+                    "offline PipeWireManager: skipping real create_virtual_mic (no daemon connection)"
+                );
+            }
         }
 
         #[cfg(not(feature = "pipewire"))]
@@ -192,7 +257,9 @@ impl PipeWireManager {
 
         #[cfg(feature = "pipewire")]
         {
-            self.inner.destroy_virtual_mic()?;
+            if let Some(inner) = self.inner.as_mut() {
+                inner.destroy_virtual_mic()?;
+            }
         }
 
         #[cfg(not(feature = "pipewire"))]
@@ -212,7 +279,10 @@ impl PipeWireManager {
     pub fn cleanup_orphans(&self) -> Result<(), PipeWireError> {
         #[cfg(feature = "pipewire")]
         {
-            self.inner.cleanup_orphans()
+            match self.inner.as_ref() {
+                Some(inner) => inner.cleanup_orphans(),
+                None => Ok(()),
+            }
         }
 
         #[cfg(not(feature = "pipewire"))]
@@ -238,7 +308,9 @@ impl PipeWireManager {
 
         #[cfg(feature = "pipewire")]
         {
-            self.inner.enable_monitor(monitor_reader)?;
+            if let Some(inner) = self.inner.as_mut() {
+                inner.enable_monitor(monitor_reader)?;
+            }
         }
 
         #[cfg(not(feature = "pipewire"))]
@@ -257,7 +329,9 @@ impl PipeWireManager {
     pub fn disable_monitor(&mut self) -> Result<(), PipeWireError> {
         #[cfg(feature = "pipewire")]
         {
-            self.inner.disable_monitor()?;
+            if let Some(inner) = self.inner.as_mut() {
+                inner.disable_monitor()?;
+            }
         }
 
         Ok(())
@@ -319,13 +393,19 @@ impl PipeWireManager {
     ) -> Result<Option<RingBufReader>, PipeWireError> {
         #[cfg(feature = "pipewire")]
         {
-            let (new_writer, new_reader) = ringbuf::ring_buffer(RING_BUF_CAPACITY);
-            self.inner.set_capture_target(target_name, new_writer)?;
-            // Track the reader here so `take_capture_reader()` sees the latest
-            // half if the audio thread has not yet claimed one. When the audio
-            // thread is already running, the caller owns the reader lifecycle.
-            self.capture_reader = Some(new_reader);
-            Ok(self.capture_reader.take())
+            match self.inner.as_mut() {
+                Some(inner) => {
+                    let (new_writer, new_reader) = ringbuf::ring_buffer(RING_BUF_CAPACITY);
+                    inner.set_capture_target(target_name, new_writer)?;
+                    // Track the reader here so `take_capture_reader()` sees
+                    // the latest half if the audio thread has not yet
+                    // claimed one. When the audio thread is already running,
+                    // the caller owns the reader lifecycle.
+                    self.capture_reader = Some(new_reader);
+                    Ok(self.capture_reader.take())
+                }
+                None => Ok(None),
+            }
         }
 
         #[cfg(not(feature = "pipewire"))]
@@ -353,7 +433,10 @@ impl PipeWireManager {
     pub fn check_disconnected(&self) -> bool {
         #[cfg(feature = "pipewire")]
         {
-            self.inner.check_disconnected()
+            self.inner
+                .as_ref()
+                .map(|inner| inner.check_disconnected())
+                .unwrap_or(false)
         }
         #[cfg(not(feature = "pipewire"))]
         {
@@ -368,7 +451,9 @@ impl PipeWireManager {
     pub fn reset_disconnected(&self) {
         #[cfg(feature = "pipewire")]
         {
-            self.inner.reset_disconnected();
+            if let Some(inner) = self.inner.as_ref() {
+                inner.reset_disconnected();
+            }
         }
     }
 
@@ -400,6 +485,11 @@ mod tests {
     use super::*;
 
     /// Verify that the stub manager connects successfully without PipeWire.
+    /// Only meaningful without the `pipewire` feature — that is the only
+    /// configuration where `connect()` is the non-live stub. With the
+    /// feature enabled, `connect()` reaches the real daemon and every other
+    /// test below uses [`PipeWireManager::offline()`] instead.
+    #[cfg(not(feature = "pipewire"))]
     #[test]
     fn stub_connect_succeeds() {
         let manager = PipeWireManager::connect();
@@ -407,10 +497,29 @@ mod tests {
         assert!(!manager.unwrap().is_virtual_mic_active());
     }
 
+    /// An `offline()` manager starts inactive, in every feature combination.
+    #[test]
+    fn offline_manager_starts_inactive() {
+        let manager = PipeWireManager::offline();
+        assert!(!manager.is_virtual_mic_active());
+    }
+
+    /// `live_pw_opt_in` accepts only the literal string `"1"` — feature-
+    /// independent (pure function, no PipeWire dependency).
+    #[test]
+    fn live_pw_opt_in_accepts_only_exactly_1() {
+        assert!(!live_pw_opt_in(None));
+        assert!(!live_pw_opt_in(Some("")));
+        assert!(!live_pw_opt_in(Some("0")));
+        assert!(!live_pw_opt_in(Some("true")));
+        assert!(!live_pw_opt_in(Some("yes")));
+        assert!(live_pw_opt_in(Some("1")));
+    }
+
     /// Verify that creating the virtual mic twice is idempotent.
     #[test]
     fn create_twice_is_idempotent() {
-        let mut manager = PipeWireManager::connect().unwrap();
+        let mut manager = PipeWireManager::offline();
 
         // First create should succeed and activate the mic.
         assert!(manager.create_virtual_mic(None).is_ok());
@@ -424,7 +533,7 @@ mod tests {
     /// Verify that Drop cleans up the virtual mic.
     #[test]
     fn drop_cleans_up_virtual_mic() {
-        let mut manager = PipeWireManager::connect().unwrap();
+        let mut manager = PipeWireManager::offline();
         manager.create_virtual_mic(None).unwrap();
         assert!(manager.is_virtual_mic_active());
 
@@ -436,7 +545,7 @@ mod tests {
     /// Verify that destroy_virtual_mic on an inactive manager is a no-op.
     #[test]
     fn destroy_when_not_active_is_noop() {
-        let mut manager = PipeWireManager::connect().unwrap();
+        let mut manager = PipeWireManager::offline();
         assert!(!manager.is_virtual_mic_active());
 
         // Should be a no-op, not an error.
@@ -447,14 +556,14 @@ mod tests {
     /// Verify that cleanup_orphans on a clean state is a no-op.
     #[test]
     fn cleanup_orphans_on_clean_state_is_noop() {
-        let manager = PipeWireManager::connect().unwrap();
+        let manager = PipeWireManager::offline();
         assert!(manager.cleanup_orphans().is_ok());
     }
 
     /// Verify create then destroy cycle works.
     #[test]
     fn create_and_destroy_cycle() {
-        let mut manager = PipeWireManager::connect().unwrap();
+        let mut manager = PipeWireManager::offline();
 
         manager.create_virtual_mic(None).unwrap();
         assert!(manager.is_virtual_mic_active());
@@ -465,6 +574,26 @@ mod tests {
         // Can create again after destroy.
         manager.create_virtual_mic(None).unwrap();
         assert!(manager.is_virtual_mic_active());
+    }
+
+    /// An `offline()` manager never touches the daemon for any of the other
+    /// delegating methods either (R1, R3).
+    #[test]
+    fn offline_manager_delegating_methods_never_touch_the_daemon() {
+        let mut manager = PipeWireManager::offline();
+        assert!(
+            manager
+                .set_capture_target(Some("mic".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(manager.configured_default_source(), None);
+        assert!(!manager.check_disconnected());
+        manager.reset_disconnected(); // must not panic
+        let _writer = manager
+            .enable_monitor()
+            .expect("enable_monitor is Ok offline");
+        assert!(manager.disable_monitor().is_ok());
     }
 
     // -- Integration tests that require a running PipeWire daemon --
@@ -492,5 +621,42 @@ mod tests {
     fn integration_orphan_detection() {
         // TODO: With `pipewire` feature, create a node, kill the client,
         // then verify cleanup_orphans detects the stale node.
+    }
+
+    // -- Live opt-in tests (run via `make test-live`, CLEANMIC_LIVE_PW_TESTS=1) --
+
+    /// Exercises the real daemon path that the facade tests above used to
+    /// cover before they moved to `offline()`. Never runs by default:
+    /// `#[ignore]` plus an opt-in early return.
+    #[cfg(feature = "pipewire")]
+    #[test]
+    #[ignore = "live PipeWire: creates a real CleanMic node; run via make test-live"]
+    fn live_pw_create_destroy_cycle_on_the_real_daemon() {
+        if !live_pw_tests_opted_in() {
+            eprintln!(
+                "skipping live_pw_create_destroy_cycle_on_the_real_daemon: set {}=1 (run via make test-live)",
+                LIVE_PW_TESTS_ENV
+            );
+            return;
+        }
+
+        let mut manager = PipeWireManager::connect().expect("connect to the real daemon");
+
+        assert!(manager.create_virtual_mic(None).is_ok());
+        assert!(manager.is_virtual_mic_active());
+
+        // Idempotent.
+        assert!(manager.create_virtual_mic(None).is_ok());
+        assert!(manager.is_virtual_mic_active());
+
+        assert!(manager.destroy_virtual_mic().is_ok());
+        assert!(!manager.is_virtual_mic_active());
+
+        assert!(manager.create_virtual_mic(None).is_ok());
+        assert!(manager.is_virtual_mic_active());
+
+        assert!(manager.cleanup_orphans().is_ok());
+
+        drop(manager);
     }
 }

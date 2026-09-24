@@ -8,7 +8,9 @@
 #   uninstall     - Remove installed files
 #   fmt           - Run cargo fmt
 #   lint          - Run cargo clippy
-#   test          - Run cargo test
+#   test          - Run cargo test (never touches the live PipeWire graph or real user dirs)
+#   test-live     - opt-in tests against the live PipeWire daemon (creates a real CleanMic
+#                   node; refuses while CleanMic or the E2E harness runs)
 #   ci-check      - Run fmt-check, clippy -D warnings, and tests (mirrors release CI)
 #   harness-test  - Offline checks for the silent E2E test harness (scripts/e2e-audio.sh)
 #   e2e-audio     - Run the silent E2E audio test (SCENARIOS="...", E2E_ARGS="...")
@@ -24,7 +26,7 @@ DESTDIR ?=
 
 BINARY  := target/release/cleanmic
 
-.PHONY: build appimage kill vendors mo install uninstall fmt lint test ci-check clean harness-test e2e-audio nested-run nested-stop test-dfn-overload
+.PHONY: build appimage kill vendors mo install uninstall fmt lint test test-live ci-check clean harness-test e2e-audio nested-run nested-stop test-dfn-overload
 
 mo:
 	@mkdir -p locale/fr/LC_MESSAGES
@@ -66,6 +68,21 @@ lint:
 
 test:
 	$(CARGO) test --all-features
+
+# Opt-in tests against the live PipeWire daemon: creates and destroys a real
+# "CleanMic" node, and (with pw_integration_test.rs) verifies its ports. Never
+# run by `test`/`ci-check` — see src/pipewire/{mod,live,devices}.rs's
+# CLEANMIC_LIVE_PW_TESTS-gated guards. Refuses up front (before any cargo
+# run) whenever CleanMic or the E2E harness could already be using the graph,
+# since a same-named second "CleanMic" node would make name-based pw-link
+# hit the wrong one.
+test-live:
+	@command -v pw-cli >/dev/null 2>&1 || { echo "test-live: refusing: pw-cli not found (is PipeWire installed?)"; exit 1; }
+	@pgrep -x cleanmic >/dev/null 2>&1 && { echo "test-live: refusing: a cleanmic process is already running"; exit 1; } || true
+	@pw-cli ls Node 2>/dev/null | grep -q CleanMic && { echo "test-live: refusing: a CleanMic node already exists in the PipeWire graph"; exit 1; } || true
+	@pw-cli ls Node 2>/dev/null | grep -q cmtest_ && { echo "test-live: refusing: a cmtest_ node already exists (E2E harness may be running)"; exit 1; } || true
+	CLEANMIC_LIVE_PW_TESTS=1 $(CARGO) test --all-features --lib -- --ignored --test-threads=1 live_pw_
+	CLEANMIC_LIVE_PW_TESTS=1 $(CARGO) test --all-features --test pw_integration_test -- --ignored --test-threads=1
 
 # CI-mirror: runs the same gates as .github/workflows/release.yml in fail-fast order.
 # Use this locally to confirm a change will pass CI before pushing.

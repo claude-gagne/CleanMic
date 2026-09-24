@@ -119,6 +119,17 @@ fn raw_input_devices() -> Vec<InputDevice> {
 fn enumerate_real_devices() -> Result<Vec<InputDevice>, String> {
     use std::process::Command;
 
+    #[cfg(test)]
+    if !crate::pipewire::live_pw_tests_opted_in() {
+        // Unit tests must never spawn `pw-dump` against the real daemon;
+        // `raw_input_devices()` falls back to the deterministic stub list.
+        return Err(format!(
+            "cargo test build: refusing to spawn pw-dump without {}=1 (unit tests must not \
+             touch the live PipeWire graph — run via make test-live)",
+            crate::pipewire::LIVE_PW_TESTS_ENV
+        ));
+    }
+
     let output = Command::new("pw-dump")
         .output()
         .map_err(|e| format!("failed to run pw-dump: {e}"))?;
@@ -508,8 +519,15 @@ mod tests {
 
     #[cfg(feature = "pipewire")]
     #[test]
-    #[ignore]
-    fn integration_list_real_devices() {
+    #[ignore = "live PipeWire: reads the real device graph; run via make test-live"]
+    fn live_pw_list_real_devices() {
+        if !crate::pipewire::live_pw_tests_opted_in() {
+            eprintln!(
+                "skipping live_pw_list_real_devices: set {}=1 (run via make test-live)",
+                crate::pipewire::LIVE_PW_TESTS_ENV
+            );
+            return;
+        }
         let enumerator = DeviceEnumerator::new();
         let devs = enumerator.list_input_devices();
         for d in &devs {

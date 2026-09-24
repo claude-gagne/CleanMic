@@ -2538,7 +2538,7 @@ mod tests {
     #[test]
     fn explicit_engine_pick_ends_the_session_only_fallback() {
         let pipeline = AudioPipeline::new().unwrap();
-        let mut pw = PipeWireManager::connect().expect("stub connect should succeed");
+        let mut pw = PipeWireManager::offline();
         let mut config = Config {
             engine: EngineType::RNNoise,
             runtime_fallback_from: Some(EngineType::DeepFilterNet),
@@ -2822,7 +2822,7 @@ mod tests {
     #[test]
     fn shutdown_without_panic() {
         let config = Config::default();
-        let mut pw = PipeWireManager::connect().expect("stub connect should succeed");
+        let mut pw = PipeWireManager::offline();
         // No virtual mic created — shutdown should still succeed gracefully.
         let result = shutdown(&config, None, &mut pw);
         assert!(result.is_ok());
@@ -2832,7 +2832,7 @@ mod tests {
     #[test]
     fn shutdown_destroys_virtual_mic() {
         let config = Config::default();
-        let mut pw = PipeWireManager::connect().expect("stub connect should succeed");
+        let mut pw = PipeWireManager::offline();
         pw.create_virtual_mic(None).expect("create should succeed");
         assert!(pw.is_virtual_mic_active());
 
@@ -2847,7 +2847,7 @@ mod tests {
     #[test]
     fn shutdown_completes_within_budget() {
         let config = Config::default();
-        let mut pw = PipeWireManager::connect().expect("stub connect should succeed");
+        let mut pw = PipeWireManager::offline();
         pw.create_virtual_mic(None).expect("create should succeed");
 
         let start = Instant::now();
@@ -2878,7 +2878,7 @@ mod tests {
     #[test]
     fn shutdown_with_pipeline_and_virtual_mic() {
         let config = Config::default();
-        let mut pw = PipeWireManager::connect().expect("stub connect should succeed");
+        let mut pw = PipeWireManager::offline();
         pw.create_virtual_mic(None).expect("create should succeed");
 
         let pipeline = AudioPipeline::new().unwrap();
@@ -2896,7 +2896,7 @@ mod tests {
     #[test]
     fn app_orchestration_start_and_shutdown() {
         let config = Config::default();
-        let mut pw = PipeWireManager::connect().expect("stub connect should succeed");
+        let mut pw = PipeWireManager::offline();
         pw.create_virtual_mic(None).expect("create should succeed");
         assert!(pw.is_virtual_mic_active());
 
@@ -2951,7 +2951,7 @@ mod tests {
     fn handle_ui_event_engine_changed() {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -2986,7 +2986,7 @@ mod tests {
     fn handle_ui_event_strength_is_remembered_per_engine() {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -3062,7 +3062,7 @@ mod tests {
     fn handle_ui_event_enable_toggle() {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -3095,7 +3095,7 @@ mod tests {
     fn handle_ui_event_mode_changed() {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -3120,7 +3120,7 @@ mod tests {
     fn handle_ui_event_auto_gain_toggled() {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -3160,7 +3160,7 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         config.engine = EngineType::DeepFilterNet;
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -3189,7 +3189,7 @@ mod tests {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
         config.enabled = true;
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -3222,7 +3222,7 @@ mod tests {
     fn handle_tray_command_toggle_auto_gain() {
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
@@ -3258,7 +3258,7 @@ mod tests {
 
         let pipeline = AudioPipeline::new().unwrap();
         let mut config = Config::default();
-        let mut pw = PipeWireManager::connect().unwrap();
+        let mut pw = PipeWireManager::offline();
         let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
         let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
 
