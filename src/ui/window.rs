@@ -817,41 +817,84 @@ fn build_device_row(state: &UiState) -> ComboRow {
     row.set_sensitive(!model.no_input);
 
     // OWNER-LOCK: device names must never be truncated or ellipsized —
-    // start, middle, or end — anywhere in the picker.
-    //
-    // `use-subtitle` hides AdwComboRow's default collapsed-value suffix
-    // label, which upstream hard-codes a 20-char end-ellipsis
-    // (`gtk_label_set_max_width_chars(20)` +
-    // `gtk_label_set_ellipsize(END)`). With `use-subtitle` on, the selected
-    // string is instead written to the row's own ActionRow subtitle, which
-    // spans the full row width and — with `subtitle-lines(0)` (unlimited) —
-    // wraps rather than truncating.
-    row.set_use_subtitle(true);
-    row.set_subtitle_lines(0);
-    // T-tua-01: device names (including remote Bluetooth names like
-    // "AirPods Pro") are always plain text, never interpreted as Pango
-    // markup, in either the subtitle or the popup list.
-    row.set_use_markup(false);
-    row.set_list_factory(Some(&full_name_list_factory(&row)));
+    // start, middle, or end — anywhere in the picker. See
+    // `apply_no_truncation`'s doc for why the device row uses
+    // `CollapsedValue::Subtitle` (45-57-char device names cannot fit beside
+    // the title) while Mode/Strength use `CollapsedValue::Suffix`.
+    apply_no_truncation(&row, CollapsedValue::Subtitle);
 
     row
 }
 
-/// Build the popup list factory for the device picker (OWNER-LOCK, T-tua-01,
+/// Where a [`full_name_factory`]'s label is rendered: in the popup list, or
+/// as the row's own always-visible collapsed-value label (replacing
+/// `AdwComboRow`'s default, ellipsizing-at-20-chars factory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactoryRole {
+    /// The popup list shown when the row is activated.
+    Popup,
+    /// The collapsed value shown next to the row's title/arrow.
+    CollapsedValue,
+}
+
+/// Plain-data label configuration for [`full_name_factory`], factored out so
+/// the OWNER-LOCK contract is unit-testable without constructing any GTK
+/// widget.
+struct FullNameLabelSpec {
+    ellipsize: pango::EllipsizeMode,
+    wrap: bool,
+    wrap_mode: pango::WrapMode,
+    max_width_chars: i32,
+    hexpand: bool,
+}
+
+/// OWNER-LOCK no-truncation label spec for `role`.
+///
+/// Neither role ever ellipsizes, and both allow at least 19 characters
+/// (`"Faible consommation"`, the longest French/English selector value)
+/// before wrapping. The popup list (T-tua-03) wraps mid-word (`WordChar`) so
+/// even a single unbroken long name bounds the popover's width rather than
+/// growing it unboundedly; the collapsed value wraps only at spaces
+/// (`Word`, never mid-word) since it sits beside the row's title rather than
+/// inside a width-constrained popover.
+fn full_name_label_spec(role: FactoryRole) -> FullNameLabelSpec {
+    match role {
+        FactoryRole::Popup => FullNameLabelSpec {
+            ellipsize: pango::EllipsizeMode::None,
+            wrap: true,
+            wrap_mode: pango::WrapMode::WordChar,
+            max_width_chars: 60,
+            hexpand: true,
+        },
+        FactoryRole::CollapsedValue => FullNameLabelSpec {
+            ellipsize: pango::EllipsizeMode::None,
+            wrap: true,
+            wrap_mode: pango::WrapMode::Word,
+            max_width_chars: 60,
+            hexpand: false,
+        },
+    }
+}
+
+/// Build a `role`-specific list-item factory for `row` (OWNER-LOCK, T-tua-01,
 /// T-tua-03).
 ///
-/// Renders each entry as a plain-text, word-wrapping label (never
-/// ellipsized) plus a check-mark image whose opacity mirrors whether that
-/// entry is the row's currently `selected-item` — the same visual contract
-/// as libadwaita's own default popup factory (`adw-combo-row.c`), which
-/// reacts to `notify::selected-item` on the row.
-fn full_name_list_factory(row: &ComboRow) -> gtk4::SignalListItemFactory {
+/// Renders each entry as a plain-text, non-ellipsizing, word-wrapping label
+/// per [`full_name_label_spec`]. For [`FactoryRole::Popup`] only, a
+/// check-mark image is added whose opacity mirrors whether that entry is the
+/// row's currently `selected-item` — the same visual contract as
+/// libadwaita's own default popup factory (`adw-combo-row.c`), which reacts
+/// to `notify::selected-item` on the row. [`FactoryRole::CollapsedValue`]
+/// renders a label-only child (no check mark, no `hexpand`), so it never
+/// steals width from the row's title box.
+fn full_name_factory(row: &ComboRow, role: FactoryRole) -> gtk4::SignalListItemFactory {
     let factory = gtk4::SignalListItemFactory::new();
+    let spec = full_name_label_spec(role);
 
     // A weak reference to the row (per upstream `gtk_object_expression_new`
-    // semantics) so this popup factory — whose lifetime is tied to the
-    // row's own popover — never creates a strong reference cycle back to
-    // the row itself.
+    // semantics) so this factory — whose lifetime is tied to the row's own
+    // popover/suffix — never creates a strong reference cycle back to the
+    // row itself.
     let row_expr = gtk4::ObjectExpression::new(row);
     let selected_item_expr = row_expr.chain_property::<ComboRow>("selected-item");
 
@@ -864,35 +907,38 @@ fn full_name_list_factory(row: &ComboRow) -> gtk4::SignalListItemFactory {
 
         let label = gtk4::Label::new(None);
         label.set_xalign(0.0);
-        label.set_hexpand(true);
+        label.set_hexpand(spec.hexpand);
         // T-tua-03: bounded wrap width keeps the popover from growing
         // unboundedly wide on an extremely long name — it grows vertically
         // instead.
-        label.set_ellipsize(pango::EllipsizeMode::None);
-        label.set_wrap(true);
-        label.set_wrap_mode(pango::WrapMode::WordChar);
-        label.set_max_width_chars(60);
-
-        let check = gtk4::Image::from_icon_name("object-select-symbolic");
+        label.set_ellipsize(spec.ellipsize);
+        label.set_wrap(spec.wrap);
+        label.set_wrap_mode(spec.wrap_mode);
+        label.set_max_width_chars(spec.max_width_chars);
 
         hbox.append(&label);
-        hbox.append(&check);
-        list_item.set_child(Some(&hbox));
 
-        // Check-mark opacity mirrors "is this item the row's
-        // selected-item?" — evaluated fresh whenever `selected-item`
-        // changes (bound with `this` = this specific list item, whose own
-        // `item` property never changes after bind).
-        let item_expr = gtk4::ListItem::this_expression("item");
-        let opacity_expr = gtk4::ClosureExpression::with_callback::<f64, _>(
-            [selected_item_expr.clone().upcast(), item_expr.upcast()],
-            |values: &[glib::Value]| -> f64 {
-                let selected = values[1].get::<Option<glib::Object>>().ok().flatten();
-                let item = values[2].get::<Option<glib::Object>>().ok().flatten();
-                if selected == item { 1.0 } else { 0.0 }
-            },
-        );
-        opacity_expr.bind(&check, "opacity", Some(list_item));
+        if role == FactoryRole::Popup {
+            let check = gtk4::Image::from_icon_name("object-select-symbolic");
+            hbox.append(&check);
+
+            // Check-mark opacity mirrors "is this item the row's
+            // selected-item?" — evaluated fresh whenever `selected-item`
+            // changes (bound with `this` = this specific list item, whose
+            // own `item` property never changes after bind).
+            let item_expr = gtk4::ListItem::this_expression("item");
+            let opacity_expr = gtk4::ClosureExpression::with_callback::<f64, _>(
+                [selected_item_expr.clone().upcast(), item_expr.upcast()],
+                |values: &[glib::Value]| -> f64 {
+                    let selected = values[1].get::<Option<glib::Object>>().ok().flatten();
+                    let item = values[2].get::<Option<glib::Object>>().ok().flatten();
+                    if selected == item { 1.0 } else { 0.0 }
+                },
+            );
+            opacity_expr.bind(&check, "opacity", Some(list_item));
+        }
+
+        list_item.set_child(Some(&hbox));
     });
 
     factory.connect_bind(move |_factory, list_item| {
@@ -918,11 +964,70 @@ fn full_name_list_factory(row: &ComboRow) -> gtk4::SignalListItemFactory {
             return;
         };
         // Plain text (never markup), matching the OWNER-LOCK / T-tua-01
-        // contract on the collapsed subtitle.
+        // contract on the collapsed value.
         label.set_text(&string_object.string());
     });
 
     factory
+}
+
+/// Where a `ComboRow`'s collapsed value is rendered, for
+/// [`apply_no_truncation`].
+enum CollapsedValue {
+    /// Route the selected value through the row's own subtitle
+    /// (`use-subtitle`), which spans the full row width. Used for the
+    /// device picker, whose 45-57-char device names cannot fit beside the
+    /// title.
+    Subtitle,
+    /// Replace `AdwComboRow`'s default (ellipsizing) collapsed-value
+    /// factory with a [`FactoryRole::CollapsedValue`] [`full_name_factory`],
+    /// leaving the row's own subtitle untouched. Used for rows whose
+    /// subtitle already carries other information (Mode's DPDFNet-only
+    /// scope hint) or should otherwise stay free.
+    Suffix,
+}
+
+/// OWNER-LOCK no-truncation entry point for every `AdwComboRow` in the
+/// window: no ellipsis anywhere in a selector's popup list or its displayed
+/// (collapsed) value.
+///
+/// `AdwComboRow` renders its always-visible collapsed value through a
+/// `GtkListView` named `current` in the row's suffix, using `priv->factory`
+/// — whose *default* factory hard-codes `gtk_label_set_ellipsize(END)` +
+/// `gtk_label_set_max_width_chars(20)`, which is what produced "Qualité
+/// maxim…". `set_factory()` replaces that factory on both `current` and the
+/// popup `list` (when no separate list factory has been set yet);
+/// `set_list_factory()` replaces only the popup. This function therefore
+/// always installs a non-ellipsizing [`full_name_factory`] as the popup
+/// factory, and — for [`CollapsedValue::Suffix`] — installs a second,
+/// `CollapsedValue`-role factory via `set_factory()` *first*, so the later
+/// `set_list_factory()` call is the one that ends up assigned to the popup
+/// (calling them in the other order would let `set_factory()`'s own popup
+/// assignment win instead).
+///
+/// [`CollapsedValue::Subtitle`] instead turns on `use-subtitle`, which
+/// overwrites the row's own subtitle with the selected value on every
+/// selection change — appropriate for the device picker but wrong for the
+/// Mode row, whose subtitle already carries the DPDFNet-only scope hint
+/// (D-04/15.2-02): `use-subtitle` there would silently delete that hint on
+/// every selection. Mode and Strength therefore use
+/// [`CollapsedValue::Suffix`], which leaves the row's own subtitle alone.
+fn apply_no_truncation(row: &ComboRow, collapsed: CollapsedValue) {
+    // T-voj-05 (parity with T-tua-01): translated selector values always
+    // render as plain text, never interpreted as Pango markup.
+    row.set_use_markup(false);
+
+    match collapsed {
+        CollapsedValue::Subtitle => {
+            row.set_use_subtitle(true);
+            row.set_subtitle_lines(0);
+        }
+        CollapsedValue::Suffix => {
+            row.set_factory(Some(&full_name_factory(row, FactoryRole::CollapsedValue)));
+        }
+    }
+
+    row.set_list_factory(Some(&full_name_factory(row, FactoryRole::Popup)));
 }
 
 /// Build the engine selector as an AdwPreferencesGroup containing one
@@ -1103,6 +1208,11 @@ fn build_strength_row(
     model.append(&tr!("Strong"));
     row.set_model(Some(&model));
     row.set_selected(strength_to_level_index(state.strength));
+    // OWNER-LOCK: full values in both the collapsed row and the popup, no
+    // ellipsis. Suffix (not Subtitle): this row has no subtitle to preserve,
+    // but Suffix is still correct/harmless here and keeps the three ComboRows
+    // consistent (see `apply_no_truncation`'s doc).
+    apply_no_truncation(&row, CollapsedValue::Suffix);
 
     row.connect_selected_notify(move |r| {
         if updating.get() {
@@ -1177,6 +1287,10 @@ fn build_mode_row(
     model.append(&tr!("Max Quality"));
     row.set_model(Some(&model));
     row.set_selected(mode_to_level_index(state.mode));
+    // OWNER-LOCK: full values in both the collapsed row and the popup, no
+    // ellipsis. Suffix (not Subtitle): `use-subtitle` would overwrite this
+    // row's DPDFNet-only scope hint (set just above) on every selection.
+    apply_no_truncation(&row, CollapsedValue::Suffix);
 
     row.connect_selected_notify(move |r| {
         if updating.get() {
@@ -1500,6 +1614,60 @@ mod tests {
             subtitle.to_lowercase().contains("dpdfnet"),
             "Mode row subtitle should convey its DPDFNet-only scope: {subtitle:?}" // i18n-ignore
         );
+    }
+
+    // ── OWNER-LOCK no-truncation label spec (260923-voj) ────────────────────
+    //
+    // Pure `full_name_label_spec()` tests only — no ComboRow/GTK widget is
+    // constructed here (same constraint as `mode_row_subtitle_conveys_...`
+    // above: this test binary's single allowed `gtk4::init()` call is
+    // already spent elsewhere).
+
+    /// The char count of "Faible consommation" — the longest French or
+    /// English selector value across Mode and Strength.
+    const LONGEST_SELECTOR_VALUE_CHARS: i32 = 19;
+
+    #[test]
+    fn full_name_label_spec_popup_matches_tua_contract() {
+        // Regression guard for the Microphone popup (260923-tua): the Popup
+        // role must keep exactly the spec 260923-tua shipped.
+        let spec = full_name_label_spec(FactoryRole::Popup);
+        assert_eq!(spec.ellipsize, pango::EllipsizeMode::None);
+        assert!(spec.wrap);
+        assert_eq!(spec.wrap_mode, pango::WrapMode::WordChar);
+        assert_eq!(spec.max_width_chars, 60);
+        assert!(spec.hexpand);
+    }
+
+    #[test]
+    fn full_name_label_spec_collapsed_value_never_ellipsizes() {
+        let spec = full_name_label_spec(FactoryRole::CollapsedValue);
+        assert_eq!(spec.ellipsize, pango::EllipsizeMode::None);
+        assert!(spec.wrap);
+        // Breaks only at spaces, never mid-word — distinct from the Popup
+        // role's WordChar, since this label sits beside the row's title
+        // rather than inside a width-constrained popover.
+        assert_eq!(spec.wrap_mode, pango::WrapMode::Word);
+        assert_eq!(spec.max_width_chars, 60);
+        assert!(!spec.hexpand);
+    }
+
+    #[test]
+    fn full_name_label_spec_fits_longest_selector_value() {
+        for role in [FactoryRole::Popup, FactoryRole::CollapsedValue] {
+            let spec = full_name_label_spec(role);
+            assert_eq!(
+                spec.ellipsize,
+                pango::EllipsizeMode::None,
+                "{role:?}: OWNER-LOCK forbids ellipsis"
+            );
+            assert!(
+                spec.max_width_chars >= LONGEST_SELECTOR_VALUE_CHARS,
+                "{role:?}: max_width_chars {} must fit \"Faible consommation\" ({} chars)", // i18n-ignore
+                spec.max_width_chars,
+                LONGEST_SELECTOR_VALUE_CHARS
+            );
+        }
     }
 
     // ── engine_row_text — disabled-row behavior (D-08) ──────────────────────
