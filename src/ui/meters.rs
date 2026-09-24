@@ -10,6 +10,16 @@
 //!
 //! Display is clamped to -60..=0 dBFS. Below -60 dBFS is treated as silence;
 //! above 0 dBFS (clipping) is clamped to 0.
+//!
+//! # Input level semantics
+//!
+//! The input meter shows the RMS of the post-DC-block capture signal — the
+//! same DC-free samples the active engine receives (see
+//! `crate::audio::LevelReport::input_rms`). Quiet mics (for example laptop
+//! DMICs, with speech around -40 dBFS) now truthfully sit near the
+//! [`DBFS_MIN`] floor instead of being inflated by an inaudible DC offset.
+//! Input auto-gain (raising a quiet mic's displayed/processed level) is a
+//! separate, not-yet-made owner decision and is out of scope here.
 
 /// Minimum display level in dBFS. Values below this are treated as silence.
 /// Set to -36 dBFS so typical USB mic self-noise (~-40 dBFS) falls below the

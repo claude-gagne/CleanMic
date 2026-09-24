@@ -7,6 +7,10 @@
 //!
 //! All processing is 48 kHz mono f32. The audio thread must remain lock-free:
 //! no allocations, no mutexes, no I/O on the hot path.
+//!
+//! Captured input is DC-blocked (20 Hz one-pole, see [`DcBlocker`]) before it
+//! reaches the engine, so a microphone's constant DC offset never gets
+//! amplified by a suppression engine or read as signal by the input meter.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -102,7 +106,14 @@ pub enum AudioCommand {
 /// Level information reported from the audio thread to the UI.
 #[derive(Debug, Clone, Copy)]
 pub struct LevelReport {
-    /// RMS level of the input buffer (linear, 0.0..=1.0+).
+    /// RMS level of the DC-blocked capture signal (linear, 0.0..=1.0+) —
+    /// exactly what the engine receives.
+    ///
+    /// A microphone's DC offset is inaudible (0 Hz) and is not sound, so
+    /// including it in this level made a silent room read about half full on
+    /// a laptop DMIC that carried ~0.109 FS of DC. With the offset removed,
+    /// the input and output meters compare the same signal before and after
+    /// suppression.
     pub input_rms: f32,
     /// RMS level of the output buffer (linear, 0.0..=1.0+).
     pub output_rms: f32,
@@ -670,11 +681,19 @@ fn audio_thread_main(
                     capture_reader = new_cr;
                     output_writer = new_ow;
                     has_ring_buffers = capture_reader.is_some() && output_writer.is_some();
+                    // A reconnected ring can carry a different DC level than
+                    // the one just torn down; priming on the next sample
+                    // avoids injecting a DC step (a click) into the engine.
+                    input_dc_block.reset();
                 }
                 Ok(AudioCommand::ReplaceCaptureReader(new_cr)) => {
                     log::info!("Audio thread: capture reader replaced (device retargeting)");
                     capture_reader = new_cr;
                     has_ring_buffers = capture_reader.is_some() && output_writer.is_some();
+                    // A different physical mic can carry a different DC
+                    // level; priming on the next sample avoids a DC-step
+                    // click into the engine.
+                    input_dc_block.reset();
                 }
                 Ok(cmd) => {
                     if handle_command(
@@ -729,6 +748,11 @@ fn audio_thread_main(
                             samples_to_ms(dropped)
                         );
                     }
+                    // The stream just (re)started: a fresh mic connection or
+                    // a resumed one after a stop can have a different DC
+                    // level. Priming on the next sample avoids injecting a
+                    // DC step (a click) into the engine.
+                    input_dc_block.reset();
                 }
 
                 let mut blocks = 0usize;
@@ -877,11 +901,17 @@ fn audio_thread_main(
                     capture_reader = new_cr;
                     output_writer = new_ow;
                     has_ring_buffers = capture_reader.is_some() && output_writer.is_some();
+                    // See the busy-loop arm above: a new ring can carry a
+                    // different DC level, so re-arm priming.
+                    input_dc_block.reset();
                 }
                 Ok(AudioCommand::ReplaceCaptureReader(new_cr)) => {
                     log::info!("Audio thread: capture reader replaced (device retargeting, idle)");
                     capture_reader = new_cr;
                     has_ring_buffers = capture_reader.is_some() && output_writer.is_some();
+                    // See the busy-loop arm above: a different physical mic
+                    // can carry a different DC level, so re-arm priming.
+                    input_dc_block.reset();
                 }
                 Ok(cmd) => {
                     if handle_command(
@@ -1902,6 +1932,7 @@ mod tests {
     /// change it mid-run (device retarget / reconnect scenarios).
     struct PacedDcToneFeeder {
         stop: Arc<AtomicBool>,
+        dc_bits: Arc<AtomicU32>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -1909,7 +1940,7 @@ mod tests {
         fn start(capture_writer: RingBufWriter, initial_dc: f32) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let dc_bits = Arc::new(AtomicU32::new(initial_dc.to_bits()));
-            let (stop_t, dc_t) = (stop.clone(), dc_bits);
+            let (stop_t, dc_t) = (stop.clone(), dc_bits.clone());
             let handle = thread::spawn(move || {
                 let period = Duration::from_secs_f64(PW_QUANTUM as f64 / f64::from(SAMPLE_RATE));
                 let mut n: u64 = 0;
@@ -1932,8 +1963,14 @@ mod tests {
             });
             Self {
                 stop,
+                dc_bits,
                 handle: Some(handle),
             }
+        }
+
+        /// Change the DC level fed on the next quantum onward.
+        fn set_dc(&self, dc: f32) {
+            self.dc_bits.store(dc.to_bits(), Ordering::Release);
         }
     }
 
@@ -2088,6 +2125,193 @@ mod tests {
             level.input_rms < 0.03,
             "input_rms = {}, expected < 0.03 (pre-fix it climbs toward ~0.109)",
             level.input_rms
+        );
+    }
+
+    /// An engine that panics on its first `process()` call. Reusable probe for
+    /// exercising the audio thread's panic-recovery (passthrough fallback)
+    /// path.
+    struct PanicOnFirstProcessEngine;
+
+    impl NoiseEngine for PanicOnFirstProcessEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, _: &[f32], _: &mut [f32]) {
+            panic!("intentional test panic (DC-blocker all-paths coverage)");
+        }
+        fn set_strength(&mut self, _: f32) {}
+        fn set_mode(&mut self, _: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    /// ReplaceCaptureReader must re-prime the DC blocker: a device retarget
+    /// can carry a different DC level. Without the reset, switching from a
+    /// steady 0.109 DC to -0.3 DC would show a step of about 0.409 (well
+    /// above the 0.05 bound used below), so this bound is discriminating.
+    #[test]
+    fn dc_block_resets_on_capture_reader_replace() {
+        let (cw1, cr1) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr1, ow).unwrap();
+        let drain = OutputDrain::start(or_);
+        let drain_samples = drain.samples.clone();
+
+        pipeline.start();
+        let feeder1 = PacedDcToneFeeder::start(cw1, 0.109);
+        thread::sleep(Duration::from_millis(300));
+
+        // Mark roughly where the old feeder's output ends, then replace the
+        // capture reader with a fresh ring fed a very different DC level.
+        let switch_mark = drain_samples.lock().unwrap().len();
+        let (cw2, cr2) = ring_buffer(65_536);
+        pipeline.replace_capture_reader(Some(cr2));
+        drop(feeder1);
+        let feeder2 = PacedDcToneFeeder::start(cw2, -0.3);
+
+        thread::sleep(Duration::from_millis(400));
+
+        drop(feeder2);
+        drop(drain);
+        pipeline.shutdown();
+
+        let out = drain_samples.lock().unwrap();
+        // Skip 100 ms after the mark: pipeline latency plus the brief
+        // zero-padded underrun while the new feeder catches up (zeros are
+        // DC-free, so this skip cannot mask a real DC step).
+        let settle = switch_mark + SAMPLE_RATE as usize / 10;
+        assert!(
+            out.len() > settle,
+            "not enough post-replacement output captured: {}",
+            out.len()
+        );
+        let tail = &out[settle..];
+        let max_abs = tail.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(
+            max_abs < 0.05,
+            "max |output| after capture-reader replace = {max_abs}, expected < 0.05"
+        );
+    }
+
+    /// The Start edge (running false -> true) must re-prime the DC blocker:
+    /// a resumed stream can carry a different DC level than before the stop.
+    #[test]
+    fn dc_block_resets_on_start() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        let drain = OutputDrain::start(or_);
+        let drain_samples = drain.samples.clone();
+
+        pipeline.start();
+        let feeder = PacedDcToneFeeder::start(cw, 0.109);
+        thread::sleep(Duration::from_millis(300));
+
+        pipeline.stop();
+        thread::sleep(Duration::from_millis(100));
+        feeder.set_dc(-0.3); // DC changes while stopped (e.g. a new session)
+        thread::sleep(Duration::from_millis(100));
+        pipeline.start();
+        thread::sleep(Duration::from_millis(300));
+
+        drop(feeder);
+        drop(drain);
+        pipeline.shutdown();
+
+        let out = drain_samples.lock().unwrap();
+        let settle = SAMPLE_RATE as usize / 10; // 100 ms
+        assert!(
+            out.len() > settle,
+            "not enough output captured: {}",
+            out.len()
+        );
+        // The discard-stale-capture fix already drops everything queued
+        // before Start, so the tail is exactly what the resumed stream
+        // produced under the new DC level.
+        let tail = &out[out.len() - settle..];
+        let max_abs = tail.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(
+            max_abs < 0.05,
+            "max |output| after Start = {max_abs}, expected < 0.05"
+        );
+    }
+
+    /// No reset on engine swap (DC is continuous across it), and every
+    /// processing path — no-engine passthrough, a direct engine set (no old
+    /// engine so no crossfade), a real two-engine crossfade, and the
+    /// panic-recovery passthrough fallback — sees DC-free input.
+    #[test]
+    fn dc_free_input_on_every_processing_path() {
+        let (cw, cr) = ring_buffer(65_536);
+        let (ow, or_) = ring_buffer(65_536);
+        let pipeline = AudioPipeline::with_ring_buffers(cr, ow).unwrap();
+        let drain = OutputDrain::start(or_);
+        let drain_samples = drain.samples.clone();
+
+        pipeline.start();
+        let feeder = PacedDcToneFeeder::start(cw, 0.109);
+
+        // No engine: passthrough/bypass path.
+        thread::sleep(Duration::from_millis(200));
+
+        // Probe A: direct set, no crossfade (no old engine yet).
+        let stats_a: Arc<Mutex<(f64, usize)>> = Arc::new(Mutex::new((0.0, 0)));
+        pipeline.set_engine(Box::new(InputProbeEngine {
+            stats: stats_a.clone(),
+            skip_remaining: PROBE_SETTLE_SAMPLES,
+        }));
+        thread::sleep(Duration::from_millis(200));
+
+        // Probe B: swapping from probe A (an active old engine) triggers a
+        // real two-engine crossfade; both engines read the same filtered
+        // block.
+        let stats_b: Arc<Mutex<(f64, usize)>> = Arc::new(Mutex::new((0.0, 0)));
+        pipeline.set_engine(Box::new(InputProbeEngine {
+            stats: stats_b.clone(),
+            skip_remaining: PROBE_SETTLE_SAMPLES,
+        }));
+        thread::sleep(Duration::from_millis(200));
+
+        // An engine that panics on its first process(): triggers the
+        // passthrough fallback.
+        pipeline.set_engine(Box::new(PanicOnFirstProcessEngine));
+        thread::sleep(Duration::from_millis(200));
+
+        drop(feeder);
+        drop(drain);
+        pipeline.shutdown();
+
+        let (sum_a, count_a) = *stats_a.lock().unwrap();
+        assert!(count_a > 0, "probe A never received input");
+        let mean_a = sum_a / count_a as f64;
+        assert!(
+            mean_a.abs() < 1e-3,
+            "probe A input mean = {mean_a}, expected near 0 (DC removed before the engine)"
+        );
+
+        let (sum_b, count_b) = *stats_b.lock().unwrap();
+        assert!(count_b > 0, "probe B never received input");
+        let mean_b = sum_b / count_b as f64;
+        assert!(
+            mean_b.abs() < 1e-3,
+            "probe B input mean = {mean_b}, expected near 0 (DC removed before the engine)"
+        );
+
+        let out = drain_samples.lock().unwrap();
+        let skip = SAMPLE_RATE as usize / 10; // 100 ms
+        assert!(
+            out.len() > skip,
+            "not enough output captured: {}",
+            out.len()
+        );
+        let tail = &out[skip..];
+        let max_abs = tail.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(
+            max_abs < 0.05,
+            "max |output| across all processing paths = {max_abs}, expected < 0.05"
         );
     }
 }
