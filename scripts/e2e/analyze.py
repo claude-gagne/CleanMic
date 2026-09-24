@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 import struct
 import sys
 from collections import namedtuple
@@ -163,6 +164,169 @@ def latency_spread_ms(window_lags: list[tuple[int, float]]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Task 2 metrics: repeats, zero runs, holes, DC, settled gain, log scanning.
+# ---------------------------------------------------------------------------
+
+
+def exact_repeat_frac(o: np.ndarray, hop: int = 480, thr: float = 1e-2) -> tuple[float, int]:
+    """Fraction of hop-aligned hops that are near-exact copies of the
+    previous hop (a decimated-mode "held frame" bug signature). Mirrors the
+    debug session's `ana.py::repeat_frac`: for every hop OFFSET (so the
+    comparison isn't blind to a fixed alignment), compare hop t against hop
+    t-hop via cumulative sums; only consider hops with rms > 1e-4 and skip
+    the first 50 (warm-up). Returns (best fraction, hops evaluated at that
+    offset)."""
+    o = np.asarray(o, dtype=np.float64)
+    if len(o) <= hop:
+        return 0.0, 0
+    d = np.concatenate([[0], np.cumsum((o[hop:] - o[:-hop]) ** 2)])
+    e = np.concatenate([[0], np.cumsum(o[hop:] ** 2)])
+    n = len(o) - hop
+    m = n // hop
+    best_frac = 0.0
+    best_evaluated = 0
+    for off in range(hop):
+        ks = off + np.arange(max(m - 1, 0)) * hop
+        ks = ks[ks + hop <= n]
+        if len(ks) == 0:
+            continue
+        dd = d[ks + hop] - d[ks]
+        ee = e[ks + hop] - e[ks]
+        rms = np.sqrt(ee / hop)
+        ok = rms > 1e-4
+        ok[:50] = False
+        evaluated = int(ok.sum())
+        repeats = (np.sqrt(np.maximum(dd, 0)) / np.sqrt(np.maximum(ee, 1e-30)) < thr) & ok
+        frac = float(repeats.sum() / evaluated) if evaluated else 0.0
+        if frac > best_frac or best_evaluated == 0:
+            best_frac = frac
+            best_evaluated = evaluated
+    return best_frac, best_evaluated
+
+
+def zero_runs(o: np.ndarray, min_len: int = 240) -> list[tuple[int, int]]:
+    """Runs of exact (|x| < 1e-9) zero at least `min_len` samples long (5 ms
+    at 48 kHz by default). Returns a list of (start_index, length)."""
+    z = (np.abs(o) < 1e-9).astype(np.int8)
+    d = np.diff(np.concatenate([[0], z, [0]]))
+    starts = np.where(d == 1)[0]
+    ends = np.where(d == -1)[0]
+    lengths = ends - starts
+    return [(int(s), int(length)) for s, length in zip(starts, lengths) if length >= min_len]
+
+
+def holes(o: np.ndarray, fs: int = 48000, frame_ms: float = 10.0) -> int:
+    """Count of `frame_ms` frames whose level drops below -90 dB while the
+    frames 3 positions before AND after it are both above -50 dB -- a brief
+    silent gap surrounded by loud audio, distinct from natural silence."""
+    frame = int(fs * frame_ms / 1000)
+    if frame <= 0 or len(o) < frame:
+        return 0
+    m = len(o) // frame
+    framed = o[: m * frame].reshape(m, frame)
+    levels = 20 * np.log10(np.sqrt(np.mean(framed**2, axis=1)) + 1e-12)
+    count = 0
+    for k in range(3, m - 3):
+        if levels[k] < -90 and levels[k - 3] > -50 and levels[k + 3] > -50:
+            count += 1
+    return count
+
+
+def dc_offset(x: np.ndarray, fs: int = 48000) -> float:
+    """Mean over the active region, excluding its first 1 s (onset
+    transients / DC-blocker settling should not bias the measurement)."""
+    start, end = active_region(x)
+    skip_to = min(start + fs, end)
+    region = x[skip_to:end]
+    if len(region) == 0:
+        region = x[start:end]
+    if len(region) == 0:
+        return 0.0
+    return float(np.mean(region))
+
+
+def rms_curve(x: np.ndarray, fs: int, window_s: float = 0.5) -> list[float]:
+    win = int(fs * window_s)
+    if win <= 0 or len(x) < win:
+        return []
+    n = len(x) // win
+    framed = x[: n * win].reshape(n, win)
+    return [round(float(v), 1) for v in 20 * np.log10(np.sqrt(np.mean(framed**2, axis=1)) + 1e-12)]
+
+
+def settled_gain_db(inp: np.ndarray, out: np.ndarray) -> float:
+    """out - in RMS(dB) over the LAST 50% of the input's active region --
+    the gain once any onset ramp (e.g. auto-gain attack) has settled."""
+    start, end = active_region(inp)
+    mid = start + (end - start) // 2
+    return rms_db(out[mid:end]) - rms_db(inp[mid:end])
+
+
+_LOG_ENGINE_CHANGED_RE = re.compile(r"Engine changed to (\w+) \(mode=(\w+)\)")
+_LOG_MODE_CHANGED_RE = re.compile(r"Mode changed to (\w+)")
+_LOG_FELL_BEHIND_RE = re.compile(r"fell \d+ ms behind")
+_LOG_DISCARDED_RE = re.compile(r"Discarded \d+ ms")
+_LOG_ERROR_RE = re.compile(r" ERROR ")
+_LOG_PANIC_RE = re.compile(r"panicked")
+_LOG_WARN_RE = re.compile(r".*\bWARN\b.*")
+_LOG_UNDERRUN_RE = re.compile(r"underrun|xrun", re.IGNORECASE)
+
+
+def logscan(log_text: str) -> dict[str, Any]:
+    """Scan an app.log's text for the counts/sequences scripts/e2e-audio.sh's
+    scenarios need: fell-behind/error/panic/Discarded counts, the ordered
+    engine-swap and mode-change sequences, the top 10 unique WARN lines
+    (informational), and an underrun/xrun mention count (informational)."""
+    warn_lines = _LOG_WARN_RE.findall(log_text)
+    unique_warns: list[str] = []
+    seen: set[str] = set()
+    for w in warn_lines:
+        if w not in seen:
+            seen.add(w)
+            unique_warns.append(w)
+        if len(unique_warns) >= 10:
+            break
+    return {
+        "fell_behind": len(_LOG_FELL_BEHIND_RE.findall(log_text)),
+        "errors": len(_LOG_ERROR_RE.findall(log_text)),
+        "panics": len(_LOG_PANIC_RE.findall(log_text)),
+        "discarded": len(_LOG_DISCARDED_RE.findall(log_text)),
+        "engine_changed": [tuple(m) for m in _LOG_ENGINE_CHANGED_RE.findall(log_text)],
+        "mode_changed": _LOG_MODE_CHANGED_RE.findall(log_text),
+        "warn_top10": unique_warns,
+        "underrun_mentions": len(_LOG_UNDERRUN_RE.findall(log_text)),
+    }
+
+
+def evaluate_swap_sequence(expected: list[tuple[str, str]], logged: list[tuple[str, str]]) -> tuple[str, str]:
+    """Compare the expected (engine, mode) sequence against the logged one.
+    PASS on an exact match; FAIL naming the first differing index otherwise."""
+    if list(logged) == list(expected):
+        return "PASS", ""
+    for i, exp in enumerate(expected):
+        got = logged[i] if i < len(logged) else None
+        if got != exp:
+            return "FAIL", f"index {i}: expected {exp}, got {got}"
+    return "FAIL", f"logged has {len(logged)} entries, expected {len(expected)}"
+
+
+def eval_dc_within(value: float, max_abs: float) -> str:
+    return "PASS" if abs(value) <= max_abs else "FAIL"
+
+
+def eval_autogain_boost(settled_db: float, min_boost_db: float) -> str:
+    return "PASS" if settled_db >= min_boost_db else "FAIL"
+
+
+def eval_autogain_off_deviation(settled_db: float, max_dev_db: float) -> str:
+    return "PASS" if abs(settled_db) <= max_dev_db else "FAIL"
+
+
+def eval_autogain_noise_diff(on_db: float, off_db: float, max_diff_db: float) -> str:
+    return "PASS" if abs(on_db - off_db) <= max_diff_db else "FAIL"
+
+
+# ---------------------------------------------------------------------------
 # `measure` CLI
 # ---------------------------------------------------------------------------
 
@@ -194,6 +358,16 @@ def measure_recording(path: str, scenario: str, recording: str, kind: str, meta:
     out = x[:, 1]
     start, end = active_region(inp)
     lag, corr, window_lags = measure_latency(inp, out, fs)
+    # Scoped to the INPUT's active region, not the whole recording: a
+    # record_pair driver (e.g. the swaps scenario's 15-swap sequence) can
+    # keep the recorder running well past the point where the source WAV
+    # (and therefore the mirrored `cmtest_mic` input) has gone silent, and a
+    # multi-second trailing silence is neither a "held frame" repeat bug nor
+    # a playback gap -- it's just the recorder still running. Without this,
+    # a single ~70 s tail of exact zero was scored as one giant zero_run.
+    out_active = out[start:end]
+    repeat_frac, evaluated_hops = exact_repeat_frac(out_active.astype(np.float32))
+    zr = zero_runs(out_active)
     result: dict[str, Any] = {
         "scenario": scenario,
         "recording": recording,
@@ -208,6 +382,16 @@ def measure_recording(path: str, scenario: str, recording: str, kind: str, meta:
         "lag_corr": round(corr, 3),
         "window_lags": window_lags,
         "latency_spread_ms": round(latency_spread_ms(window_lags), 2),
+        "exact_repeat_frac": round(repeat_frac, 4),
+        "evaluated_hops": evaluated_hops,
+        "holes": holes(out_active, fs),
+        "zero_runs": len(zr),
+        "zero_run_ms": round(sum(length for _, length in zr) / fs * 1000, 1),
+        "in_dc": round(dc_offset(inp, fs), 6),
+        "out_dc": round(dc_offset(out, fs), 6),
+        "settled_gain_db": round(settled_gain_db(inp, out), 2),
+        "in_curve": rms_curve(inp, fs),
+        "out_curve": rms_curve(out, fs),
     }
     result.update(meta)
     return result
@@ -229,20 +413,31 @@ def cmd_measure(args: argparse.Namespace) -> int:
 Row = namedtuple("Row", "metric value threshold result note")
 
 
-def eval_speech(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
-    """Task 1 subset of the "speech" kind's rules: latency only. Task 2 adds
-    repeat/holes/peak on top of this (see the extended registry below, if
-    present in a later revision of this file)."""
-    engine = str(measured.get("engine", ""))
+def _latency_limit_ms(measured: dict[str, Any], thresholds: dict[str, Any]) -> float:
+    """Per-engine (or, for the monitor path, per-scenario) MaxQuality
+    latency ceiling, plus the decimated-mode allowance for Balanced/LowCpu."""
+    kind = measured.get("kind", "speech")
     mode = str(measured.get("mode", ""))
-    base_key = f"latency_max_ms_{engine.lower()}"
-    base = thresholds.get(base_key, thresholds.get("latency_max_ms", 80))
+    if kind == "monitor_path":
+        base = thresholds.get("monitor_latency_max_ms", thresholds.get("latency_max_ms", 80))
+    else:
+        engine = str(measured.get("engine", ""))
+        base_key = f"latency_max_ms_{engine.lower()}"
+        base = thresholds.get(base_key, thresholds.get("latency_max_ms", 80))
     extra = 0.0
     if mode == "Balanced":
         extra = thresholds.get("latency_extra_balanced_ms", 0)
     elif mode == "LowCpu":
         extra = thresholds.get("latency_extra_lowcpu_ms", 0)
-    limit = base + extra
+    return base + extra
+
+
+def eval_speech(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """The "speech" (and "monitor_path") kind's rules: latency, lag_corr,
+    latency_spread_ms, plus repeat/holes/peak whenever their thresholds are
+    supplied (Task 1 only ever supplies latency-related thresholds, so those
+    extra rows are silently absent from a Task-1-only run's report)."""
+    limit = _latency_limit_ms(measured, thresholds)
     corr_min = thresholds.get("lag_corr_min", 0.5)
     lag_corr = measured.get("lag_corr")
     latency_ms = measured.get("latency_ms")
@@ -268,11 +463,116 @@ def eval_speech(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Ro
         peak_ok = peak is not None and peak <= peak_max
         rows.append(Row("out_peak", peak, f"<= {peak_max}", "PASS" if peak_ok else "FAIL", ""))
 
+    repeat_max = thresholds.get("repeat_frac_max")
+    if repeat_max is not None:
+        repeat = measured.get("exact_repeat_frac")
+        repeat_ok = repeat is not None and repeat <= repeat_max
+        rows.append(Row("exact_repeat_frac", repeat, f"<= {repeat_max}", "PASS" if repeat_ok else "FAIL", ""))
+
+    holes_max = thresholds.get("holes_max")
+    if holes_max is not None:
+        h = measured.get("holes")
+        holes_ok = h is not None and h <= holes_max
+        rows.append(Row("holes", h, f"<= {holes_max}", "PASS" if holes_ok else "FAIL", ""))
+
     return rows
+
+
+def eval_dc_speech(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """dc_speech kind: the full speech rule set, plus |out_dc| <= OUT_DC_MAX."""
+    rows = eval_speech(measured, thresholds)
+    dc_max = thresholds.get("out_dc_max", 0.001)
+    out_dc = measured.get("out_dc")
+    ok = out_dc is not None and abs(out_dc) <= dc_max
+    rows.append(Row("out_dc", out_dc, f"|x| <= {dc_max}", "PASS" if ok else "FAIL", ""))
+    return rows
+
+
+def eval_dc_silence(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """dc_silence kind: no meaningful latency signal (it's DC + silence), so
+    just |out_dc| <= OUT_DC_MAX and out_rms_db <= SILENCE_OUT_MAX_DB."""
+    dc_max = thresholds.get("out_dc_max", 0.001)
+    out_dc = measured.get("out_dc")
+    ok = out_dc is not None and abs(out_dc) <= dc_max
+    rows = [Row("out_dc", out_dc, f"|x| <= {dc_max}", "PASS" if ok else "FAIL", "")]
+    silence_max_db = thresholds.get("silence_out_max_db", -60)
+    out_rms = measured.get("out_rms_db")
+    ok2 = out_rms is not None and out_rms <= silence_max_db
+    rows.append(Row("out_rms_db", out_rms, f"<= {silence_max_db}", "PASS" if ok2 else "FAIL", ""))
+    return rows
+
+
+def eval_ag_on(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """autogain-ON recording (e.g. ag_m40_on): must boost quiet speech by at
+    least AUTOGAIN_MIN_BOOST_DB, without clipping."""
+    min_boost = thresholds.get("autogain_min_boost_db", 10)
+    gain = measured.get("settled_gain_db")
+    ok = gain is not None and gain >= min_boost
+    rows = [Row("settled_gain_db", gain, f">= {min_boost}", "PASS" if ok else "FAIL", "")]
+    peak_max = thresholds.get("peak_max")
+    if peak_max is not None:
+        peak = measured.get("out_peak")
+        ok2 = peak is not None and peak <= peak_max
+        rows.append(Row("out_peak", peak, f"<= {peak_max}", "PASS" if ok2 else "FAIL", ""))
+    return rows
+
+
+def eval_ag_off(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """autogain-OFF recording: near-unity gain (no boost applied)."""
+    max_dev = thresholds.get("autogain_off_max_dev_db", 3)
+    gain = measured.get("settled_gain_db")
+    ok = gain is not None and abs(gain) <= max_dev
+    return [Row("settled_gain_db", gain, f"|x| <= {max_dev}", "PASS" if ok else "FAIL", "")]
+
+
+def eval_ag_pink(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """autogain pink-noise recording: informational per-recording (the ON
+    vs OFF noise-floor comparison itself is a scenario-level `check`, since
+    it needs both recordings at once -- see `diff-check`)."""
+    return [Row("out_rms_db", measured.get("out_rms_db"), "(compared at scenario level)", "INFO", "")]
+
+
+def eval_swaps_during(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """The recording taken WHILE 15 live engine swaps + 3 mode changes are
+    happening. Unlike a steady "speech" recording, latency_ms/lag_corr/
+    latency_spread_ms are structurally meaningless here (each swap's brief
+    crossfade breaks the single fixed-lag correlation the envelope xcorr
+    assumes), and `holes` is EXPECTED (one brief gap per swap) rather than a
+    defect -- both are covered instead by e2e-audio.sh's own swap-count-
+    scaled `zero_run_ms`/`holes` budget `check`s. Only the decimated-mode
+    "held frame" repeat-bug signature is a real invariant here."""
+    repeat_max = thresholds.get("repeat_frac_max")
+    if repeat_max is None:
+        return []
+    repeat = measured.get("exact_repeat_frac")
+    ok = repeat is not None and repeat <= repeat_max
+    return [Row("exact_repeat_frac", repeat, f"<= {repeat_max}", "PASS" if ok else "FAIL", "")]
+
+
+def eval_check(measured: dict[str, Any], thresholds: dict[str, Any]) -> list[Row]:
+    """A precomputed cross-recording or log-based check (see `check`,
+    `diff-check`, `swap-check`, `log-check`): just echo its own verdict."""
+    return [
+        Row(
+            measured.get("metric", "check"),
+            measured.get("value"),
+            measured.get("threshold_desc", ""),
+            measured.get("result", "FAIL"),
+            measured.get("note", ""),
+        )
+    ]
 
 
 RULES_BY_KIND = {
     "speech": eval_speech,
+    "monitor_path": eval_speech,
+    "swaps_during": eval_swaps_during,
+    "dc_speech": eval_dc_speech,
+    "dc_silence": eval_dc_silence,
+    "ag_on": eval_ag_on,
+    "ag_off": eval_ag_off,
+    "ag_pink": eval_ag_pink,
+    "check": eval_check,
 }
 
 
@@ -360,10 +660,13 @@ def render_report(
 def cmd_report(args: argparse.Namespace) -> int:
     thresholds = {k: _coerce_threshold_value(v) for k, v in _parse_kv_list(args.threshold or []).items()}
     meta = _parse_kv_list(args.meta or [])
-    measurements = []
+    measurements: list[dict[str, Any]] = []
     for path in args.json_files:
         with open(path, encoding="utf-8") as fh:
-            measurements.append(json.load(fh))
+            data = json.load(fh)
+        # `log-check` writes a LIST of checks (fell_behind/errors/panics) in
+        # one file; everything else writes a single dict.
+        measurements.extend(data if isinstance(data, list) else [data])
     text, exit_code = render_report(measurements, thresholds, meta, args.aborted)
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
@@ -371,6 +674,111 @@ def cmd_report(args: argparse.Namespace) -> int:
             fh.write("\n")
     print(f"analyze: report -> {args.out} (exit {exit_code})")
     return exit_code
+
+
+def cmd_logscan(args: argparse.Namespace) -> int:
+    with open(args.log, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    result = logscan(text)
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    print(
+        f"analyze: logscan {args.log} -> {args.json_out} "
+        f"(fell_behind={result['fell_behind']} errors={result['errors']} panics={result['panics']})"
+    )
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    result = {
+        "scenario": args.scenario,
+        "recording": args.recording,
+        "kind": "check",
+        "metric": args.metric,
+        "value": _coerce_threshold_value(args.value),
+        "threshold_desc": args.threshold_desc,
+        "result": args.result,
+        "note": args.note or "",
+    }
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    return 0
+
+
+def cmd_diff_check(args: argparse.Namespace) -> int:
+    """Generic |a.FIELD - b.FIELD| <= max check between two `measure`d JSON
+    files -- used for swaps/toggle pre-vs-post latency drift and the
+    autogain pink-noise on-vs-off floor comparison."""
+    with open(args.a, encoding="utf-8") as fh:
+        a = json.load(fh)
+    with open(args.b, encoding="utf-8") as fh:
+        b = json.load(fh)
+    av = a.get(args.a_field)
+    bv = b.get(args.b_field)
+    diff = abs(av - bv) if av is not None and bv is not None else None
+    ok = diff is not None and diff <= args.max_diff
+    result = {
+        "scenario": args.scenario,
+        "recording": args.recording,
+        "kind": "check",
+        "metric": args.metric,
+        "value": round(diff, 4) if diff is not None else None,
+        "threshold_desc": f"<= {args.max_diff}",
+        "result": "PASS" if ok else "FAIL",
+        "note": args.note or f"{a.get('recording')} vs {b.get('recording')}",
+    }
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    return 0
+
+
+def cmd_swap_check(args: argparse.Namespace) -> int:
+    with open(args.logscan, encoding="utf-8") as fh:
+        scanned = json.load(fh)
+    logged = [tuple(x) for x in scanned.get("engine_changed", [])]
+    expected = [tuple(p.split(":", 1)) for p in args.expected.split(",") if p]
+    result_str, note = evaluate_swap_sequence(expected, logged)
+    result = {
+        "scenario": args.scenario,
+        "recording": args.recording,
+        "kind": "check",
+        "metric": "engine_swaps_confirmed",
+        "value": f"{len(logged)}/{len(expected)}",
+        "threshold_desc": f"== {len(expected)} matching, in order",
+        "result": result_str,
+        "note": note,
+    }
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    return 0
+
+
+def cmd_log_check(args: argparse.Namespace) -> int:
+    with open(args.logscan, encoding="utf-8") as fh:
+        scanned = json.load(fh)
+    checks = []
+    for metric, key, maxval in (
+        ("fell_behind", "fell_behind", args.fell_behind_max),
+        ("errors", "errors", args.error_max),
+        ("panics", "panics", args.panic_max),
+    ):
+        v = scanned.get(key, 0)
+        ok = v <= maxval
+        checks.append(
+            {
+                "scenario": args.scenario,
+                "recording": args.recording,
+                "kind": "check",
+                "metric": metric,
+                "value": v,
+                "threshold_desc": f"<= {maxval}",
+                "result": "PASS" if ok else "FAIL",
+                "note": "",
+            }
+        )
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(checks, fh, indent=2)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -392,6 +800,48 @@ def main(argv: list[str] | None = None) -> int:
     p_report.add_argument("--aborted", default=None)
     p_report.add_argument("json_files", nargs="*")
 
+    p_logscan = sub.add_parser("logscan")
+    p_logscan.add_argument("log")
+    p_logscan.add_argument("--json-out", required=True)
+
+    p_check = sub.add_parser("check")
+    p_check.add_argument("--scenario", required=True)
+    p_check.add_argument("--recording", required=True)
+    p_check.add_argument("--metric", required=True)
+    p_check.add_argument("--value", required=True)
+    p_check.add_argument("--threshold-desc", required=True)
+    p_check.add_argument("--result", required=True, choices=["PASS", "FAIL", "INFO", "SKIP"])
+    p_check.add_argument("--note", default="")
+    p_check.add_argument("--json-out", required=True)
+
+    p_diff = sub.add_parser("diff-check")
+    p_diff.add_argument("--a", required=True)
+    p_diff.add_argument("--b", required=True)
+    p_diff.add_argument("--a-field", required=True)
+    p_diff.add_argument("--b-field", required=True)
+    p_diff.add_argument("--max-diff", type=float, required=True)
+    p_diff.add_argument("--metric", required=True)
+    p_diff.add_argument("--scenario", required=True)
+    p_diff.add_argument("--recording", required=True)
+    p_diff.add_argument("--note", default="")
+    p_diff.add_argument("--json-out", required=True)
+
+    p_swap = sub.add_parser("swap-check")
+    p_swap.add_argument("--logscan", required=True)
+    p_swap.add_argument("--expected", required=True, help="comma-separated Engine:Mode pairs")
+    p_swap.add_argument("--scenario", required=True)
+    p_swap.add_argument("--recording", required=True)
+    p_swap.add_argument("--json-out", required=True)
+
+    p_logcheck = sub.add_parser("log-check")
+    p_logcheck.add_argument("--logscan", required=True)
+    p_logcheck.add_argument("--fell-behind-max", type=int, default=0)
+    p_logcheck.add_argument("--error-max", type=int, default=0)
+    p_logcheck.add_argument("--panic-max", type=int, default=0)
+    p_logcheck.add_argument("--scenario", required=True)
+    p_logcheck.add_argument("--recording", default="log")
+    p_logcheck.add_argument("--json-out", required=True)
+
     args = parser.parse_args(argv)
 
     try:
@@ -399,6 +849,16 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_measure(args)
         if args.cmd == "report":
             return cmd_report(args)
+        if args.cmd == "logscan":
+            return cmd_logscan(args)
+        if args.cmd == "check":
+            return cmd_check(args)
+        if args.cmd == "diff-check":
+            return cmd_diff_check(args)
+        if args.cmd == "swap-check":
+            return cmd_swap_check(args)
+        if args.cmd == "log-check":
+            return cmd_log_check(args)
     except (OSError, ValueError) as exc:
         print(f"analyze: {exc}", file=sys.stderr)
         return 2

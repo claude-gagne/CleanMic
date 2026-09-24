@@ -81,6 +81,25 @@ err() { echo "[e2e] $*" >&2; }
 : "${LATENCY_DRIFT_MAX_MS:=15}"   # max spread across 5 s windows within one recording
 : "${PEAK_MAX:=0.98}"             # clipping guard on the processed output
 
+# Monitor path (Task 2, --monitor-null-sink only): measured 70-80 ms post-fix
+# (was 319 ms pre-fix). NOT `LATENCY_MAX_MS + 40` here -- the measured value
+# already sits comfortably under the generic ceiling; a flat, directly-cited
+# number is clearer than a formula that happens to also work.
+: "${MONITOR_LATENCY_MAX_MS:=110}"
+
+: "${REPEAT_FRAC_MAX:=0.001}"              # decimated-mode "held frame" bug signature; near-zero in healthy audio
+: "${HOLES_MAX:=0}"                        # brief silent gaps surrounded by loud audio: never expected
+: "${SWAP_ZERO_MS_PER_SWAP_MAX:=20}"       # a known ~10 ms silent block per engine swap (crossfade), times headroom
+: "${OUT_DC_MAX:=0.001}"                   # the DC blocker should remove essentially all offset
+: "${SILENCE_OUT_MAX_DB:=-60}"             # processed silence should stay near the noise floor
+: "${AUTOGAIN_MIN_BOOST_DB:=10}"           # auto-gain must audibly help a -40 dBFS mic
+: "${AUTOGAIN_OFF_MAX_DEV_DB:=3}"          # auto-gain OFF should be near-unity gain
+: "${AUTOGAIN_NOISE_MAX_DIFF_DB:=3}"       # auto-gain must not audibly pump steady noise (pink, no speech gate trigger)
+: "${LOG_FELL_BEHIND_MAX:=0}"
+: "${LOG_ERROR_MAX:=0}"
+: "${LOG_PANIC_MAX:=0}"
+: "${BASELINE_ENGINES:=Dpdfnet2 Dpdfnet8 DeepFilterNet RNNoise}"
+
 : "${E2E_DISPLAY:=:47}"
 : "${E2E_LANG:=fr}"
 
@@ -144,58 +163,90 @@ mkdir -p "$OUT"/{signals,rec,logs,shots}
 export CLEANMIC_HARNESS_STATE="$OUT/harness"
 
 # ---------------------------------------------------------------------------
-# Preflight (R4): refuse BEFORE any test audio plays, never kill anything.
+# Report accumulation (declared early: render_final_report below needs these
+# populated before the EXIT trap can possibly fire).
 # ---------------------------------------------------------------------------
 
-need_tools() {
-  local missing=()
-  command -v pw-loopback >/dev/null 2>&1 || missing+=("pipewire-bin")
-  command -v pw-record >/dev/null 2>&1 || missing+=("pipewire-bin")
-  command -v pw-play >/dev/null 2>&1 || missing+=("pipewire-bin")
-  command -v pw-link >/dev/null 2>&1 || missing+=("pipewire-bin")
-  command -v pw-dump >/dev/null 2>&1 || missing+=("pipewire-bin")
-  command -v python3 >/dev/null 2>&1 || missing+=("python3")
-  if [ "${#missing[@]}" -gt 0 ]; then
-    err "missing tools -- install: ${missing[*]}"
-    exit 3
-  fi
-  if ! python3 -c 'import numpy' >/dev/null 2>&1; then
-    err "python3 numpy is required: sudo apt install python3-numpy"
-    exit 3
-  fi
+declare -a MEASURED_JSON=()
+declare -a THRESHOLD_ARGS=(
+  --threshold "latency_max_ms=$LATENCY_MAX_MS"
+  --threshold "latency_max_ms_rnnoise=$LATENCY_MAX_MS_RNNOISE"
+  --threshold "latency_max_ms_dpdfnet2=$LATENCY_MAX_MS_DPDFNET2"
+  --threshold "latency_max_ms_dpdfnet8=$LATENCY_MAX_MS_DPDFNET8"
+  --threshold "latency_max_ms_deepfilternet=$LATENCY_MAX_MS_DEEPFILTERNET"
+  --threshold "latency_extra_balanced_ms=$LATENCY_EXTRA_BALANCED_MS"
+  --threshold "latency_extra_lowcpu_ms=$LATENCY_EXTRA_LOWCPU_MS"
+  --threshold "lag_corr_min=$LAG_CORR_MIN"
+  --threshold "latency_drift_max_ms=$LATENCY_DRIFT_MAX_MS"
+  --threshold "peak_max=$PEAK_MAX"
+  --threshold "monitor_latency_max_ms=$MONITOR_LATENCY_MAX_MS"
+  --threshold "repeat_frac_max=$REPEAT_FRAC_MAX"
+  --threshold "holes_max=$HOLES_MAX"
+  --threshold "out_dc_max=$OUT_DC_MAX"
+  --threshold "silence_out_max_db=$SILENCE_OUT_MAX_DB"
+  --threshold "autogain_min_boost_db=$AUTOGAIN_MIN_BOOST_DB"
+  --threshold "autogain_off_max_dev_db=$AUTOGAIN_OFF_MAX_DEV_DB"
+  --threshold "autogain_noise_max_diff_db=$AUTOGAIN_NOISE_MAX_DIFF_DB"
+)
+declare -a META_ARGS=()
+
+REMOTE_DESKTOP_SESSION="no"
+
+build_environment_meta() {
+  local bin="$1" sha mtime head dirty
+  sha="$(sha256sum "$bin" 2>/dev/null | cut -c1-12 || echo unknown)"
+  mtime="$(stat -c %y "$bin" 2>/dev/null || echo unknown)"
+  head="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  dirty="clean"
+  git -C "$REPO_ROOT" diff --quiet 2>/dev/null || dirty="dirty"
+  # Built as an ARRAY, not printed for `$(...)` word-splitting: mtime
+  # ("2026-09-24 09:23:52 +0000") and similar values contain spaces that
+  # word-splitting would silently break into extra, misaligned arguments.
+  META_ARGS=(
+    --meta "binary=$bin" --meta "sha256_12=$sha" --meta "mtime=$mtime"
+    --meta "git_head=$head" --meta "git_dirty=$dirty" --meta "display=$DISPLAY_ARG"
+    --meta "lang=$LANG_ARG" --meta "remote_desktop_session=$REMOTE_DESKTOP_SESSION"
+  )
 }
-need_tools
 
 cmtest_node_count() {
   pw-dump 2>/dev/null | python3 "$E2E_DIR/pwgraph.py" count --prefix cmtest_ 2>/dev/null || echo 0
 }
 
-if [ -n "$(pgrep -x cleanmic 2>/dev/null || true)" ]; then
-  err "refusing to start -- a cleanmic process is already running:"
-  pgrep -a -x cleanmic >&2 || true
-  exit 4
-fi
-EXISTING_CMTEST="$(cmtest_node_count)"
-if [ "${EXISTING_CMTEST:-0}" -gt 0 ]; then
-  err "refusing to start -- $EXISTING_CMTEST cmtest_* node(s) already exist (another harness run, or a leftover)."
-  exit 4
-fi
-
-REMOTE_DESKTOP_SESSION="no"
-if [ -n "$(ss -Htn state established '( sport = :3389 )' 2>/dev/null || true)" ]; then
-  REMOTE_DESKTOP_SESSION="yes"
-  log "NOTE: an RDP session is established -- the RDP-safe graph handles this, informational only."
-fi
-
 # ---------------------------------------------------------------------------
-# TRAP FIRST -- idempotent cleanup for every exit path.
+# TRAP FIRST -- idempotent cleanup for every exit path (preflight refusals,
+# a mid-scenario abort(), Ctrl-C/TERM, or a clean finish all go through this).
 # ---------------------------------------------------------------------------
 
 LOOP_PID=""
+LOOP2_PID=""
 RECORDER_PID=""
 PLAYER_PID=""
 ABORT_CODE=""
+ABORT_MESSAGE=""
 CLEANUP_DONE=0
+
+# Renders $OUT/report.md from whatever MEASURED_JSON has accumulated so far,
+# with an "Aborted" section when ABORT_MESSAGE is set. Called from on_exit so
+# EVERY exit path gets a real report, not just runs that reached the end of
+# `main` -- an abort mid-scenario used to skip report generation entirely.
+render_final_report() {
+  local bin_used report_rc=0
+  bin_used="${APPIMAGE:-${BINARY:-$(ls -t "$REPO_ROOT"/build/CleanMic-*.AppImage 2>/dev/null | head -1 || true)}}"
+  build_environment_meta "$bin_used"
+  local -a aborted_arg=()
+  [ -n "$ABORT_MESSAGE" ] && aborted_arg=(--aborted "$ABORT_MESSAGE")
+  # analyze.py's own "analyze: report -> ... (exit N)" line goes to /dev/null
+  # here -- NOT to this function's stdout, which the caller captures via
+  # `report_rc="$(render_final_report)"` and treats as a single integer.
+  # Leaving it un-redirected made that capture two lines ("analyze: report
+  # ...(exit 1)\n1"), and the later `exit "$report_rc"` died with bash's
+  # "numeric argument required".
+  python3 "$E2E_DIR/analyze.py" report --out "$OUT/report.md" \
+    "${THRESHOLD_ARGS[@]}" "${META_ARGS[@]}" "${aborted_arg[@]}" \
+    "${MEASURED_JSON[@]}" >/dev/null || report_rc=$?
+  echo "$report_rc"
+}
 
 on_exit() {
   local rc=$?
@@ -211,11 +262,13 @@ on_exit() {
   if [ -n "$LOOP_PID" ] && [ "$(cat "/proc/$LOOP_PID/comm" 2>/dev/null || true)" = "pw-loopback" ]; then
     kill "$LOOP_PID" 2>/dev/null
   fi
+  if [ -n "$LOOP2_PID" ] && [ "$(cat "/proc/$LOOP2_PID/comm" 2>/dev/null || true)" = "pw-loopback" ]; then
+    kill "$LOOP2_PID" 2>/dev/null
+  fi
 
   local waited=0 clean=0
   while [ "$waited" -lt 50 ]; do
     local n; n="$(cmtest_node_count)"
-    local survivors; survivors="$(bash "$NESTED_RUN" status "$DISPLAY_ARG" 2>&1 | grep -c 'alive' || true)"
     if [ "${n:-1}" = 0 ]; then
       clean=1
       break
@@ -223,6 +276,9 @@ on_exit() {
     sleep 0.1
     waited=$((waited + 1))
   done
+
+  local report_rc; report_rc="$(render_final_report)"
+  log "report: $OUT/report.md (exit $report_rc)"
 
   {
     if [ "$clean" = 1 ]; then
@@ -238,7 +294,7 @@ on_exit() {
   if [ -n "$ABORT_CODE" ]; then
     exit "$ABORT_CODE"
   fi
-  exit "$rc"
+  exit "$report_rc"
 }
 trap on_exit EXIT
 trap 'ABORT_CODE=130; exit 130' INT
@@ -248,8 +304,47 @@ abort() {
   local code="$1"; shift
   err "$*"
   ABORT_CODE="$code"
+  ABORT_MESSAGE="$*"
   exit "$code"
 }
+
+# ---------------------------------------------------------------------------
+# Preflight (R4): refuse BEFORE any test audio plays, never kill anything.
+# The trap above is already installed, so every refusal below still renders
+# a report and a "Cleanup: complete" line via on_exit.
+# ---------------------------------------------------------------------------
+
+need_tools() {
+  local missing=()
+  command -v pw-loopback >/dev/null 2>&1 || missing+=("pipewire-bin")
+  command -v pw-record >/dev/null 2>&1 || missing+=("pipewire-bin")
+  command -v pw-play >/dev/null 2>&1 || missing+=("pipewire-bin")
+  command -v pw-link >/dev/null 2>&1 || missing+=("pipewire-bin")
+  command -v pw-dump >/dev/null 2>&1 || missing+=("pipewire-bin")
+  command -v python3 >/dev/null 2>&1 || missing+=("python3")
+  if [ "${#missing[@]}" -gt 0 ]; then
+    abort 3 "missing tools -- install: ${missing[*]}"
+  fi
+  if ! python3 -c 'import numpy' >/dev/null 2>&1; then
+    abort 3 "python3 numpy is required: sudo apt install python3-numpy"
+  fi
+}
+need_tools
+
+if [ -n "$(pgrep -x cleanmic 2>/dev/null || true)" ]; then
+  err "refusing to start -- a cleanmic process is already running:"
+  pgrep -a -x cleanmic >&2 || true
+  abort 4 "a cleanmic process is already running."
+fi
+EXISTING_CMTEST="$(cmtest_node_count)"
+if [ "${EXISTING_CMTEST:-0}" -gt 0 ]; then
+  abort 4 "refusing to start -- $EXISTING_CMTEST cmtest_* node(s) already exist (another harness run, or a leftover)."
+fi
+
+if [ -n "$(ss -Htn state established '( sport = :3389 )' 2>/dev/null || true)" ]; then
+  REMOTE_DESKTOP_SESSION="yes"
+  log "NOTE: an RDP session is established -- the RDP-safe graph handles this, informational only."
+fi
 
 # ---------------------------------------------------------------------------
 # RDP-safe graph (per the debug session's env_up2.sh): a Stream/Input capture
@@ -287,11 +382,17 @@ audit_graph() {
 }
 
 # ---------------------------------------------------------------------------
-# record_pair NAME WAV [SOURCE_PORT]
+# record_pair NAME WAV [SOURCE_PORT] [DRIVER_FUNC]
+#
+# DRIVER_FUNC, if given, is backgrounded right after the player is linked
+# (concurrently with playback) -- e.g. the swaps scenario's UI-driving swap
+# sequence. A nonzero driver exit aborts 5.
 # ---------------------------------------------------------------------------
 
+RECORD_START_EPOCH=""
+
 record_pair() {
-  local name="$1" wav="$2" source_port="${3:-CleanMic:capture_MONO}"
+  local name="$1" wav="$2" source_port="${3:-CleanMic:capture_MONO}" driver_func="${4:-}"
   local rec_wav="$OUT/rec/$name.wav"
 
   # NOT disowned: `wait "$RECORDER_PID"` below needs bash to still track this
@@ -347,8 +448,25 @@ with wave.open('$wav', 'rb') as w:
     abort 4 "RDP-safe graph audit failed right after linking the player for '$name'."
   fi
 
+  RECORD_START_EPOCH="$(date +%s.%N)"
+  local driver_pid=""
+  if [ -n "$driver_func" ]; then
+    "$driver_func" &
+    driver_pid=$!
+  fi
+
   wait "$PLAYER_PID" 2>/dev/null || true
   PLAYER_PID=""
+
+  if [ -n "$driver_pid" ]; then
+    local driver_rc=0
+    wait "$driver_pid" || driver_rc=$?
+    if [ "$driver_rc" != 0 ]; then
+      kill "$RECORDER_PID" 2>/dev/null || true
+      abort 5 "driver for '$name' failed (exit $driver_rc) -- see its click-target error above."
+    fi
+  fi
+
   sleep 0.8
   kill -INT "$RECORDER_PID" 2>/dev/null || true
   wait "$RECORDER_PID" 2>/dev/null || true
@@ -364,7 +482,7 @@ with wave.open('$wav', 'rb') as w:
   log "recorded $name -> $rec_wav"
 }
 
-# Poll app.log for a regex, waiting up to $2 seconds. Aborts 5 on timeout.
+# Poll app.log for a regex, waiting up to $2 seconds.
 wait_for_log() {
   local pattern="$1" timeout_s="$2" logfile="$3" waited=0
   while [ "$waited" -lt "$((timeout_s * 10))" ]; do
@@ -389,74 +507,424 @@ run_nested() {
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Report accumulation
-# ---------------------------------------------------------------------------
+# click-target wrapper for the UI actions scenarios drive directly (not
+# through record_pair's driver mechanism): 14/15 map to abort 5, everything
+# else not 0 is also abort 5 (an unconfirmed/unreachable UI action is always
+# a harness/driver problem here, never a metric FAIL).
+click_target() {
+  if ! bash "$NESTED_RUN" click-target "$DISPLAY_ARG" "$@"; then
+    abort 5 "click-target $* failed."
+  fi
+}
 
-declare -a MEASURED_JSON=()
-declare -a THRESHOLD_ARGS=(
-  --threshold "latency_max_ms=$LATENCY_MAX_MS"
-  --threshold "latency_max_ms_rnnoise=$LATENCY_MAX_MS_RNNOISE"
-  --threshold "latency_max_ms_dpdfnet2=$LATENCY_MAX_MS_DPDFNET2"
-  --threshold "latency_max_ms_dpdfnet8=$LATENCY_MAX_MS_DPDFNET8"
-  --threshold "latency_max_ms_deepfilternet=$LATENCY_MAX_MS_DEEPFILTERNET"
-  --threshold "latency_extra_balanced_ms=$LATENCY_EXTRA_BALANCED_MS"
-  --threshold "latency_extra_lowcpu_ms=$LATENCY_EXTRA_LOWCPU_MS"
-  --threshold "lag_corr_min=$LAG_CORR_MIN"
-  --threshold "latency_drift_max_ms=$LATENCY_DRIFT_MAX_MS"
-  --threshold "peak_max=$PEAK_MAX"
-)
+# Launches with the given engine/mode (plus any extra --config args) and
+# waits for startup confirmation. Sets the global APP_LOG. NEVER call this
+# via `$(...)` -- it can call abort(), whose `exit` would only kill a
+# command-substitution subshell instead of the whole script.
+APP_LOG=""
+launch_and_wait() {
+  local engine="$1" mode="$2"; shift 2
+  # `stop` (always run at the end of the PREVIOUS scenario/iteration) closes
+  # the recorded Xephyr along with the app -- reopen it first. A no-op reuse
+  # when it is already alive (e.g. this run's very first launch).
+  run_nested xephyr "$DISPLAY_ARG"
+  run_nested launch "$DISPLAY_ARG" --lang "$LANG_ARG" \
+    --config "engine = \"$engine\"" --config "mode = \"$mode\"" "$@"
+  APP_LOG="$CLEANMIC_HARNESS_STATE/display-${DISPLAY_ARG#:}/app.log"
+  if ! wait_for_log "Audio processing started" 30 "$APP_LOG"; then
+    tail -n 15 "$APP_LOG" >&2 || true
+    abort 5 "launch ($engine/$mode): app.log did not confirm startup within 30s."
+  fi
+  sleep 2
+}
 
-declare -a META_ARGS=()
-build_environment_meta() {
-  local bin="$1" sha mtime head dirty
-  sha="$(sha256sum "$bin" 2>/dev/null | cut -c1-12 || echo unknown)"
-  mtime="$(stat -c %y "$bin" 2>/dev/null || echo unknown)"
-  head="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  dirty="clean"
-  git -C "$REPO_ROOT" diff --quiet 2>/dev/null || dirty="dirty"
-  # Built as an ARRAY, not printed for `$(...)` word-splitting: mtime
-  # ("2026-09-24 09:23:52 +0000") and similar values contain spaces that
-  # word-splitting would silently break into extra, misaligned arguments.
-  META_ARGS=(
-    --meta "binary=$bin" --meta "sha256_12=$sha" --meta "mtime=$mtime"
-    --meta "git_head=$head" --meta "git_dirty=$dirty" --meta "display=$DISPLAY_ARG"
-    --meta "lang=$LANG_ARG" --meta "remote_desktop_session=$REMOTE_DESKTOP_SESSION"
-  )
+# measure_and_add SCENARIO RECORDING KIND [--meta k=v]...
+measure_and_add() {
+  local scenario="$1" recording="$2" kind="$3"; shift 3
+  local json="$OUT/rec/${recording}.json"
+  if ! python3 "$E2E_DIR/analyze.py" measure "$OUT/rec/${recording}.wav" \
+    --scenario "$scenario" --recording "$recording" --kind "$kind" \
+    "$@" --json-out "$json"; then
+    abort 5 "analyze.py measure failed for $recording."
+  fi
+  MEASURED_JSON+=("$json")
+}
+
+# Runs logscan + the fell_behind/errors/panics log-check for a scenario's
+# app.log and appends the resulting checks to MEASURED_JSON. Never aborts:
+# a log-scan hiccup shouldn't take down an otherwise-complete run.
+scenario_log_checks() {
+  local scenario="$1" recording="$2" app_log="$3"
+  local logscan_json="$OUT/logs/${recording}.logscan.json"
+  python3 "$E2E_DIR/analyze.py" logscan "$app_log" --json-out "$logscan_json" || true
+  local check_json="$OUT/rec/${recording}_logcheck.json"
+  python3 "$E2E_DIR/analyze.py" log-check --logscan "$logscan_json" \
+    --fell-behind-max "$LOG_FELL_BEHIND_MAX" --error-max "$LOG_ERROR_MAX" --panic-max "$LOG_PANIC_MAX" \
+    --scenario "$scenario" --recording "$recording" --json-out "$check_json" || true
+  [ -s "$check_json" ] && MEASURED_JSON+=("$check_json")
+}
+
+# diff_check_add A_JSON B_JSON A_FIELD B_FIELD MAX_DIFF METRIC SCENARIO RECORDING
+diff_check_add() {
+  local a="$1" b="$2" af="$3" bf="$4" maxd="$5" metric="$6" scenario="$7" recording="$8"
+  local json="$OUT/rec/${recording}.json"
+  python3 "$E2E_DIR/analyze.py" diff-check --a "$a" --b "$b" --a-field "$af" --b-field "$bf" \
+    --max-diff "$maxd" --metric "$metric" --scenario "$scenario" --recording "$recording" \
+    --json-out "$json" || true
+  [ -s "$json" ] && MEASURED_JSON+=("$json")
 }
 
 # ---------------------------------------------------------------------------
-# SCENARIO: baseline (Task 1 tracer subset -- Dpdfnet2 only)
+# SCENARIO: baseline -- one fresh launch + recording per $BASELINE_ENGINES
+# entry; SKIP (not FAIL) an engine this build doesn't have.
 # ---------------------------------------------------------------------------
 
 scenario_baseline() {
-  local engine="Dpdfnet2" mode="MaxQuality"
-  log "scenario baseline: launching $engine/$mode"
-  run_nested launch "$DISPLAY_ARG" --lang "$LANG_ARG" \
-    --config "engine = \"$engine\"" --config "mode = \"$mode\""
+  local engine mode="MaxQuality"
+  for engine in $BASELINE_ENGINES; do
+    log "scenario baseline: launching $engine/$mode"
+    # `stop` (below, end of the previous iteration) closes the recorded
+    # Xephyr as well as the app -- re-open it before every launch but the
+    # first (a no-op reuse when it's still alive, e.g. this loop's first
+    # pass right after start_graph's own xephyr).
+    run_nested xephyr "$DISPLAY_ARG"
+    run_nested launch "$DISPLAY_ARG" --lang "$LANG_ARG" \
+      --config "engine = \"$engine\"" --config "mode = \"$mode\""
+    APP_LOG="$CLEANMIC_HARNESS_STATE/display-${DISPLAY_ARG#:}/app.log"
+    if ! wait_for_log "Audio processing started" 30 "$APP_LOG"; then
+      tail -n 15 "$APP_LOG" >&2 || true
+      abort 5 "baseline: app.log did not confirm startup within 30s for $engine."
+    fi
 
-  local app_log="$CLEANMIC_HARNESS_STATE/display-${DISPLAY_ARG#:}/app.log"
-  if ! wait_for_log "Audio processing started" 30 "$app_log" ||
-    ! wait_for_log "Linked cmtest_mic:capture_MONO -> CleanMic-capture:input_MONO" 30 "$app_log" ||
-    ! wait_for_log "Engine set to $engine" 30 "$app_log"; then
-    tail -n 15 "$app_log" >&2 || true
-    abort 5 "baseline: app.log did not confirm startup within 30s."
-  fi
+    local actual_engine=""
+    actual_engine="$(grep -Eo 'Engine set to [A-Za-z0-9]+' "$APP_LOG" 2>/dev/null | tail -1 | awk '{print $NF}')" || true
+    if [ "$actual_engine" != "$engine" ]; then
+      log "baseline: $engine not available in this build (got '${actual_engine:-none}') -- SKIP"
+      run_nested stop "$DISPLAY_ARG"
+      local skip_json="$OUT/rec/baseline_${engine}_skip.json"
+      python3 "$E2E_DIR/analyze.py" check --scenario baseline --recording "baseline_${engine}" \
+        --metric availability --value "${actual_engine:-none}" --threshold-desc "== $engine" \
+        --result SKIP --note "not available in this build" --json-out "$skip_json"
+      MEASURED_JSON+=("$skip_json")
+      continue
+    fi
+    wait_for_log "Linked cmtest_mic:capture_MONO -> CleanMic-capture:input_MONO" 10 "$APP_LOG" || true
+    sleep 2
+
+    record_pair "baseline_${engine}" "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+    measure_and_add baseline "baseline_${engine}" speech --meta "engine=$engine" --meta "mode=$mode"
+
+    run_nested stop "$DISPLAY_ARG"
+    cp "$APP_LOG" "$OUT/logs/baseline_${engine}.log" 2>/dev/null || true
+    scenario_log_checks baseline "baseline_${engine}" "$APP_LOG"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# SCENARIO: swaps -- pre/during(15 live swaps + 3 mode changes)/post, plus
+# the logged swap-sequence check and the pre-vs-post latency drift check.
+# ---------------------------------------------------------------------------
+
+SWAPS_ENGINE_SEQUENCE="RNNoise DeepFilterNet Dpdfnet2 Dpdfnet8 RNNoise Dpdfnet2 DeepFilterNet Dpdfnet8 Dpdfnet2 RNNoise DeepFilterNet Dpdfnet8 RNNoise DeepFilterNet Dpdfnet2"
+
+engine_target_name() {
+  case "$1" in
+    RNNoise) echo engine-rnnoise ;;
+    DeepFilterNet) echo engine-deepfilternet ;;
+    Dpdfnet2) echo engine-dpdfnet2 ;;
+    Dpdfnet8) echo engine-dpdfnet8 ;;
+  esac
+}
+
+# Backgrounded by record_pair while speech_loop60.wav plays. Exits nonzero
+# (never abort() -- this runs in its own subshell, where `exit` cannot reach
+# the main script) on the first unconfirmed click-target, which record_pair
+# turns into an abort 5 after `wait`ing on this function's pid.
+_swaps_driver() {
+  local events_file="$OUT/rec/swaps_during.events.tsv" expected_file="$OUT/rec/swaps.expected"
+  : >"$events_file"
+  local mode="MaxQuality" i=0 engine target t new_mode mode_target
+  local -a expected_pairs=()
+  for engine in $SWAPS_ENGINE_SEQUENCE; do
+    i=$((i + 1))
+    target="$(engine_target_name "$engine")"
+    if ! bash "$NESTED_RUN" click-target "$DISPLAY_ARG" "$target" \
+      --expect "Engine changed to $engine \\(mode=$mode\\)" --timeout 5; then
+      return 1
+    fi
+    t="$(python3 -c "import time; print(round(time.time() - $RECORD_START_EPOCH, 2))" 2>/dev/null || echo "?")"
+    printf '%s\tengine\t%s\t%s\n' "$t" "$engine" "$mode" >>"$events_file"
+    expected_pairs+=("$engine:$mode")
+    sleep 1.5
+
+    new_mode=""
+    case "$i" in
+      4) new_mode=LowCpu ;;
+      9) new_mode=Balanced ;;
+      14) new_mode=MaxQuality ;;
+    esac
+    if [ -n "$new_mode" ]; then
+      case "$new_mode" in
+        LowCpu) mode_target=mode-lowcpu ;;
+        Balanced) mode_target=mode-balanced ;;
+        MaxQuality) mode_target=mode-maxquality ;;
+      esac
+      if ! bash "$NESTED_RUN" click-target "$DISPLAY_ARG" "$mode_target" \
+        --expect "Mode changed to $new_mode" --timeout 5; then
+        return 1
+      fi
+      t="$(python3 -c "import time; print(round(time.time() - $RECORD_START_EPOCH, 2))" 2>/dev/null || echo "?")"
+      printf '%s\tmode\t-\t%s\n' "$t" "$new_mode" >>"$events_file"
+      mode="$new_mode"
+    fi
+  done
+  (IFS=,; echo "${expected_pairs[*]}") >"$expected_file"
+  return 0
+}
+
+scenario_swaps() {
+  launch_and_wait Dpdfnet2 MaxQuality
+
+  record_pair swaps_pre "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+  measure_and_add swaps swaps_pre speech --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
+
+  # kind=swaps_during, NOT speech: latency_ms/lag_corr/latency_spread_ms are
+  # structurally meaningless across 15 live engine swaps (each crossfade
+  # breaks the single fixed-lag correlation), and a `holes` count > 0 is
+  # EXPECTED (one brief gap per swap) rather than a defect -- both are
+  # covered instead by the swap-count-scaled budget checks right below.
+  record_pair swaps_during "$OUT/signals/speech_loop60.wav" "CleanMic:capture_MONO" _swaps_driver
+  measure_and_add swaps swaps_during swaps_during --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
+
+  local logscan_json="$OUT/logs/swaps_during.logscan.json"
+  python3 "$E2E_DIR/analyze.py" logscan "$APP_LOG" --json-out "$logscan_json" || true
+  local expected=""; expected="$(cat "$OUT/rec/swaps.expected" 2>/dev/null || true)"
+  python3 "$E2E_DIR/analyze.py" swap-check --logscan "$logscan_json" --expected "$expected" \
+    --scenario swaps --recording swaps_sequence --json-out "$OUT/rec/swaps_sequence.json" || true
+  [ -s "$OUT/rec/swaps_sequence.json" ] && MEASURED_JSON+=("$OUT/rec/swaps_sequence.json")
+
+  local num_swaps; num_swaps="$(echo "$SWAPS_ENGINE_SEQUENCE" | wc -w)"
+  local zero_budget; zero_budget=$(python3 -c "print($num_swaps * $SWAP_ZERO_MS_PER_SWAP_MAX)")
+  local zero_ms=0
+  zero_ms="$(python3 -c "
+import json
+print(json.load(open('$OUT/rec/swaps_during.json')).get('zero_run_ms', 0))
+" 2>/dev/null || echo 0)"
+  local zresult="PASS"
+  python3 -c "raise SystemExit(0 if $zero_ms <= $zero_budget else 1)" 2>/dev/null || zresult="FAIL"
+  python3 "$E2E_DIR/analyze.py" check --scenario swaps --recording swaps_during \
+    --metric zero_run_ms_budget --value "$zero_ms" --threshold-desc "<= $zero_budget" \
+    --result "$zresult" --json-out "$OUT/rec/swaps_zero_budget.json"
+  MEASURED_JSON+=("$OUT/rec/swaps_zero_budget.json")
+
+  # Holes budget: at most one brief crossfade gap per swap is expected here
+  # (unlike a steady recording, where HOLES_MAX=0 applies).
+  local holes_count=0
+  holes_count="$(python3 -c "
+import json
+print(json.load(open('$OUT/rec/swaps_during.json')).get('holes', 0))
+" 2>/dev/null || echo 0)"
+  local hresult="PASS"
+  python3 -c "raise SystemExit(0 if $holes_count <= $num_swaps else 1)" 2>/dev/null || hresult="FAIL"
+  python3 "$E2E_DIR/analyze.py" check --scenario swaps --recording swaps_during \
+    --metric holes_budget --value "$holes_count" --threshold-desc "<= $num_swaps (one crossfade gap per swap)" \
+    --result "$hresult" --json-out "$OUT/rec/swaps_holes_budget.json"
+  MEASURED_JSON+=("$OUT/rec/swaps_holes_budget.json")
+
   sleep 2
+  record_pair swaps_post "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+  measure_and_add swaps swaps_post speech --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
 
-  record_pair "baseline_${engine}" "$OUT/signals/speech.wav" \
-    "CleanMic:capture_MONO"
-
-  local json="$OUT/rec/baseline_${engine}.json"
-  if ! python3 "$E2E_DIR/analyze.py" measure "$OUT/rec/baseline_${engine}.wav" \
-    --scenario baseline --recording "baseline_${engine}" --kind speech \
-    --meta "engine=$engine" --meta "mode=$mode" --json-out "$json"; then
-    abort 5 "analyze.py measure failed for baseline_${engine}."
-  fi
-  MEASURED_JSON+=("$json")
+  diff_check_add "$OUT/rec/swaps_pre.json" "$OUT/rec/swaps_post.json" latency_ms latency_ms \
+    "$LATENCY_DRIFT_MAX_MS" swaps_latency_drift_ms swaps swaps_drift
 
   run_nested stop "$DISPLAY_ARG"
-  cp "$app_log" "$OUT/logs/baseline.log" 2>/dev/null || true
+  cp "$APP_LOG" "$OUT/logs/swaps.log" 2>/dev/null || true
+  scenario_log_checks swaps swaps "$APP_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# SCENARIO: toggle -- pre, Activer off/on, post, plus the drift check and
+# the "at least 2 Discarded lines after restart" check.
+# ---------------------------------------------------------------------------
+
+scenario_toggle() {
+  launch_and_wait Dpdfnet2 MaxQuality
+
+  record_pair toggle_pre "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+  measure_and_add toggle toggle_pre speech --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
+
+  click_target enable --expect "Audio processing stopped" --timeout 5
+  sleep 5.8
+  click_target enable --expect "Audio processing started" --timeout 5
+  sleep 1
+
+  if ! bash "$NESTED_RUN" check-layout "$DISPLAY_ARG"; then
+    abort 5 "toggle: check-layout did not confirm Activer/Enable is back ON."
+  fi
+
+  record_pair toggle_post "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+  measure_and_add toggle toggle_post speech --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
+
+  diff_check_add "$OUT/rec/toggle_pre.json" "$OUT/rec/toggle_post.json" latency_ms latency_ms \
+    "$LATENCY_DRIFT_MAX_MS" toggle_latency_drift_ms toggle toggle_drift
+
+  local discarded_count=0
+  discarded_count="$(grep -Ec 'Discarded [0-9]+ ms' "$APP_LOG" 2>/dev/null)" || true
+  [ -z "$discarded_count" ] && discarded_count=0
+  local result="FAIL"
+  [ "$discarded_count" -ge 2 ] && result="PASS"
+  python3 "$E2E_DIR/analyze.py" check --scenario toggle --recording toggle_discarded \
+    --metric discarded_after_restart --value "$discarded_count" --threshold-desc ">= 2" \
+    --result "$result" --json-out "$OUT/rec/toggle_discarded.json"
+  MEASURED_JSON+=("$OUT/rec/toggle_discarded.json")
+
+  run_nested stop "$DISPLAY_ARG"
+  cp "$APP_LOG" "$OUT/logs/toggle.log" 2>/dev/null || true
+  scenario_log_checks toggle toggle "$APP_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# SCENARIO: modes -- LowCpu, Balanced, LowCpu, Balanced; repeats of the same
+# mode must agree within LATENCY_DRIFT_MAX_MS.
+# ---------------------------------------------------------------------------
+
+scenario_modes() {
+  launch_and_wait Dpdfnet2 MaxQuality
+
+  local -a mode_run=(LowCpu Balanced LowCpu Balanced)
+  declare -A mode_counts=()
+  local m target k rec
+  for m in "${mode_run[@]}"; do
+    case "$m" in
+      LowCpu) target=mode-lowcpu ;;
+      Balanced) target=mode-balanced ;;
+    esac
+    click_target "$target" --expect "Mode changed to $m" --timeout 5
+    sleep 2
+    k=$(( ${mode_counts[$m]:-0} + 1 ))
+    mode_counts[$m]=$k
+    rec="modes_${m}_${k}"
+    record_pair "$rec" "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+    measure_and_add modes "$rec" speech --meta "engine=Dpdfnet2" --meta "mode=$m"
+  done
+
+  diff_check_add "$OUT/rec/modes_LowCpu_1.json" "$OUT/rec/modes_LowCpu_2.json" latency_ms latency_ms \
+    "$LATENCY_DRIFT_MAX_MS" modes_lowcpu_repeat_drift_ms modes modes_lowcpu_repeat
+  diff_check_add "$OUT/rec/modes_Balanced_1.json" "$OUT/rec/modes_Balanced_2.json" latency_ms latency_ms \
+    "$LATENCY_DRIFT_MAX_MS" modes_balanced_repeat_drift_ms modes modes_balanced_repeat
+
+  run_nested stop "$DISPLAY_ARG"
+  cp "$APP_LOG" "$OUT/logs/modes.log" 2>/dev/null || true
+  scenario_log_checks modes modes "$APP_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# SCENARIO: dc -- speech+DC and silence+DC, both must show the DC blocker
+# working; the silence recording also gets an informational meters shot.
+# ---------------------------------------------------------------------------
+
+scenario_dc() {
+  launch_and_wait Dpdfnet2 MaxQuality
+
+  record_pair dc_speech "$OUT/signals/speech_dc.wav" "CleanMic:capture_MONO"
+  measure_and_add dc dc_speech dc_speech --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
+
+  bash "$NESTED_RUN" scroll "$DISPLAY_ARG" bottom >/dev/null 2>&1 || true
+  bash "$NESTED_RUN" shot "$DISPLAY_ARG" "$OUT/shots/dc_silence_meters.png" >/dev/null 2>&1 || true
+
+  record_pair dc_silence "$OUT/signals/silence_dc.wav" "CleanMic:capture_MONO"
+  measure_and_add dc dc_silence dc_silence
+
+  run_nested stop "$DISPLAY_ARG"
+  cp "$APP_LOG" "$OUT/logs/dc.log" 2>/dev/null || true
+  scenario_log_checks dc dc "$APP_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# SCENARIO: autogain -- ON boosts a quiet mic, OFF is near-unity, and ON vs
+# OFF must not audibly pump steady pink noise.
+# ---------------------------------------------------------------------------
+
+scenario_autogain() {
+  launch_and_wait Dpdfnet2 MaxQuality --config 'auto_gain_enabled = true'
+
+  record_pair ag_m40_on "$OUT/signals/speech_m40.wav" "CleanMic:capture_MONO"
+  measure_and_add autogain ag_m40_on ag_on --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
+
+  click_target autogain --expect "Input auto-gain disabled" --timeout 5
+  record_pair ag_m40_off "$OUT/signals/speech_m40.wav" "CleanMic:capture_MONO"
+  measure_and_add autogain ag_m40_off ag_off
+
+  record_pair ag_pink_off "$OUT/signals/pink_m45.wav" "CleanMic:capture_MONO"
+  measure_and_add autogain ag_pink_off ag_pink
+
+  click_target autogain --expect "Input auto-gain enabled" --timeout 5
+  record_pair ag_pink_on "$OUT/signals/pink_m45.wav" "CleanMic:capture_MONO"
+  measure_and_add autogain ag_pink_on ag_pink
+
+  diff_check_add "$OUT/rec/ag_pink_on.json" "$OUT/rec/ag_pink_off.json" out_rms_db out_rms_db \
+    "$AUTOGAIN_NOISE_MAX_DIFF_DB" autogain_noise_diff_db autogain ag_pink_diff
+
+  run_nested stop "$DISPLAY_ARG"
+  cp "$APP_LOG" "$OUT/logs/autogain.log" 2>/dev/null || true
+  scenario_log_checks autogain autogain "$APP_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# SCENARIO: monitor (--monitor-null-sink only) -- CleanMic-monitor routed
+# ONLY to a second, audited, RDP-safe null-sink loopback.
+# ---------------------------------------------------------------------------
+
+scenario_monitor() {
+  pw-loopback -n cmtestnull -c 2 -m '[ FL FR ]' \
+    --capture-props='{ media.class=Audio/Sink node.name=cmtest_null node.description=cmtest_null audio.position=[ FL FR ] }' \
+    --playback-props='{ media.class=Audio/Source node.name=cmtest_null_src node.description=cmtest_null_src priority.session=0 }' \
+    >"$OUT/logs/loopback_null.log" 2>&1 &
+  LOOP2_PID=$!
+
+  local waited=0
+  while [ "$waited" -lt 50 ]; do
+    pw-link -io 2>/dev/null | grep -q "cmtest_null_src:capture_FL" && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  sleep 1.5
+
+  if ! audit_graph; then
+    kill "$LOOP2_PID" 2>/dev/null || true
+    LOOP2_PID=""
+    abort 4 "REFUSED: remote-desktop or foreign capture attached to cmtest_null -- monitor path cannot be tested silently in this session."
+  fi
+
+  launch_and_wait Dpdfnet2 MaxQuality --monitor-sink cmtest_null
+
+  click_target monitor --expect "Monitor enabled" --timeout 5
+
+  if ! audit_graph; then
+    bash "$NESTED_RUN" click-target "$DISPLAY_ARG" monitor --expect "Monitor disabled" --timeout 5 || true
+    run_nested stop "$DISPLAY_ARG"
+    abort 4 "REFUSED: monitor path audit found a foreign link right after enabling."
+  fi
+  if ! wait_for_log "Pinning CleanMic monitor stream to configured sink cmtest_null" 3 "$APP_LOG"; then
+    bash "$NESTED_RUN" click-target "$DISPLAY_ARG" monitor --expect "Monitor disabled" --timeout 5 || true
+    run_nested stop "$DISPLAY_ARG"
+    abort 4 "monitor: pin-to-sink log line not seen within 3s."
+  fi
+
+  record_pair monitor_path "$OUT/signals/speech.wav" "cmtest_null_src:capture_FL"
+  measure_and_add monitor monitor_path monitor_path --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
+
+  click_target monitor --expect "Monitor disabled" --timeout 5
+
+  run_nested stop "$DISPLAY_ARG"
+  cp "$APP_LOG" "$OUT/logs/monitor.log" 2>/dev/null || true
+  scenario_log_checks monitor monitor "$APP_LOG"
+
+  if [ -n "$LOOP2_PID" ] && [ "$(cat "/proc/$LOOP2_PID/comm" 2>/dev/null || true)" = "pw-loopback" ]; then
+    kill "$LOOP2_PID" 2>/dev/null || true
+  fi
+  LOOP2_PID=""
 }
 
 # ---------------------------------------------------------------------------
@@ -469,37 +937,28 @@ if ! python3 "$E2E_DIR/gen_signals.py" --out "$OUT/signals"; then
 fi
 
 log "starting Xephyr on $DISPLAY_ARG"
-declare -a XEPHYR_ARGS=("$DISPLAY_ARG")
-run_nested xephyr "${XEPHYR_ARGS[@]}"
+run_nested xephyr "$DISPLAY_ARG"
 
 start_graph
 
 RUN_LIST="${SCENARIOS[*]}"
 if [[ " $RUN_LIST " == *" all "* ]]; then
-  RUN_LIST="baseline"
-  [ "$MONITOR_NULL_SINK" = 1 ] && RUN_LIST="$RUN_LIST"
+  RUN_LIST="baseline swaps toggle modes dc autogain"
+  [ "$MONITOR_NULL_SINK" = 1 ] && RUN_LIST="$RUN_LIST monitor"
 fi
 
 for s in $RUN_LIST; do
   case "$s" in
     baseline) scenario_baseline ;;
+    swaps) scenario_swaps ;;
+    toggle) scenario_toggle ;;
+    modes) scenario_modes ;;
+    dc) scenario_dc ;;
+    autogain) scenario_autogain ;;
+    monitor) scenario_monitor ;;
     all) : ;;
-    swaps | toggle | modes | dc | autogain | monitor)
-      abort 2 "scenario '$s' is implemented in Task 2 of this harness."
-      ;;
     *) abort 2 "unknown scenario '$s'." ;;
   esac
 done
 
-BIN_USED="${APPIMAGE:-${BINARY:-$(ls -t "$REPO_ROOT"/build/CleanMic-*.AppImage 2>/dev/null | head -1 || true)}}"
-build_environment_meta "$BIN_USED"
-REPORT_RC=0
-python3 "$E2E_DIR/analyze.py" report --out "$OUT/report.md" \
-  "${THRESHOLD_ARGS[@]}" "${META_ARGS[@]}" \
-  "${MEASURED_JSON[@]}" || REPORT_RC=$?
-
-log "report: $OUT/report.md (exit $REPORT_RC)"
-if [ -z "$ABORT_CODE" ]; then
-  ABORT_CODE="$REPORT_RC"
-fi
-exit "$REPORT_RC"
+exit 0

@@ -157,6 +157,133 @@ def test_latency_rule():
     assert rows["latency_ms"].result == "FAIL"
 
 
+# ---------------------------------------------------------------------------
+# Task 2: repeats, zero runs / holes, DC, settled gain, log scanning, rules
+# ---------------------------------------------------------------------------
+
+
+def test_exact_repeat_frac():
+    rng = np.random.default_rng(3)
+    hop = 480
+    n = FS * 10
+    x = (rng.standard_normal(n) * 0.1).astype(np.float64)
+
+    frac0, _ev0 = analyze.exact_repeat_frac(x.astype(np.float32), hop=hop)
+    assert abs(frac0 - 0.0) < 1e-6, f"no copies should give 0.0, got {frac0}"
+
+    y = x.copy()
+    copied_hops = range(100, 120)  # 20 hops, well past the 50-hop warm-up skip
+    for k in copied_hops:
+        start = k * hop
+        y[start : start + hop] = y[start - hop : start]
+    frac, evaluated = analyze.exact_repeat_frac(y.astype(np.float32), hop=hop)
+    expected = len(list(copied_hops)) / evaluated
+    assert abs(frac - expected) < 0.002, f"frac={frac} expected~={expected}"
+
+
+def test_dc():
+    sig = _speech_like(5.0, seed=7)
+    dc_with_offset = analyze.dc_offset(sig + 0.1)
+    assert abs(dc_with_offset - 0.1) < 1e-3
+
+    rng = np.random.default_rng(8)
+    zero_mean = rng.standard_normal(FS * 5)
+    zero_mean = zero_mean - zero_mean.mean()
+    assert abs(analyze.dc_offset(zero_mean)) < 1e-3
+
+
+def test_zero_runs_and_holes():
+    rng = np.random.default_rng(9)
+    n = FS * 2
+    x = rng.standard_normal(n) * 0.3
+    mid = n // 2
+    gap10 = int(0.010 * FS)  # 480 samples, hop/frame-aligned
+    x[mid : mid + gap10] = 0.0
+    zr = analyze.zero_runs(x)
+    assert len(zr) == 1
+    assert zr[0][1] == gap10
+    assert analyze.holes(x, FS) == 1
+
+    y = rng.standard_normal(n) * 0.3
+    gap3 = int(0.003 * FS)  # under the 5 ms (240-sample) minimum
+    y[mid : mid + gap3] = 0.0
+    assert analyze.zero_runs(y) == []
+
+
+def test_settled_gain():
+    rng = np.random.default_rng(11)
+    n = FS * 4
+    inp = rng.standard_normal(n) * 0.1
+    out = inp.copy()
+    half = n // 2
+    gain = 10 ** (16 / 20)
+    out[half:] *= gain
+    g = analyze.settled_gain_db(inp, out)
+    assert abs(g - 16) < 0.1
+
+
+def test_logscan():
+    log_text = (
+        "[t INFO x] Engine changed to Dpdfnet2 (mode=MaxQuality)\n"
+        "[t INFO x] Engine changed to RNNoise (mode=LowCpu)\n"
+        "[t WARN x] Audio thread fell 250 ms behind (engine slower than real time?)\n"
+        "[t ERROR x] something broke\n"
+        "[t INFO x] Discarded 107 ms of capture audio queued while processing was stopped\n"
+        "[t INFO x] Discarded 55 ms of capture audio queued while processing was stopped\n"
+    )
+    result = analyze.logscan(log_text)
+    assert result["fell_behind"] == 1
+    assert result["errors"] == 1
+    assert result["panics"] == 0
+    assert result["discarded"] == 2
+    assert result["engine_changed"] == [("Dpdfnet2", "MaxQuality"), ("RNNoise", "LowCpu")]
+
+
+def test_swap_sequence_rule():
+    expected = [("RNNoise", "MaxQuality"), ("DeepFilterNet", "MaxQuality"), ("Dpdfnet2", "LowCpu")]
+
+    result, _note = analyze.evaluate_swap_sequence(expected, list(expected))
+    assert result == "PASS"
+
+    logged_bad = [("RNNoise", "MaxQuality"), ("DeepFilterNet", "Balanced"), ("Dpdfnet2", "LowCpu")]
+    result2, note2 = analyze.evaluate_swap_sequence(expected, logged_bad)
+    assert result2 == "FAIL"
+    assert "index 1" in note2
+
+    logged_short = [("RNNoise", "MaxQuality")]
+    result3, note3 = analyze.evaluate_swap_sequence(expected, logged_short)
+    assert result3 == "FAIL"
+    assert "index 1" in note3
+
+
+def test_swaps_during_rule_ignores_latency_and_holes():
+    # swaps_during is a 15-swap recording: latency/lag_corr/spread/holes are
+    # all expected to look "bad" by steady-speech standards (crossfades),
+    # and must NOT be evaluated -- only the repeat-bug signature is real.
+    thresholds = {"repeat_frac_max": 0.001, "holes_max": 0, "latency_max_ms": 120}
+    measured = {
+        "latency_ms": 109,
+        "lag_corr": 0.3,
+        "latency_spread_ms": 161.0,
+        "holes": 2,
+        "exact_repeat_frac": 0.0002,
+    }
+    rows = analyze.eval_swaps_during(measured, thresholds)
+    metrics = {r.metric for r in rows}
+    assert metrics == {"exact_repeat_frac"}
+    assert rows[0].result == "PASS"
+
+
+def test_dc_and_autogain_rules():
+    assert analyze.eval_dc_within(3e-7, 1e-3) == "PASS"
+    assert analyze.eval_dc_within(0.05, 1e-3) == "FAIL"
+
+    assert analyze.eval_autogain_boost(16, 10) == "PASS"
+    assert analyze.eval_autogain_off_deviation(-1.5, 3) == "PASS"
+    assert analyze.eval_autogain_noise_diff(-40, -41, 3) == "PASS"
+    assert analyze.eval_autogain_noise_diff(-40, -46, 3) == "FAIL"
+
+
 def _run_all():
     failures = []
     for name, fn in sorted(globals().items()):

@@ -1,0 +1,73 @@
+# nested-run-targets.tsv -- calibrated UI target table for scripts/nested-run.sh's
+# `click-target`/`check-layout`/`targets` subcommands (R3).
+#
+# COLUMNS (tab-separated): name  lang  kind  index  x  top_y  bottom_off  probe_dx  probe_dy  state
+#   name        the target's identifier, passed to `click-target NAME`
+#   lang        fr | en -- the recorded launch language this row applies to
+#   kind        switch | radio | combo
+#   index       for kind=combo: the 0-based item index (Home, then Down x
+#               index, then Return). "-" for switch/radio.
+#   x           LOGICAL x (px at GDK_SCALE 1) of the click point
+#   top_y       LOGICAL y of the click point when the page is scrolled to
+#               TOP, or "-" if the target is not visible from the top
+#   bottom_off  distance in LOGICAL px from the WINDOW'S BOTTOM EDGE to the
+#               click point when the page is scrolled to BOTTOM, or "-" if
+#               not visible from the bottom. click_y = (window bottom) -
+#               bottom_off.
+#   probe_dx/dy offset from the click point (x, top_y or the bottom-derived
+#               y) that `check-layout` samples a single pixel at, to read
+#               ACCENT/NEUTRAL without landing on a switch's white thumb or
+#               a selected radio's hollow center.
+#   state       the live config.toml key this target's state reflects
+#               (switch: enabled/autostart/monitor_enabled/auto_gain_enabled;
+#               radio: compared against `engine`), or "-" for combo rows
+#               (Strength/Mode have no simple accent/neutral pixel state).
+#
+# UNITS: window 420 px wide, harness device cmtest_mic, Khip absent (its row
+# is insensitive and deliberately has no target here). All numbers below were
+# measured with PIL against real screenshots taken via `nested-run.sh shot`
+# at GDK_SCALE 1 on a 520x960 Xephyr (`scripts/e2e/README.md` documents the
+# recalibration procedure step by step).
+#
+# WHY BOTTOM_OFF DIFFERS BY LANGUAGE ONLY FOR SOME ROWS: DPDFNet-8's subtitle
+# wraps to 3 lines in fr vs 2 in en, shifting every row's distance from the
+# TOP by a constant amount from DPDFNet-8 onward, and every row's distance
+# from the BOTTOM by that same amount for rows ABOVE DPDFNet-8's wrap point.
+# Rows AFTER the wrap point (Strength/Mode/Levels/Settings) keep an IDENTICAL
+# bottom_off in both languages, because nothing below them differs by
+# language; enable/RNNoise (before the wrap point) keep an identical top_y.
+#
+# RECALIBRATING after a layout change: for each lang, `nested-run.sh xephyr
+# :47`, `launch :47 --lang LANG`, `scroll :47 top`, `shot :47 FILE`, `scroll
+# :47 bottom`, `shot :47 FILE`, then read pixel colors with PIL (or the Read
+# tool) to find each row's center and re-derive top_y/bottom_off exactly as
+# above. Re-run `check-layout` afterward; DRIFT means a number here is stale.
+#name	lang	kind	index	x	top_y	bottom_off	probe_dx	probe_dy	state
+enable	fr	switch	-	363	197	-	0	0	enabled
+enable	en	switch	-	363	197	-	0	0	enabled
+engine-rnnoise	fr	radio	-	43	315	-	0	-6	engine
+engine-rnnoise	en	radio	-	43	315	-	0	-6	engine
+engine-deepfilternet	fr	radio	-	43	370	889	0	-6	engine
+engine-deepfilternet	en	radio	-	43	370	874	0	-6	engine
+engine-dpdfnet2	fr	radio	-	43	425	834	0	-6	engine
+engine-dpdfnet2	en	radio	-	43	425	818	0	-6	engine
+engine-dpdfnet8	fr	radio	-	43	495	764	0	-6	engine
+engine-dpdfnet8	en	radio	-	43	487	757	0	-6	engine
+strength-light	fr	combo	0	300	684	575	-	-	-
+strength-light	en	combo	0	300	669	575	-	-	-
+strength-balanced	fr	combo	1	300	684	575	-	-	-
+strength-balanced	en	combo	1	300	669	575	-	-	-
+strength-strong	fr	combo	2	300	684	575	-	-	-
+strength-strong	en	combo	2	300	669	575	-	-	-
+mode-lowcpu	fr	combo	0	300	802	457	-	-	-
+mode-lowcpu	en	combo	0	300	787	457	-	-	-
+mode-balanced	fr	combo	1	300	802	457	-	-	-
+mode-balanced	en	combo	1	300	787	457	-	-	-
+mode-maxquality	fr	combo	2	300	802	457	-	-	-
+mode-maxquality	en	combo	2	300	787	457	-	-	-
+autostart	fr	switch	-	363	-	163	0	0	autostart
+autostart	en	switch	-	363	-	163	0	0	autostart
+monitor	fr	switch	-	363	-	108	0	0	monitor_enabled
+monitor	en	switch	-	363	-	108	0	0	monitor_enabled
+autogain	fr	switch	-	363	-	56	0	0	auto_gain_enabled
+autogain	en	switch	-	363	-	56	0	0	auto_gain_enabled

@@ -907,6 +907,367 @@ cmd_reap() {
 }
 
 # ---------------------------------------------------------------------------
+# UI driving (R3): logical<->physical coordinates, geometry, calibrated
+# targets. All coordinates on the command line are LOGICAL unless --physical
+# is given; physical = logical * the recorded per-display scale.
+# ---------------------------------------------------------------------------
+
+TARGETS_TSV="$SCRIPT_DIR/nested-run-targets.tsv"
+
+image_tool() {
+  if command -v magick >/dev/null 2>&1; then
+    echo "magick"
+  else
+    echo "convert"
+  fi
+}
+
+crop_pixel_txt() {
+  local file="$1" x="$2" y="$3"
+  if [ "$(image_tool)" = "magick" ]; then
+    magick "$file" -crop "1x1+${x}+${y}" +repage -depth 8 txt:- 2>/dev/null
+  else
+    convert "$file" -crop "1x1+${x}+${y}" +repage -depth 8 txt:- 2>/dev/null
+  fi
+}
+
+# Exits 5 (Xephyr not recorded) if $1's scale/geometry were never recorded --
+# deliberate: every UI subcommand needs a live, recorded Xephyr first.
+recorded_scale() {
+  local dd; dd="$(display_dir "$1")"
+  if [ ! -f "$dd/scale" ]; then
+    echo "nested-run: no recorded scale for $1 -- run 'xephyr $1' first." >&2
+    exit 5
+  fi
+  cat "$dd/scale"
+}
+
+recorded_geometry() {
+  local dd; dd="$(display_dir "$1")"
+  if [ ! -f "$dd/geometry" ]; then
+    echo "nested-run: no recorded geometry for $1 -- run 'xephyr $1' first." >&2
+    exit 5
+  fi
+  cat "$dd/geometry"
+}
+
+# All non-comment, non-blank data rows for LANG (columns: name lang kind
+# index x top_y bottom_off probe_dx probe_dy state).
+targets_for() {
+  awk -F'\t' -v lang="$1" '!/^#/ && NF >= 10 && $2 == lang {print}' "$TARGETS_TSV"
+}
+
+lookup_target() {
+  awk -F'\t' -v lang="$1" -v name="$2" '!/^#/ && NF >= 10 && $2 == lang && $1 == name {print; exit}' "$TARGETS_TSV"
+}
+
+# shot [:N] FILE  (R3)
+cmd_shot() {
+  parse_display "$@"
+  local file="${REST[0]:-}"
+  [ -n "$file" ] || { echo "usage: nested-run.sh shot [:N] FILE" >&2; exit 2; }
+  mkdir -p "$(dirname "$file")"
+  DISPLAY="$DISP" import -window root "$file"
+  local size; size="$(DISPLAY="$DISP" identify -format '%wx%h' "$file" 2>/dev/null || echo '?')"
+  echo "nested-run: shot $file ($size)"
+}
+
+# click [:N] X Y [--physical]  (R3)
+cmd_click() {
+  parse_display "$@"
+  local x="${REST[0]:-}" y="${REST[1]:-}" physical=0 i
+  for i in "${REST[@]:2}"; do [ "$i" = "--physical" ] && physical=1; done
+  if [ -z "$x" ] || [ -z "$y" ]; then
+    echo "usage: nested-run.sh click [:N] X Y [--physical]" >&2
+    exit 2
+  fi
+  local scale; scale="$(recorded_scale "$DISP")"
+  local geom; geom="$(recorded_geometry "$DISP")"
+  local sw="${geom%x*}" sh="${geom#*x}"
+  local px py
+  if [ "$physical" = 1 ]; then
+    px="$x"; py="$y"
+  else
+    px="$(python3 -c "print(int(round($x * $scale)))")"
+    py="$(python3 -c "print(int(round($y * $scale)))")"
+  fi
+  if [ "$px" -lt 0 ] || [ "$py" -lt 0 ] || [ "$px" -gt "$sw" ] || [ "$py" -gt "$sh" ]; then
+    echo "nested-run: click: ($px,$py) falls outside the recorded Xephyr geometry ${sw}x${sh}." >&2
+    exit 15
+  fi
+  DISPLAY="$DISP" xdotool mousemove "$px" "$py" click 1
+}
+
+# key [:N] KEYSYM...  (R3)
+cmd_key() {
+  parse_display "$@"
+  if [ "${#REST[@]}" -eq 0 ]; then
+    echo "usage: nested-run.sh key [:N] KEYSYM..." >&2
+    exit 2
+  fi
+  DISPLAY="$DISP" xdotool key "${REST[@]}"
+}
+
+# scroll [:N] top|bottom  (R3, P1)
+cmd_scroll() {
+  parse_display "$@"
+  local dir="${REST[0]:-}" btn
+  case "$dir" in
+    top) btn=4 ;;
+    bottom) btn=5 ;;
+    *)
+      echo "usage: nested-run.sh scroll [:N] top|bottom" >&2
+      exit 2
+      ;;
+  esac
+  local scale; scale="$(recorded_scale "$DISP")"
+  local geom; geom="$(recorded_geometry "$DISP")"
+  local sw="${geom%x*}" sh="${geom#*x}"
+  local px py
+  px="$(python3 -c "print(min(int(round(210 * $scale)), $sw))")"
+  py="$(python3 -c "print(min(int(round(400 * $scale)), $sh))")"
+  DISPLAY="$DISP" xdotool mousemove "$px" "$py"
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    DISPLAY="$DISP" xdotool click "$btn"
+    sleep 0.005
+    i=$((i + 1))
+  done
+  sleep 0.5
+}
+
+# targets [:N]  (R3)
+cmd_targets() {
+  parse_display "$@"
+  local dd; dd="$(display_dir "$DISP")"
+  local lang
+  if [ ! -f "$dd/lang" ]; then
+    echo "nested-run: targets: no recorded lang for $DISP -- launch first." >&2
+    exit 5
+  fi
+  lang="$(cat "$dd/lang")"
+  targets_for "$lang"
+}
+
+# Read the recorded window's current HEIGHT/Y (physical px) via xdotool.
+# Sets WIN_HEIGHT and WIN_Y; exits 15 if the window/geometry is unreadable.
+read_window_geometry() {
+  local dd; dd="$(display_dir "$1")"
+  local win_id
+  if [ ! -f "$dd/window.id" ]; then
+    echo "nested-run: no recorded window for $1." >&2
+    exit 15
+  fi
+  win_id="$(cat "$dd/window.id")"
+  local geom_line; geom_line="$(DISPLAY="$1" xdotool getwindowgeometry --shell "$win_id" 2>/dev/null || true)"
+  WIN_HEIGHT="$(echo "$geom_line" | awk -F= '/^HEIGHT=/{print $2}')"
+  WIN_Y="$(echo "$geom_line" | awk -F= '/^Y=/{print $2}')"
+  if [ -z "$WIN_HEIGHT" ] || [ -z "$WIN_Y" ]; then
+    echo "nested-run: could not read window geometry for $1 (window id $win_id)." >&2
+    exit 15
+  fi
+}
+
+# click-target [:N] NAME [--expect REGEX] [--timeout S]  (R3)
+cmd_click_target() {
+  parse_display "$@"
+  local name="${REST[0]:-}"
+  if [ -z "$name" ]; then
+    echo "usage: nested-run.sh click-target [:N] NAME [--expect REGEX] [--timeout S]" >&2
+    exit 2
+  fi
+  local expect="" timeout_s=5 i=1
+  while [ "$i" -lt "${#REST[@]}" ]; do
+    case "${REST[$i]}" in
+      --expect) i=$((i + 1)); expect="${REST[$i]:-}" ;;
+      --timeout) i=$((i + 1)); timeout_s="${REST[$i]:-5}" ;;
+    esac
+    i=$((i + 1))
+  done
+
+  local dd; dd="$(display_dir "$DISP")"
+  if [ ! -f "$dd/lang" ]; then
+    echo "nested-run: click-target: no recorded lang for $DISP." >&2
+    exit 15
+  fi
+  local lang; lang="$(cat "$dd/lang")"
+
+  local row; row="$(lookup_target "$lang" "$name")"
+  if [ -z "$row" ]; then
+    echo "nested-run: click-target: no calibration for '$name' in lang '$lang'." >&2
+    exit 15
+  fi
+
+  if [ "$name" = "monitor" ] && [ ! -f "$dd/monitor-sink" ]; then
+    echo "nested-run: click-target: 'monitor' needs a harness sink -- launch with --monitor-sink." >&2
+    exit 11
+  fi
+
+  local t_name t_lang t_kind t_index t_x t_top_y t_bottom_off t_probe_dx t_probe_dy t_state
+  IFS=$'\t' read -r t_name t_lang t_kind t_index t_x t_top_y t_bottom_off t_probe_dx t_probe_dy t_state <<<"$row"
+
+  read_window_geometry "$DISP"
+  local scale; scale="$(recorded_scale "$DISP")"
+  local viewport; viewport="$(python3 -c "print($WIN_HEIGHT / $scale - 50)")"
+
+  # BEFORE acting, per R3: the confirmation count is a baseline, not a
+  # post-hoc grep -- a log line already present before this call must never
+  # be mistaken for confirmation of THIS action.
+  local app_log="$dd/app.log" before_count=0
+  if [ -n "$expect" ]; then
+    # NOT `grep -c ... || echo 0`: on zero matches `grep -c` prints "0" AND
+    # exits 1, so that fallback ran TOO, appending a second "0\n0" and
+    # breaking the numeric `-gt` test below with bash's "integer expected".
+    # The bare `|| true` (no second echo) absorbs grep's exit-1-on-no-match
+    # without adding a second line, and without letting `set -e` see a
+    # "failed" plain assignment and abort the whole script right here.
+    before_count="$(grep -Ec "$expect" "$app_log" 2>/dev/null)" || true
+    [ -z "$before_count" ] && before_count=0
+  fi
+
+  local click_y=""
+  if [ "$t_top_y" != "-" ] && python3 -c "raise SystemExit(0 if $t_top_y + 24 <= $viewport else 1)" 2>/dev/null; then
+    cmd_scroll "$DISP" top
+    click_y="$t_top_y"
+  elif [ "$t_bottom_off" != "-" ] && python3 -c "raise SystemExit(0 if $t_bottom_off + 24 <= $viewport else 1)" 2>/dev/null; then
+    cmd_scroll "$DISP" bottom
+    click_y="$(python3 -c "print(($WIN_Y + $WIN_HEIGHT) / $scale - $t_bottom_off)")"
+  else
+    echo "nested-run: click-target: '$name' is unreachable at this viewport (${viewport} logical px)." >&2
+    exit 15
+  fi
+
+  cmd_click "$DISP" "$t_x" "$click_y"
+
+  if [ "$t_kind" = "combo" ]; then
+    sleep 0.6
+    cmd_key "$DISP" Home
+    local k=0
+    while [ "$k" -lt "$t_index" ]; do
+      cmd_key "$DISP" Down
+      k=$((k + 1))
+    done
+    cmd_key "$DISP" Return
+    sleep 0.4
+  fi
+
+  if [ -n "$expect" ]; then
+    local waited=0 after_count="$before_count"
+    while [ "$waited" -lt "$((timeout_s * 10))" ]; do
+      after_count="$(grep -Ec "$expect" "$app_log" 2>/dev/null)" || true
+      [ -z "$after_count" ] && after_count=0
+      [ "$after_count" -gt "$before_count" ] && return 0
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    echo "nested-run: click-target: '$name' was not confirmed by app.log within ${timeout_s}s (expected /$expect/). Last 5 lines:" >&2
+    tail -n 5 "$app_log" >&2 || true
+    exit 14
+  fi
+}
+
+# check-layout [:N]  (R3)
+cmd_check_layout() {
+  parse_display "$@"
+  local dd; dd="$(display_dir "$DISP")"
+  if [ ! -f "$dd/lang" ]; then
+    echo "nested-run: check-layout: no recorded lang for $DISP." >&2
+    exit 5
+  fi
+  local lang; lang="$(cat "$dd/lang")"
+  local cfg="$dd/home/config/cleanmic/config.toml"
+  if [ ! -f "$cfg" ]; then
+    echo "nested-run: check-layout: no private config for $DISP." >&2
+    exit 5
+  fi
+
+  read_window_geometry "$DISP"
+  local scale; scale="$(recorded_scale "$DISP")"
+  local viewport; viewport="$(python3 -c "print($WIN_HEIGHT / $scale - 50)")"
+  mkdir -p "$dd/shots"
+
+  local need_top=0 need_bottom=0
+  while IFS=$'\t' read -r t_name t_lang t_kind t_index t_x t_top_y t_bottom_off t_probe_dx t_probe_dy t_state; do
+    [ "$t_state" = "-" ] && continue
+    if [ "$t_top_y" != "-" ] && python3 -c "raise SystemExit(0 if $t_top_y + 24 <= $viewport else 1)" 2>/dev/null; then
+      need_top=1
+    elif [ "$t_bottom_off" != "-" ] && python3 -c "raise SystemExit(0 if $t_bottom_off + 24 <= $viewport else 1)" 2>/dev/null; then
+      need_bottom=1
+    fi
+  done < <(targets_for "$lang")
+
+  if [ "$need_top" = 1 ]; then
+    cmd_scroll "$DISP" top
+    cmd_shot "$DISP" "$dd/shots/check-top.png" >/dev/null
+  fi
+  if [ "$need_bottom" = 1 ]; then
+    cmd_scroll "$DISP" bottom
+    cmd_shot "$DISP" "$dd/shots/check-bottom.png" >/dev/null
+  fi
+
+  local drift=0
+  while IFS=$'\t' read -r t_name t_lang t_kind t_index t_x t_top_y t_bottom_off t_probe_dx t_probe_dy t_state; do
+    [ "$t_state" = "-" ] && continue
+    local shot_file="" click_y=""
+    if [ "$t_top_y" != "-" ] && python3 -c "raise SystemExit(0 if $t_top_y + 24 <= $viewport else 1)" 2>/dev/null; then
+      shot_file="$dd/shots/check-top.png"
+      click_y="$t_top_y"
+    elif [ "$t_bottom_off" != "-" ] && python3 -c "raise SystemExit(0 if $t_bottom_off + 24 <= $viewport else 1)" 2>/dev/null; then
+      shot_file="$dd/shots/check-bottom.png"
+      click_y="$(python3 -c "print(($WIN_Y + $WIN_HEIGHT) / $scale - $t_bottom_off)")"
+    else
+      echo "UNREACHABLE: $t_name"
+      continue
+    fi
+
+    local px py
+    px="$(python3 -c "print(int(round(($t_x + $t_probe_dx) * $scale)))")"
+    py="$(python3 -c "print(int(round(($click_y + $t_probe_dy) * $scale)))")"
+    local pixel_txt; pixel_txt="$(crop_pixel_txt "$shot_file" "$px" "$py")"
+    local hex; hex="$(echo "$pixel_txt" | grep -Eo '#[0-9A-Fa-f]{6,8}' | head -1)"
+    local classification="AMBIGUOUS"
+    if [ -n "$hex" ]; then
+      classification="$(python3 -c "
+h = '$hex'.lstrip('#')
+r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+spread = max(r, g, b) - min(r, g, b)
+print('ACCENT' if spread >= 50 else ('NEUTRAL' if spread <= 20 else 'AMBIGUOUS'))
+")"
+    fi
+
+    local expected
+    expected="$(python3 -c "
+import tomllib
+with open('$cfg', 'rb') as f:
+    cfg = tomllib.load(f)
+kind, name = '$t_kind', '$t_name'
+if kind == 'switch':
+    key = {'enable': 'enabled', 'autostart': 'autostart', 'monitor': 'monitor_enabled', 'autogain': 'auto_gain_enabled'}.get(name)
+    print('ACCENT' if cfg.get(key) else 'NEUTRAL')
+elif kind == 'radio':
+    engine = {'engine-rnnoise': 'RNNoise', 'engine-deepfilternet': 'DeepFilterNet', 'engine-dpdfnet2': 'Dpdfnet2', 'engine-dpdfnet8': 'Dpdfnet8'}.get(name)
+    print('ACCENT' if cfg.get('engine') == engine else 'NEUTRAL')
+else:
+    print('-')
+")"
+
+    if [ "$expected" = "-" ]; then
+      echo "OK: $t_name (kind $t_kind has no state check)"
+      continue
+    fi
+    if [ "$classification" = "AMBIGUOUS" ] || [ "$classification" != "$expected" ]; then
+      echo "DRIFT(expected=$expected, got=$classification, pixel=$hex, at=$px,$py): $t_name"
+      drift=1
+    else
+      echo "OK: $t_name"
+    fi
+  done < <(targets_for "$lang")
+
+  [ "$drift" = 1 ] && exit 13
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
 sub="${1:-}"
@@ -923,10 +1284,13 @@ case "$sub" in
     exit "$stop_rc"
     ;;
   reap) cmd_reap "$@" ;;
-  shot | click | key | scroll | targets | click-target | check-layout)
-    echo "nested-run: '$sub' is implemented in Task 2 of this harness." >&2
-    exit 2
-    ;;
+  shot) cmd_shot "$@" ;;
+  click) cmd_click "$@" ;;
+  key) cmd_key "$@" ;;
+  scroll) cmd_scroll "$@" ;;
+  targets) cmd_targets "$@" ;;
+  click-target) cmd_click_target "$@" ;;
+  check-layout) cmd_check_layout "$@" ;;
   *)
     echo "usage: nested-run.sh {xephyr|launch|app-pid|status|shot|click|key|scroll|targets|click-target|check-layout|stop|reap} ..." >&2
     exit 2
