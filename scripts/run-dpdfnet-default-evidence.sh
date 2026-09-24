@@ -80,8 +80,16 @@ readonly PINNED_THREADS=1            # one thread, per D-06 / schema's single-th
 readonly MIC_CLASSES=(webcam laptop headset)   # fixed, ordered; never substituted for one another
 
 # ── Small helpers ────────────────────────────────────────────────────────
-info()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
-warn()  { printf '\033[1;33m==> %s\033[0m\n' "$*"; }
+# info/warn/error all write to stderr (never stdout): several functions in
+# this script (e.g. extract_appimage_assets) return their result via a final
+# `printf` to stdout captured with `$(...)`, and any info/warn banner emitted
+# to stdout from inside such a function would silently corrupt that captured
+# value -- exactly the bug this fixes (15.2-03 Task 3: a fresh AppImage
+# extraction's info() banner was getting concatenated into $APPDIR, so
+# dpdfnet_model_path() built a garbled path and DPDFNet-2 always reported
+# "model not found", even though the file was present).
+info()  { printf '\033[1;34m==> %s\033[0m\n' "$*" >&2; }
+warn()  { printf '\033[1;33m==> %s\033[0m\n' "$*" >&2; }
 error() { printf '\033[1;31m==> %s\033[0m\n' "$*" >&2; }
 abort() { error "$*"; exit 1; }
 
