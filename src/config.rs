@@ -190,7 +190,15 @@ impl Default for Config {
 
 impl Config {
     /// Return the path to the config file (`~/.config/cleanmic/config.toml`).
+    ///
+    /// In this crate's unit-test build it points into the temp directory
+    /// instead: tests exercising code that calls [`Config::save`] (e.g.
+    /// `app::shutdown`) otherwise overwrite the developer's real settings
+    /// with defaults on every `cargo test` run.
     pub fn config_path() -> Result<PathBuf> {
+        #[cfg(test)]
+        let config_dir = std::env::temp_dir().join("cleanmic-unit-tests");
+        #[cfg(not(test))]
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -361,6 +369,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_tests_never_write_the_real_user_config() {
+        // `app::shutdown` tests (and anything else reaching `Config::save`)
+        // used to overwrite ~/.config/cleanmic/config.toml with defaults on
+        // every `cargo test` run — seen resetting the owner's engine/mode/
+        // strength/mic (debug session base-latency-330ms).
+        let path = Config::config_path().unwrap();
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "unit-test config path {path:?} must live under the temp dir"
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(!path.starts_with(PathBuf::from(home).join(".config")));
+        }
+    }
 
     /// Return a path to `config.toml` inside a fresh temp directory.
     /// The returned `TempDir` handle keeps the directory alive until dropped.
