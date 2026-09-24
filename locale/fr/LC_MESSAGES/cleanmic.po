@@ -265,18 +265,14 @@ msgstr "Fourni par l'utilisateur, adaptatif"
 msgid "DPDFNet, lower processor use"
 msgstr "DPDFNet, utilisation processeur plus faible"
 
-# Phase 15.1 Plan 06: Engine subtitle — DPDFNet-8 (window + tray selector).
-# Per D-06: replaces Plan 04's "DPDFNet, higher quality" placeholder, which
-# implied an unsupported quality ranking.
-msgid "DPDFNet, higher processor use"
-msgstr "DPDFNet, utilisation processeur plus élevée"
-
-# Phase 15.2 Plan 02: DPDFNet-8 static weak-CPU caveat (D-02) — appended after
-# the subtitle above. Gentle, static note only: never a measured hardware
-# verdict, never an auto-switch — just points at the manual Low CPU Mode
-# remedy (D-03/D-04).
-msgid "May glitch on a slower processor — try Low CPU Mode"
-msgstr "Peut saccader sur un processeur plus lent — essayez le mode Faible consommation"
+# Quick 260924-n4s (R2): Engine subtitle — DPDFNet-8 (window + tray
+# selector), the D-02/D-06 processor-use sentence and static weak-CPU caveat
+# as ONE translatable sentence pair with real sentence punctuation. Replaces
+# the two now-removed fragment msgids below ("DPDFNet, higher processor use"
+# and "May glitch on a slower processor — try Low CPU Mode"), which a bare
+# format!() join glued together with a space instead of a period.
+msgid "DPDFNet, higher processor use. May glitch on a slower processor — try Low CPU Mode"
+msgstr "DPDFNet, utilisation processeur plus élevée. Peut saccader sur un processeur plus lent — essayez le mode Faible consommation"
 
 # Phase 15.2 Plan 02: Mode row subtitle — D-04 engine-scope hint (window).
 msgid "Only affects the DPDFNet engines"

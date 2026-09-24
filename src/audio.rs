@@ -50,6 +50,18 @@ const INPUT_DC_BLOCK_CUTOFF_HZ: f32 = 20.0;
 /// Duration of the crossfade window in samples (~10 ms at 48 kHz).
 const CROSSFADE_SAMPLES: usize = 480;
 
+/// R3: bound on how long [`process_with_crossfade`] holds the OLD engine at
+/// full weight while the NEW engine's block is exact zero, instead of
+/// starting the ramp into silence. DPDFNet's `NOISY_FRAME_OFFSET * ratio`
+/// warm-up hops (measured up to 150 ms, DPDFNet-2 LowCpu) and a fresh
+/// DeepFilterNet instance's prefill block are both exact zeros — without
+/// this hold, an engine swap's crossfade ramps INTO that silence instead of
+/// bridging over it, which is exactly the swap-silence-budget defect this
+/// plan closes. 300 ms = 2x the longest measured warm-up mute, so a
+/// permanently-silent new engine still completes the crossfade eventually
+/// (30 blocks) rather than holding forever.
+const CROSSFADE_WARMUP_HOLD_MAX_SAMPLES: usize = 14_400;
+
 /// Hard cap on queued capture audio (200 ms). Above this the audio thread is
 /// running behind (engine slower than real time, long stall) and the oldest
 /// audio is dropped rather than played out late. Must stay above the largest
@@ -65,16 +77,32 @@ const CAPTURE_KEEP_AFTER_TRIM: usize = 2 * BUFFER_SIZE;
 /// guaranteeing a slower-than-real-time engine cannot starve Stop/SetEngine.
 const MAX_BLOCKS_PER_PASS: usize = CAPTURE_MAX_BACKLOG / BUFFER_SIZE + 1;
 
-/// Capture-backlog trims (the audio thread fell more than
-/// [`CAPTURE_MAX_BACKLOG`] behind) within [`FELL_BEHIND_FAULT_WINDOW`] that
-/// mean the active engine is slower than real time rather than hit by a
-/// one-off stall. An RTF 1.25 engine trims every ~0.7 s; DPDFNet-8 MaxQuality
-/// under load trimmed 56 times in one 21 s recording (E2E 2026-09-24); quiet
-/// E2E runs trim 0 times.
-const FELL_BEHIND_FAULT_COUNT: usize = 3;
+/// D-01 (owner decision, 2026-09-24, "wait a few seconds"): an engine's
+/// trouble (repeated [`EngineHealth::Overloaded`] readings, or repeated
+/// capture-backlog trims) must be SUSTAINED for about this long before the
+/// audio thread asks the app for a lighter engine. A 1-2 s CPU spike is
+/// tolerated (a brief choppy moment is acceptable); a caught panic still
+/// falls back immediately ([`EngineWatchdog::panicked`] bypasses the grace
+/// entirely). This is what lets [`crate::engine::deepfilter`]'s bypass/
+/// shadow/recover self-healing (also D-01) run its course before the app
+/// ever sees a fault.
+pub const ENGINE_FALLBACK_GRACE: Duration = Duration::from_secs(5);
 
-/// Window for [`FELL_BEHIND_FAULT_COUNT`].
-const FELL_BEHIND_FAULT_WINDOW: Duration = Duration::from_secs(10);
+/// A gap this long without another [`EngineHealth::Overloaded`] reading
+/// closes the current health trouble episode. Health is observed on every
+/// processed block (every ~10 ms), so 1 s is generously above any single
+/// scheduling hiccup while still merging a bypass/shadow/false-recovery
+/// pattern's brief Healthy blips into ONE sustained episode.
+const TROUBLE_CLEAR_AFTER_HEALTH: Duration = Duration::from_secs(1);
+
+/// A gap this long without another capture-backlog trim closes the current
+/// trim trouble episode. A mildly slow engine (RTF ~1.05) trims roughly
+/// every ~3.8 s (a faster one trims more often); two genuinely isolated
+/// trims 4 s+ apart must never look sustained.
+const TROUBLE_CLEAR_AFTER_TRIMS: Duration = Duration::from_secs(4);
+
+const _: () = assert!(TROUBLE_CLEAR_AFTER_HEALTH.as_millis() < ENGINE_FALLBACK_GRACE.as_millis());
+const _: () = assert!(TROUBLE_CLEAR_AFTER_TRIMS.as_millis() < ENGINE_FALLBACK_GRACE.as_millis());
 
 /// Bound on [`AudioPipeline::shutdown_and_join`]'s wait for the audio thread
 /// to exit. The engine's `teardown()` (which releases DPDFNet's ONNX Runtime
@@ -166,10 +194,11 @@ fn rms(samples: &[f32]) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineFault {
     /// The engine cannot keep up with real time: it said so itself
-    /// ([`EngineHealth::Overloaded`], e.g. DeepFilterNet's underrun guard
-    /// gave up and is passing audio through), or the audio thread fell more
-    /// than [`CAPTURE_MAX_BACKLOG`] behind [`FELL_BEHIND_FAULT_COUNT`] times
-    /// within [`FELL_BEHIND_FAULT_WINDOW`] while running it.
+    /// ([`EngineHealth::Overloaded`], e.g. DeepFilterNet's underrun guard is
+    /// bypassing/shadowing the plugin), or the audio thread's
+    /// [`CAPTURE_MAX_BACKLOG`] trims kept happening for
+    /// [`ENGINE_FALLBACK_GRACE`] straight (D-01: a short spike is
+    /// tolerated; sustained trouble is not).
     Overloaded,
     /// The engine panicked; the audio thread already dropped it and passes
     /// audio through unprocessed.
@@ -185,19 +214,64 @@ pub struct EngineFaultReport {
     pub fault: EngineFault,
 }
 
+/// Tracks one ongoing "trouble" episode (repeated Overloaded health
+/// readings, or repeated capture-backlog trims): pure bookkeeping of when it
+/// started and was last observed, so a series of blips closer together than
+/// `clear_after` count as ONE sustained episode instead of restarting the
+/// clock on every individual blip.
+#[derive(Clone, Copy)]
+struct TroubleEpisode {
+    since: Option<Instant>,
+    last: Option<Instant>,
+    clear_after: Duration,
+}
+
+impl TroubleEpisode {
+    fn new(clear_after: Duration) -> Self {
+        Self {
+            since: None,
+            last: None,
+            clear_after,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.since = None;
+        self.last = None;
+    }
+
+    /// Trouble observed at `now`: starts a new episode when the previous
+    /// observation is missing or more than `clear_after` in the past.
+    /// Returns the episode's current span (`now - since`).
+    fn observe(&mut self, now: Instant) -> Duration {
+        let start_new = match self.last {
+            Some(last) => now.duration_since(last) > self.clear_after,
+            None => true,
+        };
+        if start_new {
+            self.since = Some(now);
+        }
+        self.last = Some(now);
+        now.duration_since(self.since.unwrap_or(now))
+    }
+}
+
 /// Watches the active engine for the failures that would otherwise leave the
 /// virtual mic dead or unusable without anyone noticing, and reports each
 /// engine at most once. Pure bookkeeping (no allocation, no I/O): safe on
 /// the audio thread.
+///
+/// D-01 (owner decision, 2026-09-24): a report only fires once a trouble
+/// episode reaches [`ENGINE_FALLBACK_GRACE`] — a short spike is tolerated. A
+/// caught panic still reports immediately (there is nothing to wait out).
 struct EngineWatchdog {
     /// Number of `SetEngine` commands processed; matches the app-side count
     /// of [`AudioPipeline::set_engine`] calls once the queue has drained.
     generation: u64,
     /// The current engine was already reported.
     reported: bool,
-    /// Instants of the most recent capture-backlog trims (ring).
-    trims: [Option<Instant>; FELL_BEHIND_FAULT_COUNT],
-    next_trim: usize,
+    health_episode: TroubleEpisode,
+    trim_episode: TroubleEpisode,
 }
 
 impl EngineWatchdog {
@@ -205,8 +279,8 @@ impl EngineWatchdog {
         Self {
             generation: 0,
             reported: false,
-            trims: [None; FELL_BEHIND_FAULT_COUNT],
-            next_trim: 0,
+            health_episode: TroubleEpisode::new(TROUBLE_CLEAR_AFTER_HEALTH),
+            trim_episode: TroubleEpisode::new(TROUBLE_CLEAR_AFTER_TRIMS),
         }
     }
 
@@ -214,55 +288,80 @@ impl EngineWatchdog {
     fn engine_replaced(&mut self) {
         self.generation += 1;
         self.reported = false;
-        self.trims = [None; FELL_BEHIND_FAULT_COUNT];
+        self.health_episode.reset();
+        self.trim_episode.reset();
     }
 
-    fn report(&mut self, fault: EngineFault) -> Option<EngineFaultReport> {
+    fn report(
+        &mut self,
+        fault: EngineFault,
+        span: Duration,
+    ) -> Option<(EngineFaultReport, Duration)> {
         if self.reported {
             return None;
         }
         self.reported = true;
-        Some(EngineFaultReport {
-            generation: self.generation,
-            fault,
-        })
+        Some((
+            EngineFaultReport {
+                generation: self.generation,
+                fault,
+            },
+            span,
+        ))
     }
 
-    /// Poll the active engine's own health after a processed block.
-    fn check_health(&mut self, health: EngineHealth) -> Option<EngineFaultReport> {
+    /// Poll the active engine's own health after a processed block. A
+    /// Healthy block does NOT end the episode by itself — only elapsed time
+    /// without further trouble does (see [`TroubleEpisode`]) — so a
+    /// bypass/shadow/false-recovery pattern of brief Healthy blips still
+    /// counts as one sustained episode.
+    fn check_health(
+        &mut self,
+        health: EngineHealth,
+        now: Instant,
+    ) -> Option<(EngineFaultReport, Duration)> {
         match health {
             EngineHealth::Healthy => None,
-            EngineHealth::Overloaded => self.report(EngineFault::Overloaded),
+            EngineHealth::Overloaded => {
+                let span = self.health_episode.observe(now);
+                if span >= ENGINE_FALLBACK_GRACE {
+                    self.report(EngineFault::Overloaded, span)
+                } else {
+                    None
+                }
+            }
         }
     }
 
     /// The capture backlog was just trimmed at `now`.
-    fn fell_behind(&mut self, now: Instant) -> Option<EngineFaultReport> {
-        self.trims[self.next_trim] = Some(now);
-        self.next_trim = (self.next_trim + 1) % FELL_BEHIND_FAULT_COUNT;
-        // After the write, `next_trim` indexes the OLDEST of the last N.
-        let oldest = self.trims[self.next_trim]?;
-        if now.duration_since(oldest) <= FELL_BEHIND_FAULT_WINDOW {
-            self.report(EngineFault::Overloaded)
+    fn fell_behind(&mut self, now: Instant) -> Option<(EngineFaultReport, Duration)> {
+        let span = self.trim_episode.observe(now);
+        if span >= ENGINE_FALLBACK_GRACE {
+            self.report(EngineFault::Overloaded, span)
         } else {
             None
         }
     }
 
-    /// The active engine panicked and was dropped.
-    fn panicked(&mut self) -> Option<EngineFaultReport> {
-        self.report(EngineFault::Panicked)
+    /// The active engine panicked and was dropped: reports immediately,
+    /// bypassing the grace entirely.
+    fn panicked(&mut self) -> Option<(EngineFaultReport, Duration)> {
+        self.report(EngineFault::Panicked, Duration::ZERO)
     }
 }
 
 /// Send a fault report to the app (at most once per engine, see
 /// [`EngineWatchdog`], so the channel send is rare).
-fn send_fault(fault_tx: &mpsc::Sender<EngineFaultReport>, report: Option<EngineFaultReport>) {
-    if let Some(report) = report {
+fn send_fault(
+    fault_tx: &mpsc::Sender<EngineFaultReport>,
+    report: Option<(EngineFaultReport, Duration)>,
+) {
+    if let Some((report, span)) = report {
         log::warn!(
-            "Audio thread: active engine (#{}) reported {:?} — asking the app for a lighter engine",
+            "Audio thread: active engine (#{}) reported {:?} after {:.1} s of sustained trouble — asking the app for a lighter engine",
             report.generation,
-            report.fault
+            report.fault,
+            span.as_secs_f64()
         );
         if fault_tx.send(report).is_err() {
             log::debug!("engine fault channel closed - app may have shut down");
@@ -719,6 +818,10 @@ struct CrossfadeState {
     old_engine: Box<dyn NoiseEngine>,
     /// Number of crossfade samples already applied.
     samples_done: usize,
+    /// R3: samples held at full old-engine weight because the new engine's
+    /// block was exact zero (its own warm-up mute), bounded by
+    /// [`CROSSFADE_WARMUP_HOLD_MAX_SAMPLES`].
+    held_samples: usize,
 }
 
 /// Apply crossfade mixing between old and new engine outputs.
@@ -742,6 +845,19 @@ fn process_with_crossfade(
 
     // Process through new engine (fading in).
     process_buffer(new_engine, input, output);
+
+    // R3: while the ramp hasn't started yet and the new engine's block is
+    // its own warm-up mute (exact zero), hold the OLD engine at full weight
+    // instead of ramping into that silence. The ramp starts on the new
+    // engine's first non-zero block, or once the hold budget is spent.
+    if xfade.samples_done == 0
+        && xfade.held_samples < CROSSFADE_WARMUP_HOLD_MAX_SAMPLES
+        && output[..len].iter().all(|&s| s == 0.0)
+    {
+        output[..len].copy_from_slice(&old_buf[..len]);
+        xfade.held_samples += len;
+        return false;
+    }
 
     // Apply linear crossfade sample-by-sample.
     for i in 0..len {
@@ -782,6 +898,7 @@ fn handle_set_engine(
             *crossfade = Some(CrossfadeState {
                 old_engine: old,
                 samples_done: 0,
+                held_samples: 0,
             });
             *engine = Some(new_engine);
             log::info!("Engine swap started (crossfading)");
@@ -1112,7 +1229,10 @@ fn audio_thread_main(
                         output_buf.copy_from_slice(&input_buf);
                         send_fault(&fault_tx, watchdog.panicked());
                     } else if let Some(ref eng) = engine {
-                        send_fault(&fault_tx, watchdog.check_health(eng.health()));
+                        send_fault(
+                            &fault_tx,
+                            watchdog.check_health(eng.health(), Instant::now()),
+                        );
                     }
 
                     if let Some(ref writer) = output_writer {
@@ -1177,7 +1297,10 @@ fn audio_thread_main(
                     output_buf.copy_from_slice(&input_buf);
                     send_fault(&fault_tx, watchdog.panicked());
                 } else if let Some(ref eng) = engine {
-                    send_fault(&fault_tx, watchdog.check_health(eng.health()));
+                    send_fault(
+                        &fault_tx,
+                        watchdog.check_health(eng.health(), Instant::now()),
+                    );
                 }
 
                 if let Some(ref writer) = output_writer {
@@ -1865,6 +1988,7 @@ mod tests {
         let mut xfade = CrossfadeState {
             old_engine: Box::new(old_engine),
             samples_done: 0,
+            held_samples: 0,
         };
         let mut engine: Option<Box<dyn NoiseEngine>> = Some(Box::new(new_engine));
 
@@ -1909,6 +2033,7 @@ mod tests {
         let mut xfade = CrossfadeState {
             old_engine: Box::new(old_engine),
             samples_done: 0,
+            held_samples: 0,
         };
         let mut engine: Option<Box<dyn NoiseEngine>> = Some(Box::new(new_engine));
 
@@ -2002,11 +2127,15 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         let old_engine = ScalingEngine::new(1.0, Arc::new(AtomicUsize::new(0)));
-        let new_engine = ScalingEngine::new(0.0, Arc::new(AtomicUsize::new(0)));
+        // 0.5, not 0.0: this test's intent is the RAMP span, not the R3
+        // warm-up hold (an exact-zero new engine is covered separately by
+        // `crossfade_warmup_hold_bounded_for_always_zero_new_engine`).
+        let new_engine = ScalingEngine::new(0.5, Arc::new(AtomicUsize::new(0)));
 
         let mut xfade = CrossfadeState {
             old_engine: Box::new(old_engine),
             samples_done: 0,
+            held_samples: 0,
         };
         let mut engine: Option<Box<dyn NoiseEngine>> = Some(Box::new(new_engine));
 
@@ -2035,6 +2164,120 @@ mod tests {
         assert_eq!(
             iterations, 10,
             "Crossfade should take 10 iterations of 48 samples"
+        );
+    }
+
+    /// New-engine stub for the R3 crossfade warm-up hold tests: outputs
+    /// exact zero for its first `mute_calls` `process()` calls (a DPDFNet-
+    /// style warm-up mute), then a fixed scale of the input.
+    struct MuteThenLoudEngine {
+        mute_calls: usize,
+        calls: usize,
+        scale: f32,
+    }
+
+    impl NoiseEngine for MuteThenLoudEngine {
+        fn init(&mut self, _sample_rate: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            if self.calls < self.mute_calls {
+                output.fill(0.0);
+            } else {
+                for (o, &i) in output.iter_mut().zip(input.iter()) {
+                    *o = i * self.scale;
+                }
+            }
+            self.calls += 1;
+        }
+        fn set_strength(&mut self, _strength: f32) {}
+        fn set_mode(&mut self, _mode: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+    }
+
+    #[test]
+    fn crossfade_warmup_hold_bridges_a_muted_new_engine() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let old_engine = ScalingEngine::new(1.0, Arc::new(AtomicUsize::new(0)));
+        let new_engine = MuteThenLoudEngine {
+            mute_calls: 15,
+            calls: 0,
+            scale: 1.0,
+        };
+        let mut xfade = CrossfadeState {
+            old_engine: Box::new(old_engine),
+            samples_done: 0,
+            held_samples: 0,
+        };
+        let mut engine: Option<Box<dyn NoiseEngine>> = Some(Box::new(new_engine));
+
+        let input = [1.0f32; BUFFER_SIZE];
+        let mut output = [0.0f32; BUFFER_SIZE];
+        let mut old_buf = [0.0f32; BUFFER_SIZE];
+
+        let mut done = false;
+        let mut block = 0;
+        while !done {
+            block += 1;
+            done =
+                process_with_crossfade(&mut xfade, &mut engine, &input, &mut output, &mut old_buf);
+            assert!(
+                output.iter().any(|&s| s != 0.0),
+                "block {block}: no output block may be all-zero while the input is non-zero"
+            );
+            if block <= 15 {
+                assert!(
+                    !done,
+                    "block {block}: must not complete while the new engine is still muted"
+                );
+                assert!(
+                    output.iter().all(|&s| (s - 1.0).abs() < 1e-6),
+                    "block {block}: held at the old engine's full weight, got {:?}",
+                    output[0]
+                );
+            }
+        }
+        assert_eq!(
+            block, 16,
+            "the crossfade should complete on block 16 (15 held + 1 ramp)"
+        );
+    }
+
+    #[test]
+    fn crossfade_warmup_hold_bounded_for_always_zero_new_engine() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let old_engine = ScalingEngine::new(1.0, Arc::new(AtomicUsize::new(0)));
+        let new_engine = ScalingEngine::new(0.0, Arc::new(AtomicUsize::new(0)));
+        let mut xfade = CrossfadeState {
+            old_engine: Box::new(old_engine),
+            samples_done: 0,
+            held_samples: 0,
+        };
+        let mut engine: Option<Box<dyn NoiseEngine>> = Some(Box::new(new_engine));
+
+        let input = [1.0f32; BUFFER_SIZE];
+        let mut output = [0.0f32; BUFFER_SIZE];
+        let mut old_buf = [0.0f32; BUFFER_SIZE];
+
+        let mut done = false;
+        let mut block = 0;
+        while !done {
+            block += 1;
+            done =
+                process_with_crossfade(&mut xfade, &mut engine, &input, &mut output, &mut old_buf);
+        }
+        assert_eq!(
+            block,
+            CROSSFADE_WARMUP_HOLD_MAX_SAMPLES / BUFFER_SIZE + 1,
+            "a permanently-silent new engine still completes the crossfade: \
+             the held blocks plus exactly one ramp block"
         );
     }
 
@@ -3041,49 +3284,172 @@ mod tests {
     // replaces an engine the user picked after the failing one.
 
     #[test]
-    fn watchdog_reports_three_trims_within_the_window_once() {
+    fn watchdog_tolerates_a_short_overloaded_spike() {
+        // D-01: 1.3 s of Overloaded (every 10 ms block), then Healthy well
+        // past the grace -- must never report.
         let mut w = EngineWatchdog::new();
         w.engine_replaced();
         let t0 = Instant::now();
-        assert_eq!(w.fell_behind(t0), None);
-        assert_eq!(
-            w.fell_behind(t0 + Duration::from_secs(4)),
-            None,
-            "2 trims: a stall, not overload"
-        );
-        assert_eq!(
-            w.fell_behind(t0 + FELL_BEHIND_FAULT_WINDOW),
-            Some(EngineFaultReport {
-                generation: 1,
-                fault: EngineFault::Overloaded
-            }),
-            "3rd trim exactly at the window edge still counts"
-        );
-        assert_eq!(
-            w.fell_behind(t0 + Duration::from_secs(11)),
-            None,
-            "reported once per engine"
-        );
-        assert_eq!(
-            w.check_health(EngineHealth::Overloaded),
-            None,
-            "once, whatever the source"
+        for k in 0..130 {
+            assert!(
+                w.check_health(EngineHealth::Overloaded, t0 + Duration::from_millis(10 * k))
+                    .is_none(),
+                "block {k}: a 1.3s spike must never report"
+            );
+        }
+        assert!(
+            w.check_health(EngineHealth::Healthy, t0 + Duration::from_secs(20))
+                .is_none()
         );
     }
 
     #[test]
-    fn watchdog_ignores_trims_spread_wider_than_the_window() {
+    fn watchdog_reports_sustained_overload_at_the_grace() {
         let mut w = EngineWatchdog::new();
         w.engine_replaced();
         let t0 = Instant::now();
-        let step = FELL_BEHIND_FAULT_WINDOW / 2 + Duration::from_millis(1);
-        for k in 0..10 {
-            assert_eq!(
-                w.fell_behind(t0 + step * k),
-                None,
-                "trim #{k}: never 3 within the window"
+        let mut found = None;
+        for k in 0..600u64 {
+            let now = t0 + Duration::from_millis(10 * k);
+            if let Some((report, span)) = w.check_health(EngineHealth::Overloaded, now) {
+                found = Some((k, report, span));
+                break;
+            }
+        }
+        let (k, report, span) = found.expect("6 s of sustained overload must report");
+        let elapsed_ms = 10 * k;
+        assert!(
+            (5000..=5010).contains(&elapsed_ms),
+            "should report within one 10ms block of the 5.0s grace, got {elapsed_ms}ms"
+        );
+        assert!(span >= ENGINE_FALLBACK_GRACE);
+        assert_eq!(
+            report,
+            EngineFaultReport {
+                generation: 1,
+                fault: EngineFault::Overloaded
+            }
+        );
+        assert!(
+            w.check_health(EngineHealth::Overloaded, t0 + Duration::from_secs(6))
+                .is_none(),
+            "reported once per engine"
+        );
+    }
+
+    #[test]
+    fn watchdog_merges_overloaded_blips_separated_by_short_healthy_gaps() {
+        // The bypass/shadow/false-recovery pattern: Overloaded blips with
+        // Healthy gaps under TROUBLE_CLEAR_AFTER_HEALTH between them must
+        // still count as ONE sustained episode.
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(900);
+        let mut found = None;
+        for k in 0..10u64 {
+            let t = t0 + step * k as u32;
+            w.check_health(EngineHealth::Healthy, t - Duration::from_millis(100));
+            if let Some((_, span)) = w.check_health(EngineHealth::Overloaded, t) {
+                found = Some((k, span));
+                break;
+            }
+        }
+        let (k, span) = found.expect("900ms-spaced blips must eventually report");
+        assert_eq!(k, 6, "first Overloaded observation reaching the 5s grace");
+        assert!(span >= ENGINE_FALLBACK_GRACE);
+    }
+
+    #[test]
+    fn watchdog_never_reports_two_short_bursts_two_seconds_apart() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        for k in 0..130u64 {
+            assert!(
+                w.check_health(EngineHealth::Overloaded, t0 + Duration::from_millis(10 * k))
+                    .is_none(),
+                "burst 1 block {k}"
             );
         }
+        let t1 = t0 + Duration::from_millis(1_300) + Duration::from_secs(2);
+        for k in 0..130u64 {
+            assert!(
+                w.check_health(EngineHealth::Overloaded, t1 + Duration::from_millis(10 * k))
+                    .is_none(),
+                "burst 2 block {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_reports_frequent_trims_at_the_grace() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(900);
+        let mut found = None;
+        for k in 0..10u64 {
+            let t = t0 + step * k as u32;
+            if let Some((_, span)) = w.fell_behind(t) {
+                found = Some((k, span));
+                break;
+            }
+        }
+        let (k, span) = found.expect("a trim every 0.9s must eventually report");
+        assert_eq!(k, 6, "first trim reaching the 5s grace after the first one");
+        assert!(span >= ENGINE_FALLBACK_GRACE);
+    }
+
+    #[test]
+    fn watchdog_never_reports_trims_slower_than_the_clear_after() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(4_500); // > TROUBLE_CLEAR_AFTER_TRIMS
+        for k in 0..10u64 {
+            assert!(
+                w.fell_behind(t0 + step * k as u32).is_none(),
+                "trim #{k}: each gap resets the episode"
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_never_reports_two_or_three_trims_within_1_3s() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        assert!(w.fell_behind(t0).is_none());
+        assert!(w.fell_behind(t0 + Duration::from_millis(600)).is_none());
+        assert!(w.fell_behind(t0 + Duration::from_millis(1_300)).is_none());
+    }
+
+    #[test]
+    fn watchdog_never_reports_two_trims_exactly_4s_apart() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let t0 = Instant::now();
+        assert!(w.fell_behind(t0).is_none());
+        assert!(
+            w.fell_behind(t0 + TROUBLE_CLEAR_AFTER_TRIMS).is_none(),
+            "span == 4s < grace"
+        );
+    }
+
+    #[test]
+    fn watchdog_panic_reports_immediately() {
+        let mut w = EngineWatchdog::new();
+        w.engine_replaced();
+        let (report, span) = w.panicked().expect("a panic must report immediately");
+        assert_eq!(
+            report,
+            EngineFaultReport {
+                generation: 1,
+                fault: EngineFault::Panicked
+            }
+        );
+        assert_eq!(span, Duration::ZERO);
     }
 
     #[test]
@@ -3093,12 +3459,23 @@ mod tests {
         assert!(w.panicked().is_some());
         let t0 = Instant::now();
         w.fell_behind(t0);
-        w.fell_behind(t0);
+        w.fell_behind(t0 + Duration::from_millis(500));
         w.engine_replaced();
-        assert_eq!(w.fell_behind(t0), None, "old engine's trims must not count");
-        assert_eq!(w.check_health(EngineHealth::Healthy), None);
+        assert!(
+            w.fell_behind(t0).is_none(),
+            "old engine's trims must not count"
+        );
+        assert!(w.check_health(EngineHealth::Healthy, t0).is_none());
+        let mut found = None;
+        for k in 0..600u64 {
+            let now = t0 + Duration::from_millis(10 * k);
+            if let Some((report, _span)) = w.check_health(EngineHealth::Overloaded, now) {
+                found = Some(report);
+                break;
+            }
+        }
         assert_eq!(
-            w.check_health(EngineHealth::Overloaded),
+            found,
             Some(EngineFaultReport {
                 generation: 2,
                 fault: EngineFault::Overloaded
@@ -3154,9 +3531,16 @@ mod tests {
             healthy_blocks: 3,
             processed: 0,
         }));
+        let started = Instant::now();
         pipeline.start();
+        let fault = wait_for_fault(&pipeline, ENGINE_FALLBACK_GRACE + Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= ENGINE_FALLBACK_GRACE.saturating_sub(Duration::from_millis(50)),
+            "reported too early: {elapsed:?}"
+        );
         assert_eq!(
-            wait_for_fault(&pipeline, Duration::from_secs(2)),
+            fault,
             Some(EngineFaultReport {
                 generation: 1,
                 fault: EngineFault::Overloaded
@@ -3168,6 +3552,52 @@ mod tests {
             "reported once"
         );
         pipeline.shutdown();
+    }
+
+    /// health() reports Overloaded for `burst` wall-clock time since the
+    /// first `process()` call, then Healthy forever after -- a short CPU
+    /// spike, not sustained trouble (D-01).
+    struct BurstThenHealthyEngine {
+        start: Mutex<Option<Instant>>,
+        burst: Duration,
+    }
+
+    impl NoiseEngine for BurstThenHealthyEngine {
+        fn init(&mut self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], output: &mut [f32]) {
+            let mut start = self.start.lock().unwrap();
+            if start.is_none() {
+                *start = Some(Instant::now());
+            }
+            output.copy_from_slice(input);
+        }
+        fn set_strength(&mut self, _: f32) {}
+        fn set_mode(&mut self, _: ProcessingMode) {}
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+        fn teardown(&mut self) {}
+        fn health(&self) -> EngineHealth {
+            match *self.start.lock().unwrap() {
+                Some(t) if t.elapsed() < self.burst => EngineHealth::Overloaded,
+                _ => EngineHealth::Healthy,
+            }
+        }
+    }
+
+    #[test]
+    fn burst_overload_never_causes_a_fallback() {
+        let pipeline = AudioPipeline::new().unwrap();
+        pipeline.set_engine(Box::new(BurstThenHealthyEngine {
+            start: Mutex::new(None),
+            burst: Duration::from_millis(1_300),
+        }));
+        pipeline.start();
+        let fault = wait_for_fault(&pipeline, ENGINE_FALLBACK_GRACE + Duration::from_secs(2));
+        pipeline.shutdown();
+        assert_eq!(fault, None, "a 1.3s spike must never cause a fallback");
     }
 
     #[test]
@@ -3209,15 +3639,20 @@ mod tests {
     /// production runs), not only in simulation mode.
     #[test]
     fn faults_on_the_real_capture_path_reach_the_app() {
-        for (engine, expected) in [
+        for (engine, expected, wait) in [
             (
                 Box::new(GivesUpEngine {
                     healthy_blocks: 3,
                     processed: 0,
                 }) as Box<dyn NoiseEngine>,
                 EngineFault::Overloaded,
+                ENGINE_FALLBACK_GRACE + Duration::from_secs(2),
             ),
-            (Box::new(PanicOnFirstProcessEngine), EngineFault::Panicked),
+            (
+                Box::new(PanicOnFirstProcessEngine),
+                EngineFault::Panicked,
+                Duration::from_secs(1),
+            ),
         ] {
             let (cw, cr) = ring_buffer(65_536);
             let (ow, or_) = ring_buffer(65_536);
@@ -3225,7 +3660,7 @@ mod tests {
             let pw = FakePipeWire::start(cw, or_);
             pipeline.set_engine(engine);
             pipeline.start();
-            let fault = wait_for_fault(&pipeline, Duration::from_secs(2));
+            let fault = wait_for_fault(&pipeline, wait);
             drop(pw);
             pipeline.shutdown();
             assert_eq!(
@@ -3252,12 +3687,18 @@ mod tests {
             per_block: Duration::from_micros(12_500), // RTF 1.25
             slow: slow.clone(),
         }));
+        let started = Instant::now();
         pipeline.start();
-        let fault = wait_for_fault(&pipeline, Duration::from_secs(6));
+        let fault = wait_for_fault(&pipeline, ENGINE_FALLBACK_GRACE + Duration::from_secs(4));
+        let elapsed = started.elapsed();
         slow.store(false, Ordering::Release);
         thread::sleep(Duration::from_millis(100));
         drop(pw);
         pipeline.shutdown();
+        assert!(
+            elapsed >= ENGINE_FALLBACK_GRACE,
+            "reported too early: {elapsed:?}"
+        );
         assert_eq!(
             fault,
             Some(EngineFaultReport {
@@ -3268,7 +3709,7 @@ mod tests {
     }
 
     /// Held-out guard against false positives: a real-time engine on the
-    /// same fake graph for 3 s is never reported.
+    /// same fake graph past the grace is never reported.
     #[test]
     fn realtime_engine_is_never_reported() {
         let (cw, cr) = ring_buffer(65_536);
@@ -3277,7 +3718,7 @@ mod tests {
         let pw = FakePipeWire::start(cw, or_);
         pipeline.set_engine(Box::new(PassthroughEngine::new()));
         pipeline.start();
-        let fault = wait_for_fault(&pipeline, Duration::from_secs(3));
+        let fault = wait_for_fault(&pipeline, ENGINE_FALLBACK_GRACE + Duration::from_secs(1));
         drop(pw);
         pipeline.shutdown();
         assert_eq!(fault, None);

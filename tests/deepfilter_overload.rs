@@ -13,6 +13,15 @@
 //! [`DeepFilterEngine`] at real-time pace, in a CHILD process so an abort is
 //! observable as an exit status instead of killing the test harness.
 //!
+//! Quick 260924-n4s (D-01): the guard no longer gives up outright at the
+//! third fast trip — it bypasses/shadows the plugin and can self-heal. This
+//! child now proves the grace window survives sustained starvation, not an
+//! immediate give-up: it runs [`cleanmic::audio::ENGINE_FALLBACK_GRACE`] + 2 s
+//! past the first Overloaded reading (capped at 25 s total), and the output
+//! must equal the dry input on EVERY block processed while Overloaded (never
+//! silence) and the engine must still be Overloaded when the child stops
+//! (the starvation never let up, so recovery must never have been claimed).
+//!
 //! Needs the vendored plugin (`vendor/libdeep_filter_ladspa.so`, fetched by
 //! `scripts/fetch-vendors.sh`); skipped when it is absent. `#[ignore]`d
 //! because it deliberately saturates a CPU for up to ~25 s:
@@ -88,15 +97,24 @@ fn run_child() {
     let (mut blocks, mut zero_blocks, mut zero_run, mut longest_zero_run) =
         (0u64, 0u64, 0u64, 0u64);
     let mut overloaded_at: Option<Duration> = None;
-    // Stop 3 s after the engine gave up (to prove bypass output is live), or
-    // after 25 s if it never does.
+    let mut mismatch_while_overloaded = 0u64;
+    // D-01: keep the starvation going ENGINE_FALLBACK_GRACE + 2 s past the
+    // first Overloaded reading (to prove the grace window's bypass/shadow
+    // self-healing survives SUSTAINED starvation without ever reaching the
+    // plugin's own abort), or 25 s if it never gets there.
+    let overload_hold = cleanmic::audio::ENGINE_FALLBACK_GRACE + Duration::from_secs(2);
     while start.elapsed() < Duration::from_secs(25)
-        && overloaded_at.is_none_or(|t| start.elapsed() < t + Duration::from_secs(3))
+        && overloaded_at.is_none_or(|t| start.elapsed() < t + overload_hold)
     {
         for _ in 0..2 {
             for s in input.iter_mut() {
                 *s = next_sample();
             }
+            // Health BEFORE this block: the trip block itself (Normal ->
+            // Bypassed) legitimately carries a real (non-dry) plugin result
+            // -- it was still Healthy when its own processing began. Only a
+            // block that started ALREADY Overloaded must come out dry.
+            let health_before = engine.health();
             engine.process(&input, &mut output);
             blocks += 1;
             if output.iter().all(|&s| s == 0.0) {
@@ -109,6 +127,9 @@ fn run_child() {
             if overloaded_at.is_none() && engine.health() == EngineHealth::Overloaded {
                 overloaded_at = Some(start.elapsed());
             }
+            if health_before == EngineHealth::Overloaded && output != input {
+                mismatch_while_overloaded += 1;
+            }
         }
         deadline += period;
         let now = Instant::now();
@@ -117,8 +138,9 @@ fn run_child() {
         }
     }
     let bypass_is_live = output.iter().zip(&input).all(|(o, i)| o == i);
+    let overloaded_at_end = engine.health() == EngineHealth::Overloaded;
     println!(
-        "CHILD_RESULT blocks={blocks} zero_blocks={zero_blocks} longest_zero_run={longest_zero_run} overloaded={} overloaded_after_ms={} bypass_is_live={bypass_is_live}",
+        "CHILD_RESULT blocks={blocks} zero_blocks={zero_blocks} longest_zero_run={longest_zero_run} overloaded={} overloaded_after_ms={} bypass_is_live={bypass_is_live} mismatch_while_overloaded={mismatch_while_overloaded} overloaded_at_end={overloaded_at_end}",
         overloaded_at.is_some(),
         overloaded_at.map_or(-1, |t| t.as_millis() as i64),
     );
@@ -195,15 +217,26 @@ fn starved_deepfilternet_never_aborts_and_never_goes_silent() {
         .count();
     // Each plugin instance logs under its own random id ("DF <id> | ...");
     // the guard must really have replaced the instance, not just reset its
-    // own counters.
-    let instances: std::collections::BTreeSet<&str> = stderr
-        .lines()
-        .filter(|l| l.contains("Underrun detected"))
-        .filter_map(|l| l.split("DF ").nth(1)?.split_whitespace().next())
-        .collect();
+    // own counters. Also tally underruns PER instance id: the shadow
+    // ceiling (SHADOW_UNDERRUN_CEILING = 40) bounds each instance's own
+    // count, not just the total across every instance this run churns
+    // through.
+    let mut per_instance: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for l in stderr.lines().filter(|l| l.contains("Underrun detected")) {
+        if let Some(id) = l
+            .split("DF ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+        {
+            *per_instance.entry(id).or_insert(0) += 1;
+        }
+    }
+    let instances: std::collections::BTreeSet<&str> = per_instance.keys().copied().collect();
     let underruns = stderr.matches("Underrun detected").count();
+    let max_underruns_per_instance = per_instance.values().copied().max().unwrap_or(0);
     eprintln!(
-        "child status: {status:?}; plugin underrun lines: {underruns}; plugin panic lines: {panics}"
+        "child status: {status:?}; plugin underrun lines: {underruns} (max {max_underruns_per_instance} on one instance); plugin panic lines: {panics}"
     );
 
     assert!(
@@ -225,6 +258,11 @@ fn starved_deepfilternet_never_aborts_and_never_goes_silent() {
         instances.len() >= 2,
         "sustained overload must restart the plugin before giving up (instances seen: {instances:?})"
     );
+    assert!(
+        max_underruns_per_instance <= 40,
+        "one plugin instance logged {max_underruns_per_instance} underruns \
+         (SHADOW_UNDERRUN_CEILING should cap any one instance at 40, per instance: {per_instance:?})"
+    );
 
     // The libtest harness prints "test <name> ... " on the same line first.
     let line = stdout
@@ -241,6 +279,16 @@ fn starved_deepfilternet_never_aborts_and_never_goes_silent() {
         field(line, "bypass_is_live"),
         "true",
         "after giving up, the engine must pass the live input through (never silence)"
+    );
+    assert_eq!(
+        field(line, "mismatch_while_overloaded"),
+        "0",
+        "output must equal the dry input on EVERY block processed while Overloaded"
+    );
+    assert_eq!(
+        field(line, "overloaded_at_end"),
+        "true",
+        "the starvation never let up: still Overloaded ENGINE_FALLBACK_GRACE + 2s after it began"
     );
     let overloaded_after_ms: i64 = field(line, "overloaded_after_ms").parse().unwrap();
     assert!(

@@ -159,11 +159,13 @@ fn engine_subtitle(engine: EngineType) -> String {
         EngineType::Dpdfnet2 => tr!("DPDFNet, lower processor use"),
         // Per D-02: a static, gentle caveat only — never a measured
         // hardware verdict, never an auto-switch, just a pointer to the
-        // manual remedy (the Low CPU Mode, D-03/D-04).
-        EngineType::Dpdfnet8 => format!(
-            "{} {}",
-            tr!("DPDFNet, higher processor use"),
-            tr!("May glitch on a slower processor — try Low CPU Mode")
+        // manual remedy (the Low CPU Mode, D-03/D-04). Quick 260924-n4s
+        // (R2): ONE tr!() msgid for the whole sentence pair, with real
+        // sentence punctuation — a bare `format!()` join of two separately
+        // translated fragments left the translator no control over the
+        // period, and can't be reworded per-language.
+        EngineType::Dpdfnet8 => tr!(
+            "DPDFNet, higher processor use. May glitch on a slower processor — try Low CPU Mode"
         ),
         EngineType::Khip => tr!("User-supplied, adaptive"),
     }

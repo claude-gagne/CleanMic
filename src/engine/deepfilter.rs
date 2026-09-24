@@ -53,10 +53,35 @@
 //! accumulated latency (in frames) and an upper bound of its panic counter.
 //! At [`UNDERRUN_BUDGET`] the plugin is re-instantiated in place (0.1 ms,
 //! sheds the accumulated latency, restarts the count far below the abort).
-//! When fresh instances keep burning the budget, the CPU cannot sustain
-//! DeepFilterNet right now: the engine stops calling the plugin, passes the
-//! input through dry (never silence) and reports
-//! [`EngineHealth::Overloaded`] so the app switches to a lighter engine.
+//!
+//! ## Owner decision D-01 (2026-09-24, "wait a few seconds") — bypass/shadow/recover
+//!
+//! Three consecutive fast trips ([`FAST_TRIPS_TO_BYPASS`]) used to give up on
+//! DeepFilterNet for the rest of the session. Per D-01 the automatic
+//! fallback to a lighter engine only happens after
+//! [`crate::audio::ENGINE_FALLBACK_GRACE`] (5 s) of SUSTAINED trouble, so
+//! this guard now has a bounded self-healing path instead of giving up
+//! outright: [`GuardMode::Bypassed`] passes the input through dry for
+//! [`BYPASS_HOLD_CALLS`] calls (never calling the plugin — the abort-prone
+//! `run()` is simply not invoked), then [`GuardMode::Shadow`] resumes calling
+//! the plugin with its output discarded (dry passthrough continues) to see
+//! whether the worker has caught up. A shadow underrun goes back to
+//! Bypassed (each cycle costs the guard exactly one more host-counted
+//! underrun, capped by [`SHADOW_UNDERRUN_CEILING`] — well below the plugin's
+//! own [`PLUGIN_PANIC_UNDERRUNS`] abort, so it can self-heal indefinitely
+//! without ever risking the abort); [`RECOVERY_CONFIRM_CALLS`] consecutive
+//! on-time shadow calls recover to [`GuardMode::Normal`] (re-instantiating
+//! when a restart budget remains, or in place at the lifetime cap). Only
+//! reaching the shadow ceiling, or a failed restart, is permanent
+//! ([`GuardMode::GaveUp`]) — reported as [`EngineHealth::Overloaded`] just
+//! like a bypass/shadow cycle, so the app-level watchdog's own
+//! `ENGINE_FALLBACK_GRACE` timer (not this guard) is what decides whether a
+//! brief bypass/shadow episode is tolerated or ends in a runtime fallback.
+//!
+//! Once the plugin has calmed down, a ONE-TIME re-instantiation
+//! ([`SHED_MIN_UNDERRUNS`]+ underruns already paid for, [`SHED_CALM_CALLS`]
+//! on-time calls, [`SHED_QUIET_FRAMES`] quiet PROCESSED-output frames) sheds
+//! the +10 ms/underrun latency upstream never removes on its own (R4).
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -145,14 +170,12 @@ const _: () = assert!(UNDERRUN_BUDGET < PLUGIN_PANIC_UNDERRUNS - 1);
 /// one-off spike.
 const FAST_TRIP_CALLS: u64 = 3_000;
 
-/// Consecutive fast trips after which the CPU is considered unable to
-/// sustain DeepFilterNet: 3 = two fresh instances in a row failed exactly
-/// like the one they replaced. With 2, one burst straddling a restart was
-/// enough to give up: under a real background build (E2E 2026-09-24
-/// 17:38Z) a first instance tripped after 13 s and its replacement burned
-/// 8 underruns in 0.18 s of the same burst. Sustained overload (every call
-/// slow) still gives up after 24 underruns, ~1 s.
-const FAST_TRIPS_TO_GIVE_UP: u32 = 3;
+/// Consecutive fast trips after which the plugin is bypassed rather than
+/// re-instantiated again: 3 = two fresh instances in a row failed exactly
+/// like the one they replaced. Renamed from FAST_TRIPS_TO_GIVE_UP (D-01):
+/// this used to give up for good; it now enters [`GuardMode::Bypassed`],
+/// which can self-heal via [`GuardMode::Shadow`] recovery.
+const FAST_TRIPS_TO_BYPASS: u32 = 3;
 
 /// Lifetime cap on in-place re-instantiations per engine. Upstream never
 /// stops a dropped instance's worker thread (it polls every 2 ms forever and
@@ -164,16 +187,90 @@ const MAX_REINSTANTIATIONS: u32 = 10;
 /// that the guard missed (counting a few more is always safe).
 const UNDERRUN_MARGIN: Duration = Duration::from_micros(50);
 
-/// What [`UnderrunGuard::observe`] wants the engine to do after a `run()`.
+/// D-01: how long [`GuardMode::Bypassed`] holds the plugin dry (never
+/// calling `run()`) before trying a [`GuardMode::Shadow`] retry. 1 s.
+const BYPASS_HOLD_CALLS: u32 = 100;
+
+/// D-01: consecutive on-time [`GuardMode::Shadow`] calls needed to recover
+/// to [`GuardMode::Normal`]. 1 s — a sustained feed, not a single lucky
+/// probe call (the plugin buffers `1 + underruns` frames of lead, so a
+/// single call after an idle bypass can return immediately regardless of
+/// whether the worker has really caught up).
+const RECOVERY_CONFIRM_CALLS: u32 = 100;
+
+/// D-01: permanent [`GuardMode::GaveUp`] once ONE instance accumulates this
+/// many underruns across its Bypassed/Shadow cycles. Host-counted underruns
+/// since instantiation are an upper bound of upstream's own delay counter,
+/// so this must stay below [`PLUGIN_PANIC_UNDERRUNS`] - 1 (41 frames can
+/// never reach the 100th-underrun abort).
+const SHADOW_UNDERRUN_CEILING: u32 = 40;
+const _: () = assert!(SHADOW_UNDERRUN_CEILING < PLUGIN_PANIC_UNDERRUNS - 1);
+
+/// R4: a one-time plugin re-instantiation, once things have calmed down,
+/// sheds the +10 ms/underrun latency upstream never removes on its own.
+/// Needs at least this many underruns already paid for (otherwise there is
+/// nothing worth shedding).
+const SHED_MIN_UNDERRUNS: u32 = 3;
+/// R4: consecutive ON-TIME [`GuardMode::Normal`] calls (3 s) before the shed
+/// is considered — the overload must be well behind us, not still ongoing.
+const SHED_CALM_CALLS: u32 = 300;
+/// R4: consecutive quiet PROCESSED-OUTPUT frames (100 ms) required so the
+/// shed's ~10 ms prefill block and latency skip land in suppressed silence,
+/// not audible speech, even in a noisy room.
+const SHED_QUIET_FRAMES: u32 = 10;
+/// R4: a frame's RMS below this (dBFS) counts as "quiet" for the shed gate.
+const SHED_QUIET_DBFS: f32 = -50.0;
+
+/// What [`UnderrunGuard::observe`] wants the engine to do after a `run()`
+/// in [`GuardMode::Normal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardAction {
     /// Keep using the current plugin instance.
     Continue,
     /// Replace the current instance with a fresh one before the next block.
     Reinstantiate,
-    /// Stop calling the plugin for good: pass input through, report
+    /// Enter [`GuardMode::Bypassed`]: three fast trips in a row (D-01).
+    EnterBypass,
+    /// Stop calling the plugin for good (the lifetime restart cap was
+    /// reached, or a restart itself failed): pass input through, report
     /// [`EngineHealth::Overloaded`].
     GiveUp,
+}
+
+/// What [`UnderrunGuard::observe_shadow`] wants the engine to do after a
+/// `run()` in [`GuardMode::Shadow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowAction {
+    /// Still confirming: one more on-time call, not yet [`RECOVERY_CONFIRM_CALLS`].
+    Continue,
+    /// A shadow underrun: back to [`GuardMode::Bypassed`] for another hold.
+    BackToBypass,
+    /// Recovered without a restart (the lifetime cap was already reached).
+    RecoverInPlace,
+    /// Recovered with a fresh instance (a restart budget remained).
+    RecoverWithRestart,
+    /// The shadow ceiling was reached: permanent [`GuardMode::GaveUp`].
+    GiveUp,
+}
+
+/// D-01: the guard's current relationship with the plugin. `Bypassed` and
+/// `Shadow` both mean "not really processing, dry passthrough,
+/// [`EngineHealth::Overloaded`]" — the distinction only matters to
+/// `process()`'s decision of whether to call `run()` at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GuardMode {
+    /// Calling the plugin normally.
+    #[default]
+    Normal,
+    /// Passing the input through dry; `run()` is never called. `calls_left`
+    /// counts down to 0, at which point the mode becomes `Shadow`.
+    Bypassed { calls_left: u32 },
+    /// Calling the plugin (output discarded, dry passthrough continues) to
+    /// see whether the worker has caught up. `clean` counts consecutive
+    /// on-time calls toward [`RECOVERY_CONFIRM_CALLS`].
+    Shadow { clean: u32 },
+    /// Permanent: the plugin is never called again.
+    GaveUp,
 }
 
 /// Host-side accounting of the plugin's underruns (see the module docs).
@@ -181,28 +278,52 @@ enum GuardAction {
 /// and is unit-tested against a model of upstream's `run()`.
 #[derive(Debug, Default)]
 struct UnderrunGuard {
-    /// Underruns since the current instance was created.
+    /// Underruns accumulated on the CURRENT plugin instance — spans
+    /// Normal/Bypassed/Shadow cycles alike, reset only when the instance
+    /// is actually replaced (or fully recovers).
     underruns: u32,
-    /// `run()` calls on the current instance.
+    /// `run()` calls on the current instance (Normal mode only).
     calls: u64,
+    /// Consecutive ON-TIME Normal-mode calls (reset by any underrun) — the
+    /// R4 shed's "things have calmed down" signal.
+    calm: u32,
     /// Consecutive instances that burned the budget within [`FAST_TRIP_CALLS`].
     fast_trips: u32,
-    /// In-place re-instantiations over this engine's lifetime.
+    /// In-place re-instantiations over this engine's lifetime (includes the
+    /// one-time R4 shed and a Shadow recovery-with-restart).
     reinstantiations: u32,
-    given_up: bool,
+    mode: GuardMode,
 }
 
 impl UnderrunGuard {
-    /// Account one `run()` call that took `wall` (timed around the whole FFI
-    /// call, so it is never shorter than the plugin's own measurement).
+    fn mode(&self) -> GuardMode {
+        self.mode
+    }
+
+    fn given_up(&self) -> bool {
+        matches!(self.mode, GuardMode::GaveUp)
+    }
+
+    /// Stop using the plugin for good (e.g. a re-instantiation failed).
+    fn give_up(&mut self) {
+        self.mode = GuardMode::GaveUp;
+    }
+
+    /// Account one Normal-mode `run()` call that took `wall` (timed around
+    /// the whole FFI call, so it is never shorter than the plugin's own
+    /// measurement).
     fn observe(&mut self, wall: Duration) -> GuardAction {
-        if self.given_up {
+        if matches!(self.mode, GuardMode::GaveUp) {
+            // Defensive: `process()` never calls this once given up, but a
+            // direct caller (tests) must see the terminal state stick.
             return GuardAction::GiveUp;
         }
         self.calls += 1;
         if wall + UNDERRUN_MARGIN < BLOCK_DURATION {
+            self.calm += 1;
             return GuardAction::Continue;
         }
+        self.calm = 0;
         self.underruns += 1;
         if self.underruns < UNDERRUN_BUDGET {
             return GuardAction::Continue;
@@ -212,20 +333,104 @@ impl UnderrunGuard {
         } else {
             0
         };
-        if self.fast_trips >= FAST_TRIPS_TO_GIVE_UP || self.reinstantiations >= MAX_REINSTANTIATIONS
-        {
+        if self.fast_trips >= FAST_TRIPS_TO_BYPASS {
+            self.mode = GuardMode::Bypassed {
+                calls_left: BYPASS_HOLD_CALLS,
+            };
+            return GuardAction::EnterBypass;
+        }
+        if self.reinstantiations >= MAX_REINSTANTIATIONS {
             self.give_up();
             return GuardAction::GiveUp;
         }
         self.reinstantiations += 1;
         self.underruns = 0;
         self.calls = 0;
+        self.calm = 0;
         GuardAction::Reinstantiate
     }
 
-    /// Stop using the plugin (e.g. a re-instantiation failed).
-    fn give_up(&mut self) {
-        self.given_up = true;
+    /// Bypassed-mode countdown: no `run()` was called this block. Call once
+    /// per block while [`Self::mode`] is `Bypassed`.
+    fn tick_bypass(&mut self) {
+        if let GuardMode::Bypassed { calls_left } = &mut self.mode {
+            *calls_left = calls_left.saturating_sub(1);
+            if *calls_left == 0 {
+                self.mode = GuardMode::Shadow { clean: 0 };
+            }
+        }
+    }
+
+    /// Account one Shadow-mode `run()` call (output discarded) that took
+    /// `wall`.
+    fn observe_shadow(&mut self, wall: Duration) -> ShadowAction {
+        let GuardMode::Shadow { clean } = self.mode else {
+            return ShadowAction::Continue; // not reachable via process()
+        };
+        if wall + UNDERRUN_MARGIN < BLOCK_DURATION {
+            let clean = clean + 1;
+            if clean >= RECOVERY_CONFIRM_CALLS {
+                return self.recover();
+            }
+            self.mode = GuardMode::Shadow { clean };
+            ShadowAction::Continue
+        } else {
+            self.underruns += 1;
+            if self.underruns >= SHADOW_UNDERRUN_CEILING {
+                self.give_up();
+                return ShadowAction::GiveUp;
+            }
+            self.mode = GuardMode::Bypassed {
+                calls_left: BYPASS_HOLD_CALLS,
+            };
+            ShadowAction::BackToBypass
+        }
+    }
+
+    /// [`RECOVERY_CONFIRM_CALLS`] clean shadow calls: back to Normal.
+    /// Deliberately does NOT reset `fast_trips` — a false recovery must
+    /// re-bypass on its very next fast trip without needing to accumulate
+    /// three more; only a later SLOW trip (`calls` > [`FAST_TRIP_CALLS`])
+    /// clears that streak, exactly as it would for any other trip.
+    ///
+    /// CRITICAL: `underruns`/`calls` are reset ONLY when a real
+    /// re-instantiation happens (`RecoverWithRestart`). At the lifetime cap
+    /// (`RecoverInPlace`) the SAME plugin instance keeps running — zeroing
+    /// its host-counted underruns there would let host accounting drift
+    /// below that instance's still-live upstream delay counter, breaking
+    /// the invariant (module docs) that host-counted underruns since
+    /// instantiation upper-bound it. A subsequent overload on that same
+    /// instance must keep adding to the SAME count it already had.
+    fn recover(&mut self) -> ShadowAction {
+        self.calm = 0;
+        self.mode = GuardMode::Normal;
+        if self.reinstantiations >= MAX_REINSTANTIATIONS {
+            ShadowAction::RecoverInPlace
+        } else {
+            self.reinstantiations += 1;
+            self.underruns = 0;
+            self.calls = 0;
+            ShadowAction::RecoverWithRestart
+        }
+    }
+
+    /// R4: is a one-time latency shed due right now? Pure — the engine
+    /// supplies the "quiet processed output" evidence separately (this
+    /// guard has no audio to look at).
+    fn shed_due(&self) -> bool {
+        matches!(self.mode, GuardMode::Normal)
+            && self.underruns >= SHED_MIN_UNDERRUNS
+            && self.calm >= SHED_CALM_CALLS
+            && self.reinstantiations < MAX_REINSTANTIATIONS
+    }
+
+    /// Apply a shed: counts as a reinstantiation, fresh accounting. Does
+    /// NOT touch `fast_trips` (a calm shed is not an overload event).
+    fn note_shed(&mut self) {
+        self.reinstantiations += 1;
+        self.underruns = 0;
+        self.calls = 0;
+        self.calm = 0;
     }
 }
 
@@ -287,6 +492,17 @@ pub struct DeepFilterEngine {
     sample_rate: u64,
     /// Underrun accounting that keeps the plugin away from its abort path.
     guard: UnderrunGuard,
+    /// Scratch output buffer for [`GuardMode::Shadow`] calls: the plugin's
+    /// real output must go SOMEWHERE (LADSPA ports are plain pointers), but
+    /// Shadow keeps the engine's actual output dry. Allocated once in
+    /// [`Self::new`], never on the hot path.
+    shadow_scratch: [f32; FRAME_SIZE],
+    /// R4: the one-time latency shed has already happened (per engine
+    /// instance, i.e. per `DeepFilterEngine`, not per plugin instance).
+    shed_done: bool,
+    /// R4: consecutive quiet (< [`SHED_QUIET_DBFS`]) PROCESSED-output
+    /// frames, tracked only while [`GuardMode::Normal`].
+    quiet_streak: u32,
 }
 
 // SAFETY: Only accessed from the single audio thread.
@@ -307,6 +523,54 @@ impl DeepFilterEngine {
             ctrl_post_beta: 0.0,
             sample_rate: 48_000,
             guard: UnderrunGuard::default(),
+            shadow_scratch: [0.0; FRAME_SIZE],
+            shed_done: false,
+            quiet_streak: 0,
+        }
+    }
+
+    /// A block's RMS is below [`SHED_QUIET_DBFS`] (R4's "safe to shed"
+    /// evidence: the ~10 ms prefill block and latency skip land here, not
+    /// in audible speech).
+    fn frame_is_quiet(block: &[f32]) -> bool {
+        if block.is_empty() {
+            return true;
+        }
+        let sum_sq: f32 = block.iter().map(|&s| s * s).sum();
+        let rms = (sum_sq / block.len() as f32).sqrt();
+        let db = 20.0 * rms.max(1e-9).log10();
+        db < SHED_QUIET_DBFS
+    }
+
+    /// Pure shed decision, split out from the FFI-touching
+    /// [`Self::maybe_shed`] so it's unit-testable without a real plugin
+    /// handle: whether a shed should be attempted given the current quiet
+    /// streak (never twice, only in Normal mode, only once the guard
+    /// itself is calm — see [`UnderrunGuard::shed_due`]).
+    fn shed_would_apply(&self, quiet_streak: u32) -> bool {
+        !self.shed_done && quiet_streak >= SHED_QUIET_FRAMES && self.guard.shed_due()
+    }
+
+    /// After a Normal-mode call: update the quiet-output streak and shed
+    /// once due (re-instantiating the plugin, one time, per engine).
+    fn maybe_shed(&mut self, output_block: &[f32]) {
+        if Self::frame_is_quiet(output_block) {
+            self.quiet_streak = self.quiet_streak.saturating_add(1);
+        } else {
+            self.quiet_streak = 0;
+        }
+        if self.shed_would_apply(self.quiet_streak) {
+            let underruns_shed = self.guard.underruns;
+            if self.reinstantiate() {
+                self.guard.note_shed();
+                self.shed_done = true;
+                self.quiet_streak = 0;
+                log::info!(
+                    "DeepFilterNet: shed {} ms of accumulated plugin latency (one-time restart {}/{MAX_REINSTANTIATIONS})",
+                    u64::from(underruns_shed) * BLOCK_DURATION.as_millis() as u64,
+                    self.guard.reinstantiations,
+                );
+            }
         }
     }
 
@@ -446,6 +710,8 @@ impl NoiseEngine for DeepFilterEngine {
         self.handle = handle;
         self.sample_rate = sample_rate as u64;
         self.guard = UnderrunGuard::default();
+        self.shed_done = false;
+        self.quiet_streak = 0;
 
         // Activate the plugin (allocates internal buffers, initializes state).
         unsafe {
@@ -466,7 +732,7 @@ impl NoiseEngine for DeepFilterEngine {
     fn process(&mut self, input: &[f32], output: &mut [f32]) {
         // Once the guard has given up, the plugin is never called again:
         // one more underrun could be the one that aborts the process.
-        if !self.initialized || self.handle.is_null() || self.guard.given_up {
+        if !self.initialized || self.handle.is_null() || self.guard.given_up() {
             output.copy_from_slice(input);
             return;
         }
@@ -474,49 +740,122 @@ impl NoiseEngine for DeepFilterEngine {
         // Process in FRAME_SIZE-sample chunks.
         let mut pos = 0;
         while pos + FRAME_SIZE <= input.len() {
-            if self.guard.given_up {
-                break;
-            }
-            let in_ptr = input[pos..].as_ptr() as *mut LadspaData;
-            let out_ptr = output[pos..].as_mut_ptr();
+            match self.guard.mode() {
+                GuardMode::GaveUp => break,
 
-            // Timed around the whole FFI call so the guard's measurement is
-            // never shorter than the plugin's own (see UnderrunGuard).
-            let t0 = Instant::now();
-            unsafe {
-                self.connect_all_ports(in_ptr, out_ptr);
-                let d = &*self.descriptor;
-                (d.run)(self.handle, FRAME_SIZE as u64);
-            }
-            let wall = t0.elapsed();
-            pos += FRAME_SIZE;
-
-            match self.guard.observe(wall) {
-                GuardAction::Continue => {}
-                GuardAction::Reinstantiate => {
-                    if self.reinstantiate() {
-                        log::warn!(
-                            "DeepFilterNet: plugin fell behind real time {UNDERRUN_BUDGET} times \
-                             (+{} ms latency it never sheds) — restarted it (restart {}/{MAX_REINSTANTIATIONS})",
-                            UNDERRUN_BUDGET as u64 * BLOCK_DURATION.as_millis() as u64,
+                GuardMode::Bypassed { .. } => {
+                    // D-01: dry passthrough, `run()` is never called — the
+                    // abort-prone path simply isn't taken.
+                    output[pos..pos + FRAME_SIZE].copy_from_slice(&input[pos..pos + FRAME_SIZE]);
+                    self.guard.tick_bypass();
+                    if matches!(self.guard.mode(), GuardMode::Shadow { clean: 0 }) {
+                        log::info!(
+                            "DeepFilterNet: bypassing the plugin (overloaded) — passing audio through, retry in 1.0 s (restarts {}/{MAX_REINSTANTIATIONS})",
                             self.guard.reinstantiations,
-                        );
-                    } else {
-                        self.guard.give_up();
-                        log::error!(
-                            "DeepFilterNet: plugin restart failed — passing audio through unprocessed"
                         );
                     }
                 }
-                GuardAction::GiveUp => {
-                    log::warn!(
-                        "DeepFilterNet cannot keep up with real time on this computer \
-                         ({} plugin restarts) — passing audio through unprocessed to keep the \
-                         microphone working",
-                        self.guard.reinstantiations,
-                    );
+
+                GuardMode::Normal => {
+                    let in_ptr = input[pos..].as_ptr() as *mut LadspaData;
+                    let out_ptr = output[pos..].as_mut_ptr();
+
+                    // Timed around the whole FFI call so the guard's
+                    // measurement is never shorter than the plugin's own.
+                    let t0 = Instant::now();
+                    unsafe {
+                        self.connect_all_ports(in_ptr, out_ptr);
+                        let d = &*self.descriptor;
+                        (d.run)(self.handle, FRAME_SIZE as u64);
+                    }
+                    let wall = t0.elapsed();
+
+                    match self.guard.observe(wall) {
+                        GuardAction::Continue => {
+                            self.maybe_shed(&output[pos..pos + FRAME_SIZE]);
+                        }
+                        GuardAction::Reinstantiate => {
+                            if self.reinstantiate() {
+                                log::warn!(
+                                    "DeepFilterNet: plugin fell behind real time {UNDERRUN_BUDGET} times \
+                                     (+{} ms latency it never sheds) — restarted it (restart {}/{MAX_REINSTANTIATIONS})",
+                                    UNDERRUN_BUDGET as u64 * BLOCK_DURATION.as_millis() as u64,
+                                    self.guard.reinstantiations,
+                                );
+                            } else {
+                                self.guard.give_up();
+                                log::error!(
+                                    "DeepFilterNet: plugin restart failed — passing audio through unprocessed"
+                                );
+                            }
+                        }
+                        GuardAction::EnterBypass => {
+                            log::warn!(
+                                "DeepFilterNet: bypassing the plugin (overloaded) — passing audio through, retry in 1.0 s (restarts {}/{MAX_REINSTANTIATIONS})",
+                                self.guard.reinstantiations,
+                            );
+                        }
+                        GuardAction::GiveUp => {
+                            log::warn!(
+                                "DeepFilterNet cannot keep up with real time on this computer \
+                                 ({} plugin restarts) — passing audio through unprocessed to keep the \
+                                 microphone working",
+                                self.guard.reinstantiations,
+                            );
+                        }
+                    }
+                }
+
+                GuardMode::Shadow { .. } => {
+                    // D-01: the plugin runs, but the OUTPUT stays dry — a
+                    // shadow retry, not a live resume (a live resume would
+                    // first replay up to L frames of stale queued audio and
+                    // play at +L*10 ms latency).
+                    output[pos..pos + FRAME_SIZE].copy_from_slice(&input[pos..pos + FRAME_SIZE]);
+                    let in_ptr = input[pos..].as_ptr() as *mut LadspaData;
+                    let scratch_ptr = self.shadow_scratch.as_mut_ptr();
+
+                    let t0 = Instant::now();
+                    unsafe {
+                        self.connect_all_ports(in_ptr, scratch_ptr);
+                        let d = &*self.descriptor;
+                        (d.run)(self.handle, FRAME_SIZE as u64);
+                    }
+                    let wall = t0.elapsed();
+
+                    match self.guard.observe_shadow(wall) {
+                        ShadowAction::Continue | ShadowAction::BackToBypass => {}
+                        ShadowAction::RecoverInPlace => {
+                            log::info!(
+                                "DeepFilterNet: plugin back to real time — processing resumed (restart {}/{MAX_REINSTANTIATIONS})",
+                                self.guard.reinstantiations,
+                            );
+                        }
+                        ShadowAction::RecoverWithRestart => {
+                            if self.reinstantiate() {
+                                log::info!(
+                                    "DeepFilterNet: plugin back to real time — processing resumed (restart {}/{MAX_REINSTANTIATIONS})",
+                                    self.guard.reinstantiations,
+                                );
+                            } else {
+                                self.guard.give_up();
+                                log::error!(
+                                    "DeepFilterNet: plugin restart failed — passing audio through unprocessed"
+                                );
+                            }
+                        }
+                        ShadowAction::GiveUp => {
+                            log::warn!(
+                                "DeepFilterNet cannot keep up with real time on this computer \
+                                 ({} plugin restarts) — passing audio through unprocessed to keep the \
+                                 microphone working",
+                                self.guard.reinstantiations,
+                            );
+                        }
+                    }
                 }
             }
+            pos += FRAME_SIZE;
         }
 
         // Passthrough for whatever was not processed: a sub-frame remainder
@@ -550,10 +889,11 @@ impl NoiseEngine for DeepFilterEngine {
     }
 
     fn health(&self) -> EngineHealth {
-        if self.guard.given_up {
-            EngineHealth::Overloaded
-        } else {
-            EngineHealth::Healthy
+        match self.guard.mode() {
+            GuardMode::Normal => EngineHealth::Healthy,
+            GuardMode::Bypassed { .. } | GuardMode::Shadow { .. } | GuardMode::GaveUp => {
+                EngineHealth::Overloaded
+            }
         }
     }
 
@@ -678,6 +1018,10 @@ mod tests {
     /// Drive guard + upstream model with `walls` (host-timed); the plugin's
     /// own timing is the host's minus `overhead`. Returns (reinstantiations,
     /// gave_up) and panics if the model ever reaches its panic!().
+    ///
+    /// D-01: the model is NOT called on Bypassed frames (`run()` is never
+    /// invoked there, exactly like `DeepFilterEngine::process`) — only
+    /// Normal and Shadow frames make a real `run()` call.
     fn drive(
         walls: impl IntoIterator<Item = Duration>,
         overhead: Duration,
@@ -687,22 +1031,36 @@ mod tests {
         let mut plugin = UpstreamRunModel::fresh(decreases);
         let mut reinst = 0;
         for (i, wall) in walls.into_iter().enumerate() {
-            if guard.given_up {
-                break; // the engine never calls run() again
-            }
-            plugin
-                .run(wall.saturating_sub(overhead))
-                .unwrap_or_else(|_| panic!("upstream would have aborted the process at call {i}"));
-            match guard.observe(wall) {
-                GuardAction::Continue => {}
-                GuardAction::Reinstantiate => {
-                    reinst += 1;
-                    plugin = UpstreamRunModel::fresh(decreases);
+            match guard.mode() {
+                GuardMode::GaveUp => break,
+                GuardMode::Bypassed { .. } => {
+                    guard.tick_bypass();
                 }
-                GuardAction::GiveUp => {}
+                GuardMode::Normal => {
+                    plugin
+                        .run(wall.saturating_sub(overhead))
+                        .unwrap_or_else(|_| {
+                            panic!("upstream would have aborted the process at call {i}")
+                        });
+                    if let GuardAction::Reinstantiate = guard.observe(wall) {
+                        reinst += 1;
+                        plugin = UpstreamRunModel::fresh(decreases);
+                    }
+                }
+                GuardMode::Shadow { .. } => {
+                    plugin
+                        .run(wall.saturating_sub(overhead))
+                        .unwrap_or_else(|_| {
+                            panic!("upstream would have aborted the process at call {i}")
+                        });
+                    if let ShadowAction::RecoverWithRestart = guard.observe_shadow(wall) {
+                        reinst += 1;
+                        plugin = UpstreamRunModel::fresh(decreases);
+                    }
+                }
             }
         }
-        (reinst, guard.given_up)
+        (reinst, guard.given_up())
     }
 
     #[test]
@@ -720,7 +1078,10 @@ mod tests {
 
     #[test]
     fn guard_keeps_upstream_away_from_its_abort_under_sustained_overload() {
-        // Every call slow — the E2E loaded run / the starved-worker repro.
+        // Every call slow forever — the E2E loaded run / the starved-worker
+        // repro. D-01: two restarts, then bypass; each shadow retry costs
+        // exactly one more (capped) underrun until the per-instance ceiling
+        // ends it in a permanent GiveUp — never the plugin's own abort.
         for decreases in [false, true] {
             let (reinst, gave_up) = drive(
                 std::iter::repeat_n(SLOW, 100_000),
@@ -730,8 +1091,8 @@ mod tests {
             assert!(gave_up, "sustained overload must end in GiveUp");
             assert_eq!(
                 reinst,
-                FAST_TRIPS_TO_GIVE_UP - 1,
-                "every fast trip but the last restarts, then give up"
+                FAST_TRIPS_TO_BYPASS - 1,
+                "two restarts before bypass; the shadow ceiling ends it, not a third restart"
             );
         }
     }
@@ -823,7 +1184,7 @@ mod tests {
             }
             g.observe(SLOW)
         };
-        for n in 1..FAST_TRIPS_TO_GIVE_UP {
+        for n in 1..FAST_TRIPS_TO_BYPASS {
             assert_eq!(
                 burn(&mut guard),
                 GuardAction::Reinstantiate,
@@ -840,7 +1201,7 @@ mod tests {
             "slow trip resets the streak"
         );
         assert_eq!(guard.fast_trips, 0);
-        for n in 1..FAST_TRIPS_TO_GIVE_UP {
+        for n in 1..FAST_TRIPS_TO_BYPASS {
             assert_eq!(
                 burn(&mut guard),
                 GuardAction::Reinstantiate,
@@ -849,18 +1210,24 @@ mod tests {
         }
         assert_eq!(
             burn(&mut guard),
-            GuardAction::GiveUp,
-            "FAST_TRIPS_TO_GIVE_UP fast trips in a row"
+            GuardAction::EnterBypass,
+            "FAST_TRIPS_TO_BYPASS fast trips in a row enters bypass, not a give-up (D-01)"
+        );
+        assert_eq!(
+            guard.mode(),
+            GuardMode::Bypassed {
+                calls_left: BYPASS_HOLD_CALLS
+            }
         );
     }
 
     #[test]
     fn a_fast_trip_needs_the_budget_burned_within_the_window() {
         let mut guard = UnderrunGuard::default();
-        for _ in 0..UNDERRUN_BUDGET * (FAST_TRIPS_TO_GIVE_UP - 1) {
+        for _ in 0..UNDERRUN_BUDGET * (FAST_TRIPS_TO_BYPASS - 1) {
             guard.observe(SLOW);
         }
-        assert_eq!(guard.fast_trips, FAST_TRIPS_TO_GIVE_UP - 1);
+        assert_eq!(guard.fast_trips, FAST_TRIPS_TO_BYPASS - 1);
         // Window boundary: calls == FAST_TRIP_CALLS is still fast.
         for _ in 0..FAST_TRIP_CALLS - u64::from(UNDERRUN_BUDGET) {
             guard.observe(FAST);
@@ -871,8 +1238,8 @@ mod tests {
         assert_eq!(guard.calls, FAST_TRIP_CALLS - 1);
         assert_eq!(
             guard.observe(SLOW),
-            GuardAction::GiveUp,
-            "burned at exactly FAST_TRIP_CALLS"
+            GuardAction::EnterBypass,
+            "the third fast trip, burned at exactly FAST_TRIP_CALLS, enters bypass"
         );
     }
 
@@ -893,6 +1260,9 @@ mod tests {
                 GuardAction::Reinstantiate => reinst += 1,
                 GuardAction::GiveUp => break,
                 GuardAction::Continue => panic!("budget burned without an action"),
+                GuardAction::EnterBypass => {
+                    panic!("fast_trips is reset every cycle here; bypass is unreachable")
+                }
             }
         }
         assert_eq!(reinst, MAX_REINSTANTIATIONS);
@@ -910,6 +1280,200 @@ mod tests {
         let mut output = vec![0.0f32; 960];
         engine.process(&input, &mut output);
         assert_eq!(input, output);
+    }
+
+    // ── D-01: Bypassed / Shadow / Recover boundary tests ───────────────────
+
+    /// Trip the guard into `GuardMode::Bypassed` via exactly
+    /// [`FAST_TRIPS_TO_BYPASS`] budget trips (sustained SLOW), mirroring
+    /// `a_slow_trip_is_a_new_spike_not_an_escalation`'s `burn` pattern.
+    fn trip_into_bypass(guard: &mut UnderrunGuard) {
+        let burn = |g: &mut UnderrunGuard| {
+            for _ in 0..UNDERRUN_BUDGET - 1 {
+                assert_eq!(g.observe(SLOW), GuardAction::Continue);
+            }
+            g.observe(SLOW)
+        };
+        for _ in 0..FAST_TRIPS_TO_BYPASS - 1 {
+            assert_eq!(burn(guard), GuardAction::Reinstantiate);
+        }
+        assert_eq!(burn(guard), GuardAction::EnterBypass);
+    }
+
+    #[test]
+    fn exactly_bypass_hold_calls_dry_frames_before_the_first_shadow_run() {
+        let mut guard = UnderrunGuard::default();
+        trip_into_bypass(&mut guard);
+        for k in 0..BYPASS_HOLD_CALLS {
+            assert!(
+                matches!(guard.mode(), GuardMode::Bypassed { .. }),
+                "still bypassed at dry frame {k}"
+            );
+            guard.tick_bypass();
+        }
+        assert_eq!(
+            guard.mode(),
+            GuardMode::Shadow { clean: 0 },
+            "exactly BYPASS_HOLD_CALLS dry frames, then the first shadow run()"
+        );
+    }
+
+    #[test]
+    fn recovery_at_the_lifetime_cap_recovers_in_place_then_gives_up_on_the_next_trip() {
+        let mut guard = UnderrunGuard::default();
+        guard.reinstantiations = MAX_REINSTANTIATIONS;
+        // This instance already carries most of its underrun history from
+        // before recovery (RecoverInPlace must NOT zero it -- see `recover`'s
+        // doc comment): one more underrun after recovery reaches the budget.
+        guard.underruns = UNDERRUN_BUDGET - 1;
+        guard.mode = GuardMode::Shadow { clean: 0 };
+        for _ in 0..RECOVERY_CONFIRM_CALLS - 1 {
+            assert_eq!(guard.observe_shadow(FAST), ShadowAction::Continue);
+        }
+        assert_eq!(guard.observe_shadow(FAST), ShadowAction::RecoverInPlace);
+        assert_eq!(guard.mode(), GuardMode::Normal);
+        assert_eq!(
+            guard.reinstantiations, MAX_REINSTANTIATIONS,
+            "no restart happened"
+        );
+        // The very next budget trip on the SAME (already near-ceiling)
+        // instance gives up immediately -- no bypass, no more restarts.
+        assert_eq!(guard.observe(SLOW), GuardAction::GiveUp);
+    }
+
+    #[test]
+    fn burst_then_calm_bypasses_and_recovers_with_a_restart() {
+        // 130 SLOW (1.3s burst), then FAST: bypass is entered and exits
+        // after BYPASS_HOLD_CALLS; RECOVERY_CONFIRM_CALLS clean shadow
+        // calls recover; end mode is Normal with restarts == 3 (2 + the
+        // recovery) and fewer than 300 blocks spent Overloaded.
+        let mut guard = UnderrunGuard::default();
+        let mut overloaded = 0u32;
+        let walls = std::iter::repeat_n(SLOW, 130).chain(std::iter::repeat_n(FAST, 100_000));
+        for wall in walls {
+            match guard.mode() {
+                GuardMode::GaveUp => panic!("must never give up in this scenario"),
+                GuardMode::Bypassed { .. } => {
+                    overloaded += 1;
+                    guard.tick_bypass();
+                }
+                GuardMode::Normal => {
+                    guard.observe(wall);
+                }
+                GuardMode::Shadow { .. } => {
+                    overloaded += 1;
+                    guard.observe_shadow(wall);
+                    if guard.mode() == GuardMode::Normal {
+                        break; // recovered
+                    }
+                }
+            }
+        }
+        assert_eq!(guard.mode(), GuardMode::Normal);
+        assert_eq!(guard.reinstantiations, 3, "2 restarts + 1 recovery restart");
+        // Two full BYPASS_HOLD_CALLS cycles (the first shadow attempt still
+        // underruns on the tail of the burst and bounces back once) plus one
+        // RECOVERY_CONFIRM_CALLS clean run, plus a small constant for the
+        // handful of budget-trip calls themselves -- comfortably bounded,
+        // not the unbounded/aborting behaviour this guard replaces.
+        let bound = 2 * BYPASS_HOLD_CALLS + RECOVERY_CONFIRM_CALLS + FAST_TRIPS_TO_BYPASS;
+        assert!(
+            overloaded <= bound,
+            "blocks spent Overloaded should be bounded (<= {bound}), got {overloaded}"
+        );
+    }
+
+    // ── R4: one-time latency shed ───────────────────────────────────────────
+
+    #[test]
+    fn frame_is_quiet_below_and_above_the_threshold() {
+        let quiet = vec![0.001f32; FRAME_SIZE]; // ~ -60 dBFS
+        assert!(DeepFilterEngine::frame_is_quiet(&quiet));
+        let loud = vec![0.5f32; FRAME_SIZE]; // ~ -6 dBFS
+        assert!(!DeepFilterEngine::frame_is_quiet(&loud));
+        assert!(DeepFilterEngine::frame_is_quiet(&[]));
+    }
+
+    #[test]
+    fn shed_applies_after_calm_underruns_and_quiet_output() {
+        let mut engine = DeepFilterEngine::new();
+        engine.guard.mode = GuardMode::Normal;
+        engine.guard.underruns = SHED_MIN_UNDERRUNS;
+        engine.guard.calm = SHED_CALM_CALLS;
+        assert!(engine.shed_would_apply(SHED_QUIET_FRAMES));
+    }
+
+    #[test]
+    fn shed_never_applies_while_output_is_not_quiet() {
+        let mut engine = DeepFilterEngine::new();
+        engine.guard.mode = GuardMode::Normal;
+        engine.guard.underruns = SHED_MIN_UNDERRUNS;
+        engine.guard.calm = SHED_CALM_CALLS;
+        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES - 1));
+    }
+
+    #[test]
+    fn shed_never_applies_with_fewer_than_the_minimum_underruns() {
+        let mut engine = DeepFilterEngine::new();
+        engine.guard.mode = GuardMode::Normal;
+        engine.guard.underruns = SHED_MIN_UNDERRUNS - 1;
+        engine.guard.calm = SHED_CALM_CALLS;
+        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES));
+    }
+
+    #[test]
+    fn shed_never_applies_a_second_time() {
+        let mut engine = DeepFilterEngine::new();
+        engine.guard.mode = GuardMode::Normal;
+        engine.guard.underruns = SHED_MIN_UNDERRUNS;
+        engine.guard.calm = SHED_CALM_CALLS;
+        engine.shed_done = true;
+        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES));
+    }
+
+    #[test]
+    fn shed_never_applies_outside_normal_mode() {
+        let mut engine = DeepFilterEngine::new();
+        engine.guard.underruns = SHED_MIN_UNDERRUNS;
+        engine.guard.calm = SHED_CALM_CALLS;
+        for mode in [
+            GuardMode::Bypassed {
+                calls_left: BYPASS_HOLD_CALLS,
+            },
+            GuardMode::Shadow { clean: 0 },
+            GuardMode::GaveUp,
+        ] {
+            engine.guard.mode = mode;
+            assert!(
+                !engine.shed_would_apply(SHED_QUIET_FRAMES),
+                "must not shed in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shed_never_applies_at_the_lifetime_cap() {
+        let mut engine = DeepFilterEngine::new();
+        engine.guard.mode = GuardMode::Normal;
+        engine.guard.underruns = SHED_MIN_UNDERRUNS;
+        engine.guard.calm = SHED_CALM_CALLS;
+        engine.guard.reinstantiations = MAX_REINSTANTIATIONS;
+        assert!(!engine.shed_would_apply(SHED_QUIET_FRAMES));
+    }
+
+    #[test]
+    fn note_shed_counts_toward_reinstantiations_and_resets_accounting() {
+        let mut guard = UnderrunGuard::default();
+        guard.underruns = 5;
+        guard.calls = 400;
+        guard.calm = SHED_CALM_CALLS;
+        let reinst_before = guard.reinstantiations;
+        guard.note_shed();
+        assert_eq!(guard.reinstantiations, reinst_before + 1);
+        assert_eq!(guard.underruns, 0);
+        assert_eq!(guard.calls, 0);
+        assert_eq!(guard.calm, 0);
+        assert_eq!(guard.mode(), GuardMode::Normal, "health stays Healthy");
     }
 
     /// Full init → process → teardown. Requires libdeep_filter_ladspa.so.
