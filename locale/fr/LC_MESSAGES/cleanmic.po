@@ -137,6 +137,14 @@ msgstr "Écouter le micro filtré"
 msgid "Route processed audio to your headphones"
 msgstr "Acheminer le son filtré vers vos écouteurs"
 
+# Quick task 260923-x24: Settings/Paramètres toggle + tray mirror for the
+# speech-gated input auto-gain (src/ui/window.rs, src/tray.rs).
+msgid "Automatic mic volume"
+msgstr "Volume automatique du micro"
+
+msgid "Boosts microphones that are too quiet"
+msgstr "Augmente le volume des micros trop faibles"
+
 # ── Tray notification ─────────────────────────────────────────────────────────
 msgid "CleanMic is still running"
 msgstr "CleanMic tourne toujours en arrière-plan"

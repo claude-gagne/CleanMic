@@ -688,6 +688,11 @@ fn handle_ui_event(
             }
             log::info!("Monitor {}", if enabled { "enabled" } else { "disabled" });
         }
+        UiEvent::AutoGainToggled(enabled) => {
+            pipeline.set_auto_gain(enabled);
+            config.auto_gain_enabled = enabled;
+            log::info!("automatic mic volume enabled: {}", enabled);
+        }
         UiEvent::AutostartToggled(enabled) => {
             config.autostart = enabled;
             if enabled {
@@ -1541,6 +1546,7 @@ fn run_with_gui(
         let sync_engine_selector = handles.engine_selector.clone();
         let sync_strength_row = handles.strength_row.clone();
         let sync_monitor_row = handles.monitor_row.clone();
+        let sync_auto_gain_row = handles.auto_gain_row.clone();
         let sync_win_title = handles.win_title.clone();
         let sync_device_row = handles.device_row.clone();
 
@@ -1576,6 +1582,7 @@ fn run_with_gui(
         let sync_engine_selector_timer = sync_engine_selector;
         let sync_strength_timer = sync_strength_row;
         let sync_monitor_timer = sync_monitor_row;
+        let sync_auto_gain_timer = sync_auto_gain_row;
         let sync_win_title_timer = sync_win_title;
         let _sync_device_timer = sync_device_row;
         let last_synced_timer = last_synced_config;
@@ -1706,6 +1713,10 @@ fn run_with_gui(
                         sync_monitor_timer.set_active(cfg.monitor_enabled);
                     }
 
+                    if sync_auto_gain_timer.is_active() != cfg.auto_gain_enabled {
+                        sync_auto_gain_timer.set_active(cfg.auto_gain_enabled);
+                    }
+
                     *last = cfg.clone();
                     log::debug!("UI synced from config change");
 
@@ -1727,7 +1738,10 @@ fn run_with_gui(
                 );
                 let needs_immediate_save = matches!(
                     event,
-                    UiEvent::EnableToggled(_) | UiEvent::MonitorToggled(_) | UiEvent::AutostartToggled(_)
+                    UiEvent::EnableToggled(_)
+                        | UiEvent::MonitorToggled(_)
+                        | UiEvent::AutostartToggled(_)
+                        | UiEvent::AutoGainToggled(_)
                 );
                 handle_ui_event(event, &pipeline_timer, &mut config_timer.borrow_mut(), &mut pw_timer.borrow_mut(), &last_explicit_timer, &current_capture_target_timer);
                 if needs_debounce {
@@ -2863,6 +2877,41 @@ mod tests {
             &current_capture_target_test,
         );
         assert_eq!(config.mode, crate::engine::ProcessingMode::LowCpu);
+
+        drop(pipeline);
+    }
+
+    /// handle_ui_event dispatches AutoGainToggled correctly (quick task
+    /// 260923-x24).
+    #[test]
+    fn handle_ui_event_auto_gain_toggled() {
+        let pipeline = AudioPipeline::new().unwrap();
+        let mut config = Config::default();
+        let mut pw = PipeWireManager::connect().unwrap();
+        let last_explicit_test: RefCell<Option<String>> = RefCell::new(None);
+        let current_capture_target_test: RefCell<Option<String>> = RefCell::new(None);
+
+        assert!(config.auto_gain_enabled, "default config starts ON");
+
+        handle_ui_event(
+            UiEvent::AutoGainToggled(false),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
+        assert!(!config.auto_gain_enabled);
+
+        handle_ui_event(
+            UiEvent::AutoGainToggled(true),
+            &pipeline,
+            &mut config,
+            &mut pw,
+            &last_explicit_test,
+            &current_capture_target_test,
+        );
+        assert!(config.auto_gain_enabled);
 
         drop(pipeline);
     }

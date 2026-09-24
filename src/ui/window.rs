@@ -21,7 +21,8 @@
 //!     │   └── MeterRow       — output level meter
 //!     └── AdwPreferencesGroup "Settings"
 //!         ├── AdwSwitchRow   — autostart
-//!         └── AdwSwitchRow   — monitor (listen to processed mic)
+//!         ├── AdwSwitchRow   — monitor (listen to processed mic)
+//!         └── AdwSwitchRow   — automatic mic volume (input auto-gain)
 //! ```
 //!
 //! Only compiled when the `gui` feature is enabled (gated on the `pub mod
@@ -76,6 +77,9 @@ pub struct WindowHandles {
     pub mode_row: ComboRow,
     /// The monitor toggle switch — updated on monitor state changes.
     pub monitor_row: SwitchRow,
+    /// The automatic-mic-volume toggle switch — updated on auto-gain state
+    /// changes (quick task 260923-x24).
+    pub auto_gain_row: SwitchRow,
     /// The header bar window title widget (title + subtitle).
     pub win_title: libadwaita::WindowTitle,
     /// The device picker combo row — updated when device list changes.
@@ -612,6 +616,9 @@ pub fn build_main_window(
     }
     settings_group.add(&monitor_row);
 
+    let auto_gain_row = build_auto_gain_row(state, event_tx.clone());
+    settings_group.add(&auto_gain_row);
+
     page.add(&settings_group);
 
     // ── Close behaviour: depends on tray availability ────────────────────────────
@@ -664,6 +671,7 @@ pub fn build_main_window(
         strength_row,
         mode_row,
         monitor_row,
+        auto_gain_row,
         win_title,
         device_row,
         device_updating,
@@ -672,6 +680,28 @@ pub fn build_main_window(
         strength_updating,
         mode_updating,
     }
+}
+
+/// Build the "Automatic mic volume" `SwitchRow` for the Settings group
+/// (quick task 260923-x24, per `LOCK-UI-TOGGLE`).
+///
+/// Mirrors `monitor_row`'s construction exactly: title, subtitle,
+/// `set_active` from state, and a `connect_active_notify` handler that sends
+/// [`UiEvent::AutoGainToggled`].
+fn build_auto_gain_row(state: &UiState, event_tx: mpsc::Sender<UiEvent>) -> SwitchRow {
+    let row = SwitchRow::new();
+    row.set_title(&tr!("Automatic mic volume"));
+    row.set_subtitle(&tr!("Boosts microphones that are too quiet"));
+    row.set_active(state.auto_gain_enabled);
+    row.connect_active_notify(move |row: &SwitchRowRef| {
+        if event_tx
+            .send(UiEvent::AutoGainToggled(row.is_active()))
+            .is_err()
+        {
+            log::warn!("UI event channel closed - AutoGainToggled dropped");
+        }
+    });
+    row
 }
 
 // ── Helper builders ───────────────────────────────────────────────────────────
@@ -1383,6 +1413,11 @@ impl WindowHandles {
             self.monitor_row.set_active(state.monitor_enabled);
         }
 
+        // Automatic mic volume switch
+        if self.auto_gain_row.is_active() != state.auto_gain_enabled {
+            self.auto_gain_row.set_active(state.auto_gain_enabled);
+        }
+
         self.win_title.set_subtitle(&if state.active {
             tr!("Active")
         } else {
@@ -1788,6 +1823,35 @@ mod tests {
             let view = device_row_view(&row);
             assert_eq!(view.subtitle, tr!("No input device available"));
             assert!(!view.sensitive);
+        });
+        if ran.is_none() {
+            eprintln!("skipped: no display server for GTK");
+        }
+    }
+
+    // ── build_auto_gain_row (quick task 260923-x24, LOCK-UI-TOGGLE) ─────────
+
+    /// The "Automatic mic volume" row shows the right title/subtitle, mirrors
+    /// `state.auto_gain_enabled`, and emits `UiEvent::AutoGainToggled` on
+    /// toggle. Goes through the shared GTK test thread like the device-row
+    /// tests above; skips cleanly when headless.
+    #[test]
+    fn auto_gain_row_reflects_state_and_emits_toggle_event() {
+        let ran = crate::ui::gtk_test::run(|| {
+            let mut state = UiState::from_config(&Config::default());
+            state.auto_gain_enabled = true;
+            let (tx, rx) = mpsc::channel::<UiEvent>();
+            let row = build_auto_gain_row(&state, tx);
+
+            assert_eq!(row.title().to_string(), tr!("Automatic mic volume"));
+            assert_eq!(
+                row.subtitle().map(|t| t.to_string()).unwrap_or_default(),
+                tr!("Boosts microphones that are too quiet")
+            );
+            assert!(row.is_active(), "row must reflect state.auto_gain_enabled");
+
+            row.set_active(false);
+            assert_eq!(rx.try_recv(), Ok(UiEvent::AutoGainToggled(false)));
         });
         if ran.is_none() {
             eprintln!("skipped: no display server for GTK");

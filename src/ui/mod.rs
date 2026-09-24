@@ -63,6 +63,10 @@ pub enum UiEvent {
     /// The user toggled the monitor (listen-to-processed-mic) switch.
     MonitorToggled(bool),
 
+    /// The user toggled automatic mic volume (speech-gated input boost for
+    /// too-quiet mics — see [`crate::dsp::AutoGain`]).
+    AutoGainToggled(bool),
+
     /// The user toggled the autostart switch.
     AutostartToggled(bool),
 
@@ -142,7 +146,12 @@ pub struct UiState {
     /// Whether autostart is enabled.
     pub autostart: bool,
 
-    /// Latest RMS level of the raw input signal (linear 0.0..=1.0).
+    /// Whether automatic mic volume (speech-gated input boost for too-quiet
+    /// mics) is enabled. Defaults to `true` — matches `Config`'s default.
+    pub auto_gain_enabled: bool,
+
+    /// Latest RMS level of the conditioned (DC-blocked, auto-gained) input
+    /// signal (linear 0.0..=1.0) — exactly what the engine receives.
     /// Drives the input level meter.
     pub input_level: f32,
 
@@ -199,6 +208,7 @@ impl Default for UiState {
             input_device: None,
             monitor_enabled: false,
             autostart: false,
+            auto_gain_enabled: true,
             input_level: 0.0,
             output_level: 0.0,
             available_devices: Vec::new(),
@@ -232,6 +242,7 @@ impl UiState {
             input_device: config.input_device.clone(),
             monitor_enabled: config.monitor_enabled,
             autostart: config.autostart,
+            auto_gain_enabled: config.auto_gain_enabled,
             ..Default::default()
         }
     }
@@ -258,6 +269,7 @@ mod tests {
         assert_eq!(state.input_device, None);
         assert!(!state.monitor_enabled);
         assert!(!state.autostart);
+        assert!(state.auto_gain_enabled);
         assert!((state.input_level - 0.0).abs() < f32::EPSILON);
         assert!((state.output_level - 0.0).abs() < f32::EPSILON);
         assert!(state.available_devices.is_empty());
@@ -276,6 +288,7 @@ mod tests {
             monitor_enabled: true,
             enabled: false,
             autostart: true,
+            auto_gain_enabled: false,
             ..Config::default()
         };
         config.set_strength_for(EngineType::RNNoise, 0.8);
@@ -294,6 +307,10 @@ mod tests {
         assert_eq!(state.input_device, Some("alsa_input.usb-Blue_Yeti".into()));
         assert!(state.monitor_enabled);
         assert!(state.autostart);
+        assert!(
+            !state.auto_gain_enabled,
+            "auto_gain_enabled maps from config"
+        );
         // live fields are zeroed
         assert!((state.input_level).abs() < f32::EPSILON);
         assert!((state.output_level).abs() < f32::EPSILON);
@@ -403,6 +420,14 @@ mod tests {
         assert_eq!(
             UiEvent::AutostartToggled(true),
             UiEvent::AutostartToggled(true)
+        );
+        assert_eq!(
+            UiEvent::AutoGainToggled(true),
+            UiEvent::AutoGainToggled(true)
+        );
+        assert_ne!(
+            UiEvent::AutoGainToggled(true),
+            UiEvent::AutoGainToggled(false)
         );
     }
 
