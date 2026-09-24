@@ -22,7 +22,8 @@ build path. The developer shortcuts live in the `Makefile`:
 
 - `make build` - release build with all features
 - `make appimage` - build the AppImage bundle (see also `scripts/build-appimage.sh`)
-- `make test` - run the unit tests
+- `make test` - run the unit tests (never touches your live PipeWire graph or real user dirs)
+- `make test-live` - opt-in tests against the live PipeWire daemon (creates a real CleanMic node; run after changing PipeWire integration code)
 - `make fmt` - format sources with `cargo fmt`
 - `make lint` - run `cargo clippy --all-features`
 

@@ -659,4 +659,57 @@ mod tests {
 
         drop(manager);
     }
+
+    /// `tests/*.rs` integration test files that reach the live PipeWire path
+    /// must be structurally opt-in: a `CLEANMIC_LIVE_PW_TESTS` reference plus
+    /// `#[ignore]` in code. Integration tests link the crate's non-test lib,
+    /// so the `cfg(test)` connect() guard in live.rs does not cover them —
+    /// this is the backstop. Feature-independent — scans source text, not
+    /// compiled code, so it runs the same in every build.
+    #[test]
+    fn integration_tests_touching_live_pipewire_are_opt_in() {
+        let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let Ok(entries) = std::fs::read_dir(&tests_dir) else {
+            // No tests/ directory — nothing to scan.
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Strip `//` line comments so a comment mentioning these calls
+            // doesn't produce a false positive/negative.
+            let code: String = contents
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let touches_live_pipewire = code.contains("PipeWireManager::connect")
+                || code.contains("create_virtual_mic")
+                || code.contains("Command::new(\"pw-");
+
+            if !touches_live_pipewire {
+                continue;
+            }
+
+            assert!(
+                code.contains("CLEANMIC_LIVE_PW_TESTS"),
+                "{} reaches the live PipeWire path but never mentions CLEANMIC_LIVE_PW_TESTS \
+                 — it must be opt-in (see make test-live)",
+                path.display()
+            );
+            assert!(
+                code.contains("#[ignore"),
+                "{} reaches the live PipeWire path but has no #[ignore] — it must not run by \
+                 default (see make test-live)",
+                path.display()
+            );
+        }
+    }
 }

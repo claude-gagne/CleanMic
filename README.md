@@ -161,6 +161,14 @@ make appimage
 ### Testing
 
 - `make test` — the Rust unit/integration test suite (`cargo test --all-features`).
+  Never touches your live PipeWire graph (no "CleanMic" node is created or
+  destroyed) or your real config/autostart/desktop-entry files — everything
+  it exercises runs against an offline stand-in.
+- `make test-live` — the opt-in counterpart: creates a real "CleanMic" node
+  against your actual PipeWire daemon (`CLEANMIC_LIVE_PW_TESTS=1`), so it
+  refuses up front if CleanMic or the E2E harness is already using the graph.
+  Run this after changing PipeWire integration code, not as part of your
+  everyday `make test`.
 - `make harness-test` — offline checks for the silent E2E test harness itself
   (shell syntax, a sandboxed self-test of the screen/scale/owner-process
   guards, and the Python metric/report unit tests). No X server, no

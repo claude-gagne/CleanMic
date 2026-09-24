@@ -18,25 +18,52 @@ const APP_ID: &str = "com.cleanmic.CleanMic";
 const DESKTOP_FILENAME: &str = "com.cleanmic.CleanMic.desktop";
 
 /// Return the XDG autostart directory (`~/.config/autostart/`).
+///
+/// In this crate's unit-test build it points into the temp directory instead
+/// (mirroring `Config::config_path`'s cb6b607 pattern): no test today calls
+/// the real-dir wrappers, but this makes it structurally impossible for one
+/// to start writing the developer's real autostart entry (R4).
 fn default_autostart_dir() -> PathBuf {
-    let config_home = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".config")
-        });
-    config_home.join("autostart")
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("cleanmic-unit-tests")
+            .join("xdg-config")
+            .join("autostart")
+    }
+    #[cfg(not(test))]
+    {
+        let config_home = std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                PathBuf::from(home).join(".config")
+            });
+        config_home.join("autostart")
+    }
 }
 
 /// Return the XDG applications directory (`~/.local/share/applications/`).
+///
+/// See [`default_autostart_dir`]'s doc comment for the cfg(test) redirect.
 fn default_applications_dir() -> PathBuf {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".local").join("share")
-        });
-    data_home.join("applications")
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("cleanmic-unit-tests")
+            .join("xdg-data")
+            .join("applications")
+    }
+    #[cfg(not(test))]
+    {
+        let data_home = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                PathBuf::from(home).join(".local").join("share")
+            });
+        data_home.join("applications")
+    }
 }
 
 /// Generate the content of the `.desktop` file.
@@ -140,18 +167,33 @@ fn install_desktop_entry(dir: &Path, content: &str) -> Result<()> {
 
 /// Return the XDG icons directory for the hicolor scalable apps slot.
 /// (`~/.local/share/icons/hicolor/scalable/apps/`)
+///
+/// See [`default_autostart_dir`]'s doc comment for the cfg(test) redirect.
 fn default_icons_dir() -> PathBuf {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".local").join("share")
-        });
-    data_home
-        .join("icons")
-        .join("hicolor")
-        .join("scalable")
-        .join("apps")
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("cleanmic-unit-tests")
+            .join("xdg-data")
+            .join("icons")
+            .join("hicolor")
+            .join("scalable")
+            .join("apps")
+    }
+    #[cfg(not(test))]
+    {
+        let data_home = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                PathBuf::from(home).join(".local").join("share")
+            });
+        data_home
+            .join("icons")
+            .join("hicolor")
+            .join("scalable")
+            .join("apps")
+    }
 }
 
 /// Locate the bundled SVG icon.
@@ -317,6 +359,37 @@ fn reconcile_in(config_value: bool, autostart_dir: &Path, applications_dir: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R4: the real-dir wrappers must never resolve under the developer's
+    /// actual `$HOME`/XDG dirs in the unit-test build — only under
+    /// `temp_dir()/cleanmic-unit-tests`, mirroring `Config::config_path`
+    /// (cb6b607). No test today calls the real-dir wrappers; this makes it
+    /// structurally impossible for a future one to write the developer's
+    /// real autostart entry, desktop file or icon.
+    #[test]
+    fn unit_tests_never_touch_the_real_xdg_dirs() {
+        let unit_test_root = std::env::temp_dir().join("cleanmic-unit-tests");
+        for dir in [
+            default_autostart_dir(),
+            default_applications_dir(),
+            default_icons_dir(),
+        ] {
+            assert!(
+                dir.starts_with(&unit_test_root),
+                "{} does not resolve under {} (a unit test would touch the real user dir)",
+                dir.display(),
+                unit_test_root.display()
+            );
+            if let Ok(home) = std::env::var("HOME") {
+                assert!(
+                    !dir.starts_with(&home),
+                    "{} resolves under $HOME ({})",
+                    dir.display(),
+                    home
+                );
+            }
+        }
+    }
 
     /// Create temp dirs that act as XDG_CONFIG_HOME/autostart and
     /// XDG_DATA_HOME/applications, returning the tempdir handle (keep alive),
