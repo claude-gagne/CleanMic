@@ -43,6 +43,9 @@ msgstr "Par défaut"
 msgid "No input device available"
 msgstr "Aucun microphone disponible"
 
+msgid "unplugged"
+msgstr "débranché"
+
 msgid "Enable"
 msgstr "Activer"
 

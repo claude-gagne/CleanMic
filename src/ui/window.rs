@@ -34,6 +34,7 @@ use std::sync::mpsc;
 
 use gtk4::gio;
 use gtk4::glib;
+use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{Box as GBox, Orientation};
 use libadwaita::prelude::*;
@@ -85,6 +86,16 @@ pub struct WindowHandles {
     /// refresh would fire `UiEvent::DeviceChanged`, overwriting the user's
     /// explicit pick in `config.input_device` and breaking D-06 + D-03.
     pub device_updating: Rc<Cell<bool>>,
+    /// What each index in `device_row`'s CURRENT popup list represents —
+    /// replaces the old build-time (description, node.name) vector capture,
+    /// which went stale after any runtime list refresh. R1 makes refreshes
+    /// routine (plug/unplug, pin changes), so a click must always resolve
+    /// against the list actually on screen, not the one captured at window
+    /// construction time. Replaced wholesale by [`update_device_list`] under
+    /// the `device_updating` guard. Not `pub`: `PickerTarget` is private to
+    /// this module and only the selection closure / `update_device_list`
+    /// (both defined here) ever touch it.
+    device_targets: Rc<RefCell<Vec<PickerTarget>>>,
     /// The update notification banner at the top of the window.
     /// Revealed when a new version is available (per D-05, D-08).
     pub update_banner: Banner,
@@ -455,20 +466,23 @@ pub fn build_main_window(
     // Device picker
     let device_row = build_device_row(state);
     let device_updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Seeded from the same initial model `build_device_row` computed
+    // internally — kept in sync thereafter by `update_device_list` under the
+    // `device_updating` guard. Replaces the old build-time (description,
+    // node.name) vector capture, which went stale after any runtime list
+    // refresh (R1 makes refreshes routine: plug/unplug, pin changes).
+    let device_targets: Rc<RefCell<Vec<PickerTarget>>> = Rc::new(RefCell::new(
+        build_device_model(
+            &state.available_devices,
+            state.system_default_name.as_deref(),
+            state.input_device.as_deref(),
+        )
+        .targets,
+    ));
     {
         let tx = event_tx.clone();
         let device_updating_cb = device_updating.clone();
-        // Clone the (description → node.name) mapping for real devices.
-        // Used to translate a real-device pick back to a PipeWire node name.
-        let devices_for_cb: Vec<(String, String)> = state
-            .available_devices
-            .iter()
-            .map(|d| (d.description.clone(), d.name.clone()))
-            .collect();
-        // Precompute the "Default " prefix so we can detect synthetic Default entries
-        // in the current model at selection time. Format matches build_device_model:
-        // tr!("Default") + " (" + desc + ")".
-        let default_prefix = format!("{} (", tr!("Default"));
+        let device_targets_cb = device_targets.clone();
         device_row.connect_selected_item_notify(move |row| {
             // G-05 guard: skip events fired by programmatic model refreshes
             // in update_device_list. Only real user clicks should emit
@@ -477,51 +491,22 @@ pub fn build_main_window(
                 return;
             }
             let idx = row.selected() as usize;
-            // Read the string at the selected index AND at index 0 in one model access.
-            let model = row
-                .model()
-                .and_then(|m| m.downcast::<gtk4::StringList>().ok());
-            let item_text: Option<String> = model
-                .as_ref()
-                .and_then(|sl| sl.string(idx as u32).map(|s| s.to_string()));
-            // Direct model[0] read for "is Default present?" — simpler than the
-            // nested item_text.as_ref().map(...) pattern (planner revision w7).
-            let has_default = model
-                .as_ref()
-                .and_then(|sl| sl.string(0))
-                .map(|first| first.to_string().starts_with(&default_prefix))
-                .unwrap_or(false);
-
-            // D-10: "No input device available" is the only string — picker is
-            // insensitive, but guard anyway.
-            if let Some(ref text) = item_text
-                && text == &tr!("No input device available")
-            {
-                return;
-            }
-
-            // D-01/D-06: index 0 is the Default entry when it starts with
-            // "Default (" — emit DeviceChangedToDefault. Otherwise it's a
-            // real device (Default is hidden).
-            if idx == 0 && has_default {
-                if tx.send(UiEvent::DeviceChangedToDefault).is_err() {
-                    log::warn!("UI event channel closed - DeviceChangedToDefault dropped");
+            let target = device_targets_cb.borrow().get(idx).cloned();
+            match target {
+                Some(PickerTarget::Default) => {
+                    if tx.send(UiEvent::DeviceChangedToDefault).is_err() {
+                        log::warn!("UI event channel closed - DeviceChangedToDefault dropped");
+                    }
                 }
-                return;
-            }
-
-            // Real-device pick. Figure out the offset: if index 0 was the
-            // Default entry, real devices start at index 1. Otherwise at 0.
-            let real_idx = if has_default { idx.saturating_sub(1) } else { idx };
-            let name: Option<String> = devices_for_cb.get(real_idx).map(|(_, n)| n.clone());
-            let Some(name) = name else {
-                log::warn!(
-                    "Device picker: no device available for selected index {idx} (real_idx {real_idx}) — ignoring"
-                );
-                return;
-            };
-            if tx.send(UiEvent::DeviceChanged(name)).is_err() {
-                log::warn!("UI event channel closed - DeviceChanged dropped");
+                Some(PickerTarget::Device(name)) => {
+                    if tx.send(UiEvent::DeviceChanged(name)).is_err() {
+                        log::warn!("UI event channel closed - DeviceChanged dropped");
+                    }
+                }
+                Some(PickerTarget::NoInput) | None => {
+                    // D-10 placeholder, or an out-of-range index (should not
+                    // happen — guard anyway).
+                }
             }
         });
     }
@@ -682,6 +667,7 @@ pub fn build_main_window(
         win_title,
         device_row,
         device_updating,
+        device_targets,
         update_banner,
         strength_updating,
         mode_updating,
@@ -689,6 +675,26 @@ pub fn build_main_window(
 }
 
 // ── Helper builders ───────────────────────────────────────────────────────────
+
+/// What a given index in the device picker's CURRENT popup list represents.
+///
+/// Computed fresh by [`build_device_model`] every time the list is (re)built
+/// and stored in [`WindowHandles::device_targets`] so the selection closure
+/// always resolves a click against the list actually on screen (R1 makes
+/// runtime list refreshes routine: plug/unplug, pin changes).
+#[derive(Debug, Clone, PartialEq)]
+enum PickerTarget {
+    /// Index 0's synthetic "Default (Mic)" entry — selecting it emits
+    /// `UiEvent::DeviceChangedToDefault`, clearing `config.input_device`
+    /// rather than pinning to a specific name (D-06).
+    Default,
+    /// A real device, identified by its stable PipeWire node name —
+    /// selecting it emits `UiEvent::DeviceChanged(name)`.
+    Device(String),
+    /// The D-10 "No input device available" placeholder entry — never
+    /// emits a `UiEvent` (the picker is also insensitive in this state).
+    NoInput,
+}
 
 /// Result of computing the picker's string model and current selection.
 ///
@@ -698,16 +704,19 @@ pub fn build_main_window(
 /// entry (true) or the first real device (false). The selection closure uses
 /// this to decide which UiEvent variant to emit when index 0 is picked.
 /// `no_input` indicates the D-10 "No input device available" state.
+/// `targets` is parallel to `strings`: `targets[i]` identifies what picking
+/// `strings[i]` means (Default / a specific device / the no-input sentinel).
 struct DevicePickerModel {
     strings: Vec<String>,
     selected_idx: u32,
     /// Retained as part of the helper's contract even though the selection
-    /// closure inspects the StringList directly (via `has_default` prefix
-    /// match). Plan 03 or future consumers that render the picker from the
-    /// computed model without re-reading the widget can read this flag.
+    /// closure now inspects `targets` directly rather than a string prefix
+    /// match. Future consumers that render the picker from the computed
+    /// model without re-reading the widget can read this flag.
     #[allow(dead_code)]
     default_present: bool,
     no_input: bool,
+    targets: Vec<PickerTarget>,
 }
 
 /// Compute the picker's string list and selection state from the current
@@ -720,6 +729,10 @@ struct DevicePickerModel {
 ///   → no Default entry; real devices start at index 0.
 /// - `devices` empty AND `system_default_name` is None
 ///   → single entry `"No input device available"` (D-10). `no_input = true`.
+///
+/// R1 / OWNER-LOCK: a real device with `available == false` renders as
+/// `"{description} ({unplugged})"` — the full real name is never shortened,
+/// only suffixed. Available devices render as their description untouched.
 fn build_device_model(
     devices: &[DeviceInfo],
     system_default_name: Option<&str>,
@@ -732,6 +745,7 @@ fn build_device_model(
             selected_idx: 0,
             default_present: false,
             no_input: true,
+            targets: vec![PickerTarget::NoInput],
         };
     }
 
@@ -741,15 +755,25 @@ fn build_device_model(
         .map(|d| d.description.clone());
 
     let mut strings: Vec<String> = Vec::with_capacity(devices.len() + 1);
+    let mut targets: Vec<PickerTarget> = Vec::with_capacity(devices.len() + 1);
     let default_present = if let Some(ref desc) = default_description {
         // D-02 label format: tr!("Default") + " (" + description + ")"
         strings.push(format!("{} ({})", tr!("Default"), desc));
+        targets.push(PickerTarget::Default);
         true
     } else {
         false
     };
     for d in devices {
-        strings.push(d.description.clone());
+        if d.available {
+            strings.push(d.description.clone());
+        } else {
+            // R1: kept only because it is pinned or the system default;
+            // OWNER-LOCK: the full real name is never shortened, only
+            // suffixed with the translated marker.
+            strings.push(format!("{} ({})", d.description, tr!("unplugged")));
+        }
+        targets.push(PickerTarget::Device(d.name.clone()));
     }
 
     // Compute selected_idx:
@@ -772,6 +796,7 @@ fn build_device_model(
         selected_idx,
         default_present,
         no_input: false,
+        targets,
     }
 }
 
@@ -791,7 +816,113 @@ fn build_device_row(state: &UiState) -> ComboRow {
     row.set_selected(model.selected_idx);
     row.set_sensitive(!model.no_input);
 
+    // OWNER-LOCK: device names must never be truncated or ellipsized —
+    // start, middle, or end — anywhere in the picker.
+    //
+    // `use-subtitle` hides AdwComboRow's default collapsed-value suffix
+    // label, which upstream hard-codes a 20-char end-ellipsis
+    // (`gtk_label_set_max_width_chars(20)` +
+    // `gtk_label_set_ellipsize(END)`). With `use-subtitle` on, the selected
+    // string is instead written to the row's own ActionRow subtitle, which
+    // spans the full row width and — with `subtitle-lines(0)` (unlimited) —
+    // wraps rather than truncating.
+    row.set_use_subtitle(true);
+    row.set_subtitle_lines(0);
+    // T-tua-01: device names (including remote Bluetooth names like
+    // "AirPods Pro") are always plain text, never interpreted as Pango
+    // markup, in either the subtitle or the popup list.
+    row.set_use_markup(false);
+    row.set_list_factory(Some(&full_name_list_factory(&row)));
+
     row
+}
+
+/// Build the popup list factory for the device picker (OWNER-LOCK, T-tua-01,
+/// T-tua-03).
+///
+/// Renders each entry as a plain-text, word-wrapping label (never
+/// ellipsized) plus a check-mark image whose opacity mirrors whether that
+/// entry is the row's currently `selected-item` — the same visual contract
+/// as libadwaita's own default popup factory (`adw-combo-row.c`), which
+/// reacts to `notify::selected-item` on the row.
+fn full_name_list_factory(row: &ComboRow) -> gtk4::SignalListItemFactory {
+    let factory = gtk4::SignalListItemFactory::new();
+
+    // A weak reference to the row (per upstream `gtk_object_expression_new`
+    // semantics) so this popup factory — whose lifetime is tied to the
+    // row's own popover — never creates a strong reference cycle back to
+    // the row itself.
+    let row_expr = gtk4::ObjectExpression::new(row);
+    let selected_item_expr = row_expr.chain_property::<ComboRow>("selected-item");
+
+    factory.connect_setup(move |_factory, list_item| {
+        let Some(list_item) = list_item.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+
+        let hbox = GBox::new(Orientation::Horizontal, 6);
+
+        let label = gtk4::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        // T-tua-03: bounded wrap width keeps the popover from growing
+        // unboundedly wide on an extremely long name — it grows vertically
+        // instead.
+        label.set_ellipsize(pango::EllipsizeMode::None);
+        label.set_wrap(true);
+        label.set_wrap_mode(pango::WrapMode::WordChar);
+        label.set_max_width_chars(60);
+
+        let check = gtk4::Image::from_icon_name("object-select-symbolic");
+
+        hbox.append(&label);
+        hbox.append(&check);
+        list_item.set_child(Some(&hbox));
+
+        // Check-mark opacity mirrors "is this item the row's
+        // selected-item?" — evaluated fresh whenever `selected-item`
+        // changes (bound with `this` = this specific list item, whose own
+        // `item` property never changes after bind).
+        let item_expr = gtk4::ListItem::this_expression("item");
+        let opacity_expr = gtk4::ClosureExpression::with_callback::<f64, _>(
+            [selected_item_expr.clone().upcast(), item_expr.upcast()],
+            |values: &[glib::Value]| -> f64 {
+                let selected = values[1].get::<Option<glib::Object>>().ok().flatten();
+                let item = values[2].get::<Option<glib::Object>>().ok().flatten();
+                if selected == item { 1.0 } else { 0.0 }
+            },
+        );
+        opacity_expr.bind(&check, "opacity", Some(list_item));
+    });
+
+    factory.connect_bind(move |_factory, list_item| {
+        let Some(list_item) = list_item.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+        let Some(child) = list_item.child() else {
+            return;
+        };
+        let Some(hbox) = child.downcast_ref::<GBox>() else {
+            return;
+        };
+        let Some(label) = hbox
+            .first_child()
+            .and_then(|w| w.downcast::<gtk4::Label>().ok())
+        else {
+            return;
+        };
+        let Some(item) = list_item.item() else {
+            return;
+        };
+        let Some(string_object) = item.downcast_ref::<gtk4::StringObject>() else {
+            return;
+        };
+        // Plain text (never markup), matching the OWNER-LOCK / T-tua-01
+        // contract on the collapsed subtitle.
+        label.set_text(&string_object.string());
+    });
+
+    factory
 }
 
 /// Build the engine selector as an AdwPreferencesGroup containing one
@@ -1133,6 +1264,11 @@ impl WindowHandles {
         // UiEvent::DeviceChanged. Resetting to false after both calls complete
         // ensures user clicks captured after this update still fire normally.
         self.device_updating.set(true);
+        // Assign the new targets in their own statement so the RefCell
+        // borrow is released before set_model/set_selected run (both may
+        // synchronously fire selected-item-notify, whose handler also
+        // borrows `device_targets`).
+        *self.device_targets.borrow_mut() = model.targets;
         self.device_row.set_model(Some(&list));
         self.device_row.set_selected(model.selected_idx);
         self.device_updating.set(false);
@@ -1207,6 +1343,93 @@ mod tests {
                 EngineType::Khip,
             ]
         );
+    }
+
+    // ── build_device_model (R1, R2, OWNER-LOCK) ─────────────────────────────
+    //
+    // Lowercase fixture descriptions ("internal mic", "jack mic") and dotted
+    // node names keep the i18n Class B guard from tripping on this file;
+    // `tr!` returns the msgid verbatim in tests (no locale loaded).
+
+    #[test]
+    fn build_device_model_available_device_shows_full_description_untouched() {
+        let devices = vec![DeviceInfo {
+            name: "internal.mic".into(),
+            description: "internal mic".into(),
+            available: true,
+        }];
+        let model = build_device_model(&devices, None, Some("internal.mic"));
+        assert_eq!(model.strings, vec!["internal mic".to_string()]);
+    }
+
+    #[test]
+    fn build_device_model_unavailable_pinned_device_gets_unplugged_marker_and_is_selected() {
+        let devices = vec![DeviceInfo {
+            name: "jack.mic".into(),
+            description: "jack mic".into(),
+            available: false,
+        }];
+        let model = build_device_model(&devices, None, Some("jack.mic"));
+        assert_eq!(
+            model.strings,
+            vec![format!("jack mic ({})", tr!("unplugged"))]
+        );
+        assert_eq!(model.selected_idx, 0);
+    }
+
+    #[test]
+    fn build_device_model_with_default_present_orders_targets_and_label() {
+        let devices = vec![
+            DeviceInfo {
+                name: "internal.mic".into(),
+                description: "internal mic".into(),
+                available: true,
+            },
+            DeviceInfo {
+                name: "jack.mic".into(),
+                description: "jack mic".into(),
+                available: true,
+            },
+        ];
+        let model = build_device_model(&devices, Some("internal.mic"), None);
+        assert_eq!(
+            model.targets,
+            vec![
+                PickerTarget::Default,
+                PickerTarget::Device("internal.mic".into()),
+                PickerTarget::Device("jack.mic".into()),
+            ]
+        );
+        assert_eq!(
+            model.strings[0],
+            format!("{} ({})", tr!("Default"), "internal mic")
+        );
+    }
+
+    #[test]
+    fn build_device_model_with_default_absent_targets_start_at_device_zero() {
+        let devices = vec![DeviceInfo {
+            name: "internal.mic".into(),
+            description: "internal mic".into(),
+            available: true,
+        }];
+        // system_default_name is Some but doesn't resolve to any device in
+        // `devices`, so no Default entry is prepended (matches D-01: only a
+        // resolvable default gets the synthetic entry).
+        let model = build_device_model(&devices, Some("unresolvable.name"), None);
+        assert_eq!(
+            model.targets,
+            vec![PickerTarget::Device("internal.mic".into())]
+        );
+        assert!(!model.default_present);
+    }
+
+    #[test]
+    fn build_device_model_no_input_state() {
+        let model = build_device_model(&[], None, None);
+        assert_eq!(model.strings, vec![tr!("No input device available")]);
+        assert_eq!(model.targets, vec![PickerTarget::NoInput]);
+        assert!(model.no_input);
     }
 
     #[test]
