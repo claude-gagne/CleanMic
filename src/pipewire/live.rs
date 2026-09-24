@@ -28,6 +28,53 @@ use pw::stream::{Stream, StreamFlags};
 use super::ringbuf::{BacklogLimiter, RingBufReader, RingBufWriter};
 use super::{NODE_CHANNELS, NODE_NAME, NODE_SAMPLE_RATE, PipeWireError};
 
+/// Maximum monitor-stream frames processed per preallocated scratch chunk —
+/// the default PipeWire max quantum (see `CAPTURE_MAX_BACKLOG`'s doc in
+/// `src/audio.rs` for the same reference point). PipeWire could in principle
+/// negotiate a larger buffer on some configuration; `read_and_interleave_stereo`
+/// then processes it in multiple chunks of at most this size so the RT
+/// callback still never allocates.
+const MONITOR_SCRATCH_MAX_FRAMES: usize = 8_192;
+
+/// Reads `n_mono_frames` frames via `read_fn` and duplicates each one into
+/// both channels of `out`, an interleaved stereo buffer (`[FL, FR, FL, FR,
+/// ...]`).
+///
+/// Processes at most `scratch.len()` frames per `read_fn` call, so a caller
+/// with a small preallocated `scratch` buffer can still service an
+/// arbitrarily large `n_mono_frames` without ever allocating — the property
+/// that matters for the real-time monitor playback callback, which calls
+/// this with `scratch` preallocated once outside the RT path (see
+/// `MONITOR_SCRATCH_MAX_FRAMES`) and `read_fn` bound to
+/// `BacklogLimiter::read_padded`, which zero-pads on underrun.
+fn read_and_interleave_stereo(
+    mut read_fn: impl FnMut(&mut [f32]) -> usize,
+    scratch: &mut [f32],
+    out: &mut [f32],
+    n_mono_frames: usize,
+) {
+    debug_assert!(
+        !scratch.is_empty(),
+        "scratch buffer must hold at least one frame"
+    );
+    debug_assert!(
+        out.len() >= n_mono_frames * 2,
+        "out must hold n_mono_frames stereo frames"
+    );
+    let mut done = 0usize;
+    while done < n_mono_frames {
+        let chunk_len = (n_mono_frames - done).min(scratch.len());
+        let chunk = &mut scratch[..chunk_len];
+        read_fn(chunk);
+        for (i, &sample) in chunk.iter().enumerate() {
+            let frame = done + i;
+            out[2 * frame] = sample;
+            out[2 * frame + 1] = sample;
+        }
+        done += chunk_len;
+    }
+}
+
 /// Handle to the PipeWire main-loop thread and shared state needed to
 /// create/destroy the virtual mic stream from any thread.
 pub(super) struct LivePipeWireManager {
@@ -719,6 +766,11 @@ impl LivePipeWireManager {
         // Follows the playback sink's clock (e.g. Bluetooth), not the mic's:
         // shed standing backlog like the output stream does.
         let mut limiter = BacklogLimiter::new();
+        // Preallocated outside the RT callback (see
+        // `read_and_interleave_stereo`'s doc): the callback itself never
+        // allocates, even if PipeWire ever negotiates a buffer larger than
+        // `MONITOR_SCRATCH_MAX_FRAMES`.
+        let mut mono_scratch = vec![0f32; MONITOR_SCRATCH_MAX_FRAMES];
 
         let listener = stream
             .add_local_listener()
@@ -755,16 +807,16 @@ impl LivePipeWireManager {
                                 n_stereo_samples,
                             );
 
-                            // Read mono frames into the first half of a stack
-                            // scratch buffer, then interleave into the output.
-                            let mut mono_buf = vec![0f32; n_mono_frames];
-                            // Zero-pads unread frames (ring buffer underrun).
-                            limiter.read_padded(&monitor_reader, &mut mono_buf);
-                            // Interleave: out[2*i] = FL, out[2*i+1] = FR
-                            for (i, &sample) in mono_buf.iter().enumerate() {
-                                out[2 * i] = sample;
-                                out[2 * i + 1] = sample;
-                            }
+                            // Read mono frames through the preallocated
+                            // scratch buffer (chunked if the negotiated
+                            // buffer ever exceeds it) and interleave into the
+                            // stereo output. No allocation on this RT path.
+                            read_and_interleave_stereo(
+                                |chunk| limiter.read_padded(&monitor_reader, chunk),
+                                &mut mono_scratch,
+                                out,
+                                n_mono_frames,
+                            );
 
                             if !data.chunk.is_null() {
                                 let chunk = &mut *data.chunk;
@@ -1104,4 +1156,127 @@ fn configured_default_sink() -> Option<String> {
 pub(crate) fn configured_default_source() -> Option<String> {
     pw_metadata_name("default.configured.audio.source")
         .or_else(|| pw_metadata_name("default.audio.source"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `read_and_interleave_stereo` is a pure function over a generic
+    // `read_fn`, so it is fully testable here without a live PipeWire
+    // connection or any FFI — unlike the rest of this module, which requires
+    // real PipeWire streams and raw buffer pointers.
+
+    /// A `read_fn` that fills its argument with a rising sequence starting at
+    /// `next` (mimicking `BacklogLimiter::read_padded` reading real samples),
+    /// advancing `next` by the slice length each call.
+    fn counting_read_fn(next: std::cell::Cell<f32>) -> impl FnMut(&mut [f32]) -> usize {
+        move |buf: &mut [f32]| {
+            for s in buf.iter_mut() {
+                let v = next.get();
+                *s = v;
+                next.set(v + 1.0);
+            }
+            buf.len()
+        }
+    }
+
+    #[test]
+    fn interleaves_mono_frames_into_both_stereo_channels() {
+        let mut scratch = vec![0.0f32; 8];
+        let mut out = vec![-1.0f32; 8 * 2];
+        read_and_interleave_stereo(
+            counting_read_fn(std::cell::Cell::new(0.0)),
+            &mut scratch,
+            &mut out,
+            8,
+        );
+        for i in 0..8 {
+            assert_eq!(out[2 * i], i as f32, "FL frame {i}");
+            assert_eq!(out[2 * i + 1], i as f32, "FR frame {i}");
+        }
+    }
+
+    #[test]
+    fn processes_in_chunks_when_frames_exceed_scratch_len() {
+        // scratch holds only 3 frames; ask for 10 — must take multiple
+        // read_fn calls and still produce a fully correct interleave with no
+        // gaps or overlaps at the chunk boundaries.
+        let mut scratch = vec![0.0f32; 3];
+        let mut out = vec![-1.0f32; 10 * 2];
+        read_and_interleave_stereo(
+            counting_read_fn(std::cell::Cell::new(100.0)),
+            &mut scratch,
+            &mut out,
+            10,
+        );
+        for i in 0..10 {
+            let expected = 100.0 + i as f32;
+            assert_eq!(out[2 * i], expected, "FL frame {i}");
+            assert_eq!(out[2 * i + 1], expected, "FR frame {i}");
+        }
+    }
+
+    #[test]
+    fn single_frame_scratch_still_works() {
+        // The smallest legal scratch buffer: one read_fn call per frame.
+        let mut scratch = vec![0.0f32; 1];
+        let mut out = vec![-1.0f32; 4 * 2];
+        read_and_interleave_stereo(
+            counting_read_fn(std::cell::Cell::new(0.0)),
+            &mut scratch,
+            &mut out,
+            4,
+        );
+        assert_eq!(&out, &[0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn zero_frames_is_a_no_op() {
+        let mut scratch = vec![0.0f32; 4];
+        let mut out = vec![-1.0f32; 0];
+        let mut calls = 0usize;
+        read_and_interleave_stereo(
+            |_buf| {
+                calls += 1;
+                0
+            },
+            &mut scratch,
+            &mut out,
+            0,
+        );
+        assert_eq!(calls, 0, "read_fn must not be called for zero frames");
+    }
+
+    #[test]
+    fn exact_multiple_of_scratch_len_does_not_over_or_under_read() {
+        // n_mono_frames is an exact multiple of scratch.len(): must take
+        // exactly n/scratch.len() calls and cover every frame once.
+        let mut scratch = vec![0.0f32; 4];
+        let mut out = vec![-1.0f32; 8 * 2];
+        let mut call_count = 0usize;
+        let next = std::cell::Cell::new(0.0f32);
+        read_and_interleave_stereo(
+            |buf| {
+                call_count += 1;
+                for s in buf.iter_mut() {
+                    let v = next.get();
+                    *s = v;
+                    next.set(v + 1.0);
+                }
+                buf.len()
+            },
+            &mut scratch,
+            &mut out,
+            8,
+        );
+        assert_eq!(
+            call_count, 2,
+            "8 frames over a 4-frame scratch should take 2 calls"
+        );
+        for i in 0..8 {
+            assert_eq!(out[2 * i], i as f32);
+            assert_eq!(out[2 * i + 1], i as f32);
+        }
+    }
 }
