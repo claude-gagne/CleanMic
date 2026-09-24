@@ -174,11 +174,17 @@ impl RingBufReader {
 /// Observation window of [`BacklogLimiter`], in samples requested by the
 /// consumer (1 s at 48 kHz).
 const LIMITER_WINDOW: usize = 48_000;
-/// Standing backlog tolerated before [`BacklogLimiter`] sheds (50 ms).
-const LIMITER_MAX_STANDING: usize = 2_400;
+/// Standing backlog tolerated before [`BacklogLimiter`] sheds (20 ms).
+///
+/// Whatever stands below this is added to every call's latency for as long as
+/// the stream runs, so it is kept small: a late consumer start (the audio
+/// thread runs ~60 ms before the output stream streams), an engine-swap
+/// stall or a shrinking quantum routinely leave 15-30 ms of slack, which a
+/// 50 ms tolerance used to keep forever.
+const LIMITER_MAX_STANDING: usize = 960;
 /// Backlog [`BacklogLimiter`] leaves in place after shedding, as jitter
-/// headroom (20 ms).
-const LIMITER_KEEP: usize = 960;
+/// headroom (10 ms) on top of the worst case seen in the last window.
+const LIMITER_KEEP: usize = 480;
 
 /// Consumer-side latency bound for a ring that bridges two independently
 /// clocked PipeWire graphs (e.g. the ALSA-mic-driven audio thread feeding the
@@ -210,7 +216,7 @@ pub struct BacklogLimiter {
 
 impl BacklogLimiter {
     /// Create a limiter with the production tuning (1 s window, shed when
-    /// more than 50 ms stood unused for the whole window, keep 20 ms).
+    /// more than 20 ms stood unused for the whole window, keep 10 ms).
     pub fn new() -> Self {
         Self::with_params(LIMITER_WINDOW, LIMITER_MAX_STANDING, LIMITER_KEEP)
     }
@@ -232,9 +238,24 @@ impl BacklogLimiter {
     /// (underrun), shed standing backlog if a window just completed, and
     /// return the number of real samples read.
     ///
+    /// On an underrun (less than `out.len()` queued) with more than `keep`
+    /// queued, `keep` samples are left in the ring: the gap is `keep` longer,
+    /// but playback resumes with that much headroom. Without it, recovery
+    /// restored only the exact shortfall, so a producer delivering in
+    /// jittery 480-sample blocks (a heavy engine) sat at zero margin and
+    /// every new jitter peak became another burst of small underruns — a
+    /// click train instead of one gap. Nothing is dropped: the kept samples
+    /// are the next ones played.
+    ///
     /// RT-safe: no allocation, no locks, no syscalls.
     pub fn read_padded(&mut self, reader: &RingBufReader, out: &mut [f32]) -> usize {
-        let read = reader.read(out);
+        let queued = reader.available();
+        let want = if queued < out.len() && queued > self.keep {
+            queued - self.keep
+        } else {
+            out.len()
+        };
+        let read = reader.read(&mut out[..want]);
         for s in &mut out[read..] {
             *s = 0.0;
         }
@@ -423,6 +444,102 @@ mod tests {
         assert_eq!(underruns, 0);
         assert_eq!(limiter.shed_total(), 9_600 - LIMITER_KEEP);
         assert_eq!(r.available(), LIMITER_KEEP);
+    }
+
+    #[test]
+    fn limiter_sheds_small_standing_slack_left_by_a_late_consumer_start() {
+        // The live pipeline's audio thread starts ~57 ms before the output
+        // stream begins streaming, and the consumer then settles with ~29 ms
+        // (1376 samples) that is never read in time — measured on a real
+        // PipeWire graph (debug session base-latency-330ms). A limiter that
+        // tolerates that forever adds it to every call's latency.
+        let (w, r) = ring_buffer(65_536);
+        let mut limiter = BacklogLimiter::new();
+        w.write(&vec![0.5f32; 1_376]);
+        let underruns = drive(&mut limiter, &w, &r, 1024, 100, |_| 1024);
+        assert_eq!(underruns, 0, "shedding must never starve the consumer");
+        assert_eq!(limiter.shed_total(), 1_376 - LIMITER_KEEP);
+        assert_eq!(r.available(), LIMITER_KEEP);
+        assert!(
+            LIMITER_KEEP <= 480,
+            "headroom kept after a shed ({LIMITER_KEEP} samples) must stay within 10 ms"
+        );
+    }
+
+    #[test]
+    fn limiter_underrun_resumes_with_keep_of_headroom() {
+        // 1000 queued, the consumer wants 1024: an underrun either way. The
+        // limiter must hold `LIMITER_KEEP` back (one slightly longer gap) so
+        // playback resumes with headroom instead of running on empty and
+        // underrunning again on the next late block.
+        let (w, r) = ring_buffer(4096);
+        let mut limiter = BacklogLimiter::new();
+        w.write(&[0.5f32; 1000]);
+        let mut out = [9.0f32; 1024];
+        let read = limiter.read_padded(&r, &mut out);
+        assert_eq!(read, 1000 - LIMITER_KEEP);
+        assert!(out[..read].iter().all(|&s| s == 0.5));
+        assert!(out[read..].iter().all(|&s| s == 0.0));
+        assert_eq!(
+            r.available(),
+            LIMITER_KEEP,
+            "headroom kept for the next read"
+        );
+    }
+
+    #[test]
+    fn limiter_underrun_with_at_most_keep_queued_plays_it_all() {
+        // Boundary neighbours of the hold-back: with `keep` or fewer samples
+        // queued there is no headroom to keep — play what there is.
+        for queued in [LIMITER_KEEP, LIMITER_KEEP - 1] {
+            let (w, r) = ring_buffer(4096);
+            let mut limiter = BacklogLimiter::new();
+            w.write(&vec![0.5f32; queued]);
+            let mut out = [9.0f32; 1024];
+            assert_eq!(limiter.read_padded(&r, &mut out), queued);
+            assert_eq!(r.available(), 0);
+        }
+        // One more than `keep`: exactly one real sample, `keep` stay queued.
+        let (w, r) = ring_buffer(4096);
+        let mut limiter = BacklogLimiter::new();
+        w.write(&vec![0.5f32; LIMITER_KEEP + 1]);
+        let mut out = [9.0f32; 1024];
+        assert_eq!(limiter.read_padded(&r, &mut out), 1);
+        assert_eq!(r.available(), LIMITER_KEEP);
+    }
+
+    #[test]
+    fn limiter_does_not_turn_block_jitter_into_a_train_of_underruns() {
+        // A heavy engine (DPDFNet-8, ~7.5 ms per 480-sample block) delivers
+        // its output in 480-sample blocks whose completion jitters; the
+        // consumer pulls one 1024-frame quantum per callback. Measured live
+        // (debug session base-latency-330ms): with zero margin every new
+        // jitter peak produced a burst of 64-sample underruns, one per
+        // quantum. Simulated in sample time: block k is ready at
+        // (k + 1) * 480 + a deterministic pseudo-random delay of 0 or 470.
+        let (w, r) = ring_buffer(65_536);
+        let mut limiter = BacklogLimiter::new();
+        let mut out = vec![0.0f32; 1024];
+        let block = [0.5f32; 480];
+        let mut lcg: u32 = 12_345;
+        let mut next_block_ready = 480u64;
+        let mut underrun_events = 0;
+        for cb in 1..=5_000u64 {
+            let now = cb * 1024;
+            while next_block_ready <= now {
+                w.write(&block);
+                lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let jitter = if (lcg >> 16) % 8 == 0 { 470 } else { 0 };
+                next_block_ready = next_block_ready - (next_block_ready % 480) + 480 + jitter;
+            }
+            if limiter.read_padded(&r, &mut out) < out.len() {
+                underrun_events += 1;
+            }
+        }
+        assert!(
+            underrun_events <= 3,
+            "{underrun_events} underruns: block jitter must be absorbed by kept headroom, not replayed as a click train"
+        );
     }
 
     #[test]

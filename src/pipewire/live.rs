@@ -36,6 +36,66 @@ use super::{NODE_CHANNELS, NODE_NAME, NODE_SAMPLE_RATE, PipeWireError};
 /// callback still never allocates.
 const MONITOR_SCRATCH_MAX_FRAMES: usize = 8_192;
 
+/// First libpipewire release whose `pw_buffer` carries `requested`
+/// (`pipewire/stream.h`: "Since 0.3.50"). On an older runtime the field lies
+/// past the end of the struct PipeWire allocated, so it must never be read.
+const PW_BUFFER_REQUESTED_SINCE: (u32, u32, u32) = (0, 3, 50);
+
+/// Parses a libpipewire version string (`"1.6.2"`, `"0.3.48"`) into
+/// `(major, minor, micro)`; a missing micro counts as 0.
+fn parse_pw_version(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u32>().ok());
+    let major = parts.next()??;
+    let minor = parts.next()??;
+    let micro = parts.next().flatten().unwrap_or(0);
+    Some((major, minor, micro))
+}
+
+/// Whether a libpipewire of this version fills `pw_buffer::requested`; an
+/// unparsable version is treated as "no" (safe fallback).
+fn version_fills_buffer_requested(version: &str) -> bool {
+    parse_pw_version(version).is_some_and(|v| v >= PW_BUFFER_REQUESTED_SINCE)
+}
+
+/// Whether the libpipewire we are running against fills
+/// `pw_buffer::requested`. Called once per stream creation, never on the RT
+/// path.
+fn runtime_fills_buffer_requested() -> bool {
+    // SAFETY: returns a pointer to a static NUL-terminated version string
+    // owned by libpipewire, valid for the life of the process.
+    let version = unsafe { std::ffi::CStr::from_ptr(pw::sys::pw_get_library_version()) };
+    let version = version.to_string_lossy();
+    let supported = version_fills_buffer_requested(&version);
+    if !supported {
+        log::warn!(
+            "libpipewire {version} does not report the requested buffer size (needs 0.3.50+): \
+             CleanMic playback streams fall back to whole buffers, which adds latency"
+        );
+    }
+    supported
+}
+
+/// Number of frames a playback process callback should write this cycle.
+///
+/// PipeWire sizes playback buffers for the largest possible quantum
+/// (`maxsize`: 8192-12288 frames here), but a graph cycle only consumes
+/// `requested` frames — one quantum, or what the resampler needs. Filling
+/// the whole buffer made PipeWire play it out over many cycles before asking
+/// for more, so every sample waited about one full buffer: a constant
+/// ~170-260 ms delay, whatever the quantum (debug session
+/// base-latency-330ms). Returns `requested` clamped to the buffer; falls
+/// back to the whole buffer only when PipeWire gives no suggestion
+/// (`Some(0)`) or the runtime predates the field (`None`).
+fn playback_frames(requested: Option<u64>, max_frames: usize) -> usize {
+    match requested {
+        Some(r) if r > 0 => usize::try_from(r).map_or(max_frames, |r| r.min(max_frames)),
+        _ => max_frames,
+    }
+}
+
 /// Reads `n_mono_frames` frames via `read_fn` and duplicates each one into
 /// both channels of `out`, an interleaved stereo buffer (`[FL, FR, FL, FR,
 /// ...]`).
@@ -581,6 +641,8 @@ impl LivePipeWireManager {
         // thread follows the mic's clock: shed any standing backlog so a
         // transient can never become permanent latency (see BacklogLimiter).
         let mut limiter = BacklogLimiter::new();
+        // Checked once here, off the RT path (see `playback_frames`).
+        let use_requested = runtime_fills_buffer_requested();
 
         let listener = stream
             .add_local_listener()
@@ -597,11 +659,17 @@ impl LivePipeWireManager {
                     stream.queue_raw_buffer(raw_buf);
                     return;
                 }
+                let requested = use_requested.then_some(buf.requested);
                 let spa_buf = &mut *buf.buffer;
                 if spa_buf.n_datas > 0 && !spa_buf.datas.is_null() {
                     let data = &mut *spa_buf.datas;
                     if !data.data.is_null() && data.maxsize > 0 {
-                        let n_samples = data.maxsize as usize / std::mem::size_of::<f32>();
+                        // Write only what this cycle consumes, never the
+                        // whole (much larger) buffer.
+                        let n_samples = playback_frames(
+                            requested,
+                            data.maxsize as usize / std::mem::size_of::<f32>(),
+                        );
                         let slice =
                             std::slice::from_raw_parts_mut(data.data as *mut f32, n_samples);
                         limiter.read_padded(&output_reader, slice);
@@ -771,6 +839,8 @@ impl LivePipeWireManager {
         // allocates, even if PipeWire ever negotiates a buffer larger than
         // `MONITOR_SCRATCH_MAX_FRAMES`.
         let mut mono_scratch = vec![0f32; MONITOR_SCRATCH_MAX_FRAMES];
+        // Checked once here, off the RT path (see `playback_frames`).
+        let use_requested = runtime_fills_buffer_requested();
 
         let listener = stream
             .add_local_listener()
@@ -793,15 +863,20 @@ impl LivePipeWireManager {
                         stream.queue_raw_buffer(raw_buf);
                         return;
                     }
+                    let requested = use_requested.then_some(buf.requested);
                     let spa_buf = &mut *buf.buffer;
                     if spa_buf.n_datas > 0 && !spa_buf.datas.is_null() {
                         let data = &mut *spa_buf.datas;
                         if !data.data.is_null() && data.maxsize > 0 {
                             // Output buffer holds interleaved stereo f32 frames.
                             // Each stereo frame = 2 f32 samples (FL, FR).
-                            let n_stereo_samples =
-                                data.maxsize as usize / std::mem::size_of::<f32>();
-                            let n_mono_frames = n_stereo_samples / 2;
+                            // Write only the frames this cycle consumes,
+                            // never the whole (much larger) buffer.
+                            let n_mono_frames = playback_frames(
+                                requested,
+                                data.maxsize as usize / (2 * std::mem::size_of::<f32>()),
+                            );
+                            let n_stereo_samples = n_mono_frames * 2;
                             let out = std::slice::from_raw_parts_mut(
                                 data.data as *mut f32,
                                 n_stereo_samples,
@@ -1278,5 +1353,51 @@ mod tests {
             assert_eq!(out[2 * i], i as f32);
             assert_eq!(out[2 * i + 1], i as f32);
         }
+    }
+
+    #[test]
+    fn playback_writes_only_the_requested_frames_not_the_whole_buffer() {
+        // Real graph (debug session base-latency-330ms): 12288-frame buffers,
+        // PipeWire asking for one 1024-frame quantum per cycle. Writing the
+        // whole buffer queued ~256 ms of audio per sample.
+        assert_eq!(playback_frames(Some(1024), 12_288), 1024);
+        assert_eq!(playback_frames(Some(256), 8_192), 256);
+        // Rate matching can ask for an odd count; honour it exactly.
+        assert_eq!(playback_frames(Some(1_115), 8_192), 1_115);
+    }
+
+    #[test]
+    fn playback_frames_is_clamped_to_the_buffer() {
+        assert_eq!(playback_frames(Some(16_384), 8_192), 8_192);
+        assert_eq!(playback_frames(Some(u64::MAX), 8_192), 8_192);
+    }
+
+    #[test]
+    fn playback_falls_back_to_the_whole_buffer_without_a_suggestion() {
+        // `requested == 0` means "no suggestion" (PipeWire docs); `None` is a
+        // runtime older than the field. Both keep the pre-fix behaviour.
+        assert_eq!(playback_frames(Some(0), 8_192), 8_192);
+        assert_eq!(playback_frames(None, 8_192), 8_192);
+    }
+
+    #[test]
+    fn parses_libpipewire_versions() {
+        assert_eq!(parse_pw_version("1.6.2"), Some((1, 6, 2)));
+        assert_eq!(parse_pw_version("0.3.48"), Some((0, 3, 48)));
+        assert_eq!(parse_pw_version("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_pw_version("1.4.7-1ubuntu1"), Some((1, 4, 7)));
+        assert_eq!(parse_pw_version(""), None);
+        assert_eq!(parse_pw_version("garbage"), None);
+    }
+
+    #[test]
+    fn requested_is_only_trusted_from_0_3_50() {
+        let ok = version_fills_buffer_requested;
+        assert!(!ok("0.3.48"), "Ubuntu 22.04's PipeWire predates the field");
+        assert!(!ok("0.3.49"));
+        assert!(ok("0.3.50"));
+        assert!(ok("1.0.5"), "Ubuntu 24.04");
+        assert!(ok("1.6.2"));
+        assert!(!ok("not-a-version"), "unparsable must fall back safely");
     }
 }
