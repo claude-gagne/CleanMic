@@ -7,8 +7,10 @@ USAGE
   gen_signals.py --out DIR [--demo-dir REPO_ROOT/assets/demo]
 
 Writes 16-bit mono 48 kHz WAVs into DIR: speech.wav, speech_m40.wav,
-speech_dc.wav, silence_dc.wav, pink_m45.wav, speech_loop60.wav, plus a
-signals.json manifest (name, duration_s, rms_dbfs, dc per file).
+speech_dc.wav, silence_dc.wav, pink_m45.wav, speech_loop60.wav,
+speech_loop150.wav (quick 260924-n4s: >= 150 s, covers the swaps scenario's
+full 15-swap + 3-mode sequence), plus a signals.json manifest (name,
+duration_s, rms_dbfs, dc per file).
 
 EXIT CODES
   0  ok
@@ -118,6 +120,12 @@ def generate(out_dir: str, demo_dir: str) -> dict:
     silence_dc = np.full(int(10 * FS), 0.1)
     pink_m45 = _scale_to_dbfs(_pink_noise(20.0), -45.0)
     speech_loop60 = np.tile(speech, 3)
+    # quick 260924-n4s (R3): the swaps scenario's full 15-swap + 3-mode
+    # sequence runs to ~127 s (planning_evidence); speech_loop60 (~59 s) cut
+    # it off after only 8 of the 15 swaps. Tile enough repeats of `speech`
+    # to clear 150 s regardless of its own length.
+    loop150_reps = max(1, -(-150 // max(1, int(len(speech) / FS))))
+    speech_loop150 = np.tile(speech, loop150_reps)
 
     files = {
         "speech.wav": speech,
@@ -126,6 +134,7 @@ def generate(out_dir: str, demo_dir: str) -> dict:
         "silence_dc.wav": silence_dc,
         "pink_m45.wav": pink_m45,
         "speech_loop60.wav": speech_loop60,
+        "speech_loop150.wav": speech_loop150,
     }
 
     manifest = {}

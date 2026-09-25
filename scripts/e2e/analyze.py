@@ -338,6 +338,16 @@ _LOG_FALLBACK_RE = re.compile(r"^\[(\S+) [A-Z]+ +[^\]]*\] Engine fallback: (\w+)
 _LOG_PLUGIN_ABORT_RE = re.compile(r"Processing too slow! Please upgrade your CPU")
 _LOG_DFN_RESTART_RE = re.compile(r"DeepFilterNet: plugin fell behind real time")
 _LOG_DFN_GAVE_UP_RE = re.compile(r"DeepFilterNet cannot keep up with real time")
+# quick 260924-n4s (R1/R3): D-01's exact new log prefixes (src/audio.rs,
+# src/engine/deepfilter.rs) -- timestamped, so their span can be mapped to a
+# WAV-relative time the same way Task 1 maps holes (epoch_to_wav).
+_LOG_TROUBLE_SPAN_RE = re.compile(r"after ([\d.]+) s of sustained trouble")
+_LOG_DFN_BYPASS_RE = re.compile(r"DeepFilterNet: bypassing the plugin")
+_LOG_DFN_RECOVER_RE = re.compile(r"DeepFilterNet: plugin back to real time")
+_LOG_DFN_RESTART_TS_RE = re.compile(r"^\[(\S+) [A-Z]+ +[^\]]*\] DeepFilterNet: plugin fell behind real time", re.MULTILINE)
+_LOG_DFN_SHED_TS_RE = re.compile(r"^\[(\S+) [A-Z]+ +[^\]]*\] DeepFilterNet: shed (\d+) ms of accumulated plugin latency", re.MULTILINE)
+_LOG_SWAP_STARTED_RE = re.compile(r"^\[(\S+) [A-Z]+ +[^\]]*\] Engine swap started \(crossfading\)", re.MULTILINE)
+_LOG_MODE_SET_RE = re.compile(r"^\[(\S+) [A-Z]+ +[^\]]*\] Engine mode set to (\w+)", re.MULTILINE)
 
 
 def logscan(log_text: str) -> dict[str, Any]:
@@ -370,6 +380,17 @@ def logscan(log_text: str) -> dict[str, Any]:
         "plugin_aborts": len(_LOG_PLUGIN_ABORT_RE.findall(log_text)),
         "dfn_restarts": len(_LOG_DFN_RESTART_RE.findall(log_text)),
         "dfn_gave_up": len(_LOG_DFN_GAVE_UP_RE.findall(log_text)),
+        "trouble_span_s": [float(x) for x in _LOG_TROUBLE_SPAN_RE.findall(log_text)],
+        "dfn_bypass_entries": len(_LOG_DFN_BYPASS_RE.findall(log_text)),
+        "dfn_recoveries": len(_LOG_DFN_RECOVER_RE.findall(log_text)),
+        "dfn_restart_at": [t for t in (_log_epoch(ts) for ts in _LOG_DFN_RESTART_TS_RE.findall(log_text)) if t is not None],
+        "dfn_shed_at": [
+            (t, int(ms)) for ts, ms in _LOG_DFN_SHED_TS_RE.findall(log_text) if (t := _log_epoch(ts)) is not None
+        ],
+        "swap_started_at": [t for t in (_log_epoch(ts) for ts in _LOG_SWAP_STARTED_RE.findall(log_text)) if t is not None],
+        "mode_set_at": [
+            (t, mode) for ts, mode in _LOG_MODE_SET_RE.findall(log_text) if (t := _log_epoch(ts)) is not None
+        ],
     }
 
 
@@ -395,11 +416,39 @@ def _log_epoch(ts: str) -> float | None:
 # engine's steady-state latency is architectural, not host-load-dependent.
 SCHED_SENSITIVE = {"holes", "latency_spread_ms", "fell_behind"}
 
+# quick 260924-n4s (R1/R5, Task 3): every recording inside `stress`/`spike`
+# is taken adjacent to DELIBERATE synthetic CPU load by design -- a busy
+# host (this shared box's OTHER agents/builds/Syncthing, not just the
+# harness's own spinners) can plausibly move latency_ms/lag_corr/
+# dead_run_ms here even once the load has stopped, so a FAIL there is
+# downgraded to INCONCLUSIVE (see `evaluate_stress`/`evaluate_spike`) when
+# that specific recording was itself contended.
+_STRESS_SPIKE_SCENARIOS = {"stress", "spike"}
+_STRESS_SPIKE_EXTRA_SCHED_SENSITIVE = {"dead_run_ms", "latency_ms", "lag_corr"}
+
+# `baseline` real-world evidence (3-run stability check, 2026-09-24, this
+# shared machine): a single contended attempt can make the envelope xcorr
+# genuinely unmeasurable (lag_corr collapses), which is a HOST artifact, not
+# an engine defect -- yet lag_corr/latency_ms were deterministic for
+# baseline, so one unlucky attempt stopped the whole engine with a FAIL no
+# retry could recover from. Folding them into `decide_attempts`' own
+# majority-of-QUIET-attempts machinery (attempts.md's design, already used
+# for holes/latency_spread_ms/fell_behind) fixes this the same way: a
+# contended attempt's FAIL is evidence, not a vote, and the loop asks for
+# another attempt instead of giving up. This does NOT touch swaps pre/post,
+# toggle, modes, dc, or autogain -- their lag_corr/latency_ms stay strict.
+_BASELINE_SCENARIOS = {"baseline"}
+_BASELINE_EXTRA_SCHED_SENSITIVE = {"latency_ms", "lag_corr"}
+
 
 def is_sched_sensitive_metric(metric: str, measured: dict[str, Any]) -> bool:
     if metric in SCHED_SENSITIVE:
         return True
     if metric == "latency_ms" and str(measured.get("engine", "")) == "DeepFilterNet":
+        return True
+    if measured.get("scenario") in _STRESS_SPIKE_SCENARIOS and metric in _STRESS_SPIKE_EXTRA_SCHED_SENSITIVE:
+        return True
+    if measured.get("scenario") in _BASELINE_SCENARIOS and metric in _BASELINE_EXTRA_SCHED_SENSITIVE:
         return True
     return False
 
@@ -558,10 +607,17 @@ def evaluate_stress(
     app_alive: bool,
     load_start_epoch: float,
     recovery_max_s: float,
+    recovery_min_s: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Log/process-level verdicts for one `stress` run (the recording-level
     dead-output verdict is the `stress_load` measure rule). Returns check
-    dicts (kind=check) for the report."""
+    dicts (kind=check) for the report.
+
+    quick 260924-n4s (R1, D-01): `recovery_min_s` (== ENGINE_FALLBACK_GRACE
+    when the grace is in effect) makes an EARLY fallback a FAIL too -- a
+    recovery faster than the grace means the grace was not honoured. A
+    fallback logged BEFORE the synthetic load even started is INCONCLUSIVE
+    (the machine was already overloaded by something else), never PASS."""
     rows: list[dict[str, Any]] = []
 
     def row(metric: str, value: Any, desc: str, result: str, note: str = "") -> None:
@@ -570,24 +626,75 @@ def evaluate_stress(
     row("app_alive", "yes" if app_alive else "DIED", "== yes", "PASS" if app_alive else "FAIL")
     aborts = logscan_result.get("plugin_aborts", 0)
     row("plugin_abort_lines", aborts, "== 0", "PASS" if aborts == 0 else "FAIL", "vendored DeepFilterNet 'Processing too slow!' panic")
+    desc = f"{recovery_min_s} <= x <= {recovery_max_s}"
     fallbacks = logscan_result.get("fallbacks", [])
     if fallbacks:
         first = fallbacks[0]
         t = first.get("t")
         if t is None:
-            row("recovery_s", "unparsable", f"<= {recovery_max_s}", "FAIL")
+            row("recovery_s", "unparsable", desc, "FAIL")
+        elif t < load_start_epoch:
+            # The machine was already too busy for the engine before the
+            # synthetic load began (e.g. someone else's build): this run's
+            # recovery timing tells us nothing about the grace.
+            note = f"{first['from']} -> {first['to']} ({first['reason']}); before the synthetic load started (machine already overloaded)"
+            row("recovery_s", "n/a", desc, "INCONCLUSIVE", note)
         else:
             note = f"{first['from']} -> {first['to']} ({first['reason']})"
-            if t < load_start_epoch:
-                # The machine was already too busy for the engine before the
-                # synthetic load began (e.g. someone else's build): recovery
-                # happened even earlier.
-                note += "; before the synthetic load started (machine already overloaded)"
-            rec = round(max(0.0, t - load_start_epoch), 2)
-            row("recovery_s", rec, f"<= {recovery_max_s}", "PASS" if rec <= recovery_max_s else "FAIL", note)
+            rec = round(t - load_start_epoch, 2)
+            ok = recovery_min_s <= rec <= recovery_max_s
+            row("recovery_s", rec, desc, "PASS" if ok else "FAIL", note)
     else:
-        row("recovery_s", "no fallback", f"<= {recovery_max_s}", "INFO", "engine kept up (no runtime fallback logged)")
+        row("recovery_s", "no fallback", desc, "INFO", "engine kept up (no runtime fallback logged)")
     row("dfn_restarts", logscan_result.get("dfn_restarts", 0), "(informational)", "INFO")
+    spans = logscan_result.get("trouble_span_s", [])
+    if spans:
+        row("trouble_sustained_s", spans[0], "(informational)", "INFO")
+    row("dfn_bypass_entries", logscan_result.get("dfn_bypass_entries", 0), "(informational)", "INFO")
+    row("dfn_recoveries", logscan_result.get("dfn_recoveries", 0), "(informational)", "INFO")
+    row("dfn_sheds", len(logscan_result.get("dfn_shed_at", [])), "(informational)", "INFO")
+    return rows
+
+
+def evaluate_spike(
+    logscan_result: dict[str, Any],
+    app_alive: bool,
+    launched_engine: str,
+    contended: bool = False,
+) -> list[dict[str, Any]]:
+    """Log/process-level verdicts for the `spike` scenario (R1): a short
+    1.3 s burst must never trigger a runtime fallback, never abort the
+    plugin, and must leave the launched engine still active.
+
+    `contended` (the load recording's OWN contention verdict, R5): a
+    fallback IS the grace mechanism correctly reacting to genuinely
+    sustained trouble -- if that trouble outlasted the synthetic burst
+    because the shared host was ALSO busy, this isn't evidence the grace
+    failed on a clean, isolated 1.3 s spike. Downgrades a fallback/wrong-
+    end-engine FAIL to INCONCLUSIVE rather than PASS -- it's still not a
+    confirmed clean spike."""
+    rows: list[dict[str, Any]] = []
+
+    def row(metric: str, value: Any, desc: str, result: str, note: str = "") -> None:
+        rows.append({"kind": "check", "metric": metric, "value": value, "threshold_desc": desc, "result": result, "note": note})
+
+    fallbacks = logscan_result.get("fallbacks", [])
+    note = "; ".join(f"{f['from']} -> {f['to']} ({f['reason']})" for f in fallbacks)
+    fb_result = "PASS" if not fallbacks else "FAIL"
+    if fallbacks and contended:
+        fb_result = "INCONCLUSIVE"
+        note += "; recording was contended -- cannot isolate the synthetic burst from real ambient load"
+    row("fallback_during_spike", len(fallbacks), "== 0", fb_result, note)
+    row("app_alive", "yes" if app_alive else "DIED", "== yes", "PASS" if app_alive else "FAIL")
+    aborts = logscan_result.get("plugin_aborts", 0)
+    row("plugin_abort_lines", aborts, "== 0", "PASS" if aborts == 0 else "FAIL")
+    active = active_engine_after(logscan_result, launched_engine)
+    end_result = "PASS" if active == launched_engine else "FAIL"
+    end_note = ""
+    if active != launched_engine and contended:
+        end_result = "INCONCLUSIVE"
+        end_note = "recording was contended -- cannot isolate the synthetic burst from real ambient load"
+    row("end_engine", active, f"== {launched_engine}", end_result, end_note)
     return rows
 
 
@@ -596,6 +703,80 @@ def active_engine_after(logscan_result: dict[str, Any], started_with: str) -> st
     target, else `started_with`."""
     fallbacks = logscan_result.get("fallbacks", [])
     return fallbacks[-1]["to"] if fallbacks else started_with
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (R3): per-swap zero-run attribution over the full swap sequence.
+# ---------------------------------------------------------------------------
+
+
+def epoch_to_wav(epoch: float, rec_link_epoch: float, source_onset_s: float) -> float:
+    """Inverse of `hole_epoch` (input_onset_wav_s=0 convention): map a
+    wall-clock log epoch back to the WAV-relative timeline `zero_runs`/
+    `hole_times_s` use (seconds since the recording's input-active-region
+    start)."""
+    return epoch - rec_link_epoch - source_onset_s
+
+
+def swap_attribution(
+    zero_runs_list: list[tuple[int, int]],
+    fs: int,
+    swap_events: list[tuple[float, str, str]],
+    dfn_restart_t_wav: list[float],
+    dfn_shed_t_wav: list[float],
+    swap_window_s: float = 0.6,
+    dfn_window_s: float = 0.15,
+    hole_attribution: list[dict[str, Any]] | None = None,
+    hole_match_window_s: float = 0.05,
+) -> list[dict[str, Any]]:
+    """Classify every zero run (start_sample, length) from `zero_runs()`
+    against the (t_wav, engine, mode) of every swap INSIDE the speech,
+    already excluding swaps whose instant lies outside it:
+
+    - a run starting at sample 0 is `leading` (pipeline latency, not a swap);
+    - one within [swap_t, swap_t + swap_window_s] of a swap is `swap`,
+      attributed to that swap's (engine, mode);
+    - a <= 480-sample run within +/- dfn_window_s of a DFN restart is
+      `dfn_underrun`;
+    - one within +/- dfn_window_s of a DFN shed is `dfn_shed`;
+    - anything else is `unattributed`, annotated with Task 1's own host
+      evidence (`hole_attribution`, from `attribute_holes()`) for the
+      nearest hole within `hole_match_window_s`, when one is given.
+    """
+    out: list[dict[str, Any]] = []
+    swaps_sorted = sorted(swap_events, key=lambda s: s[0])
+    holes_sorted = sorted(hole_attribution or [], key=lambda h: h["t_wav"])
+    for start, length in zero_runs_list:
+        t_wav = round(start / fs, 3)
+        ms = round(length / fs * 1000, 1)
+        if start == 0:
+            out.append({"t": t_wav, "ms": ms, "class": "leading", "engine": None, "mode": None})
+            continue
+        matched = next((s for s in swaps_sorted if s[0] <= t_wav <= s[0] + swap_window_s), None)
+        if matched is not None:
+            out.append({"t": t_wav, "ms": ms, "class": "swap", "engine": matched[1], "mode": matched[2]})
+            continue
+        if length <= 480 and any(abs(t_wav - r) <= dfn_window_s for r in dfn_restart_t_wav):
+            out.append({"t": t_wav, "ms": ms, "class": "dfn_underrun", "engine": None, "mode": None})
+            continue
+        if any(abs(t_wav - r) <= dfn_window_s for r in dfn_shed_t_wav):
+            out.append({"t": t_wav, "ms": ms, "class": "dfn_shed", "engine": None, "mode": None})
+            continue
+        nearest = min(holes_sorted, key=lambda h: abs(h["t_wav"] - t_wav), default=None)
+        host_evidence = (
+            nearest["class"] if nearest is not None and abs(nearest["t_wav"] - t_wav) <= hole_match_window_s else None
+        )
+        out.append({"t": t_wav, "ms": ms, "class": "unattributed", "engine": None, "mode": None, "host_evidence": host_evidence})
+    return out
+
+
+def swap_attribution_summary(attributed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Total zero ms per attribution class, plus the swap-class-only total
+    the budget check applies to."""
+    by_class: dict[str, float] = {}
+    for a in attributed:
+        by_class[a["class"]] = round(by_class.get(a["class"], 0.0) + a["ms"], 1)
+    return {"by_class_ms": by_class, "swap_class_ms": by_class.get("swap", 0.0)}
 
 
 def evaluate_swap_sequence(expected: list[tuple[str, str]], logged: list[tuple[str, str]]) -> tuple[str, str]:
@@ -1328,7 +1509,19 @@ def cmd_log_check(args: argparse.Namespace) -> int:
 def cmd_stress_check(args: argparse.Namespace) -> int:
     with open(args.logscan, encoding="utf-8") as fh:
         scanned = json.load(fh)
-    rows = evaluate_stress(scanned, args.app_alive == "yes", args.load_start, args.recovery_max_s)
+    rows = evaluate_stress(scanned, args.app_alive == "yes", args.load_start, args.recovery_max_s, args.recovery_min_s)
+    for r in rows:
+        r["scenario"] = args.scenario
+        r["recording"] = args.recording
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, indent=2)
+    return 0
+
+
+def cmd_spike_check(args: argparse.Namespace) -> int:
+    with open(args.logscan, encoding="utf-8") as fh:
+        scanned = json.load(fh)
+    rows = evaluate_spike(scanned, args.app_alive == "yes", args.launched_engine, args.contended)
     for r in rows:
         r["scenario"] = args.scenario
         r["recording"] = args.recording
@@ -1341,6 +1534,60 @@ def cmd_active_engine(args: argparse.Namespace) -> int:
     with open(args.logscan, encoding="utf-8") as fh:
         scanned = json.load(fh)
     print(active_engine_after(scanned, args.started_with))
+    return 0
+
+
+def cmd_swap_attribution(args: argparse.Namespace) -> int:
+    with open(args.logscan, encoding="utf-8") as fh:
+        scanned = json.load(fh)
+    x, fs = read_wav(args.wav)
+    if x.shape[1] < 2:
+        raise ValueError(f"expected a 2-channel recording (input, output): {args.wav}")
+    inp, out = x[:, 0], x[:, 1]
+    start, end = active_region(inp)
+    out_active = out[start:end]
+    zr = zero_runs(out_active)
+    duration_s = len(out_active) / fs
+
+    # 15 (engine, mode) pairs, in order -- the ENGINE swaps only (matches
+    # `swap-check`'s --expected; scenario_swaps' swaps.expected file).
+    engine_pairs = [tuple(p.split(":", 1)) for p in args.expected.split(",") if p]
+    swap_wavs = [epoch_to_wav(t, args.rec_link_epoch, args.source_onset_s) for t in scanned.get("swap_started_at", [])]
+    swap_events: list[tuple[float, str, str]] = [
+        (t_wav, engine, mode)
+        for t_wav, (engine, mode) in zip(swap_wavs, engine_pairs)
+        if 0 <= t_wav <= duration_s
+    ]
+
+    # Mode changes: --mode-change-after N means "after N completed engine
+    # swaps" (1-indexed) -- the engine active at that point is engine_pairs
+    # [N-1][0]; the target mode itself comes straight from the log line.
+    mode_events = scanned.get("mode_set_at", [])
+    for (t_epoch, logged_mode), after_n in zip(mode_events, args.mode_change_after):
+        t_wav = epoch_to_wav(t_epoch, args.rec_link_epoch, args.source_onset_s)
+        if 0 <= t_wav <= duration_s and 1 <= after_n <= len(engine_pairs):
+            swap_events.append((t_wav, engine_pairs[after_n - 1][0], logged_mode))
+
+    dfn_restart_t_wav = [epoch_to_wav(t, args.rec_link_epoch, args.source_onset_s) for t in scanned.get("dfn_restart_at", [])]
+    dfn_shed_t_wav = [epoch_to_wav(t, args.rec_link_epoch, args.source_onset_s) for t, _ms in scanned.get("dfn_shed_at", [])]
+
+    hole_attribution = None
+    if args.measured_json:
+        with open(args.measured_json, encoding="utf-8") as fh:
+            hole_attribution = json.load(fh).get("hole_attribution")
+
+    attributed = swap_attribution(zr, fs, swap_events, dfn_restart_t_wav, dfn_shed_t_wav, hole_attribution=hole_attribution)
+    summary = swap_attribution_summary(attributed)
+    result = {
+        "scenario": args.scenario,
+        "recording": args.recording,
+        "kind": "swap_attribution",
+        "swaps_in_speech": len(swap_events),
+        "rows": attributed,
+        **summary,
+    }
+    with open(args.json_out, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
     return 0
 
 
@@ -1463,9 +1710,34 @@ def main(argv: list[str] | None = None) -> int:
     p_stress.add_argument("--app-alive", required=True, choices=["yes", "no"])
     p_stress.add_argument("--load-start", type=float, required=True, help="Unix epoch the load started")
     p_stress.add_argument("--recovery-max-s", type=float, required=True)
+    p_stress.add_argument("--recovery-min-s", type=float, default=0.0)
     p_stress.add_argument("--scenario", required=True)
     p_stress.add_argument("--recording", required=True)
     p_stress.add_argument("--json-out", required=True)
+
+    p_spike = sub.add_parser("spike-check")
+    p_spike.add_argument("--logscan", required=True)
+    p_spike.add_argument("--app-alive", required=True, choices=["yes", "no"])
+    p_spike.add_argument("--launched-engine", required=True)
+    p_spike.add_argument("--contended", action="store_true", help="the load recording's own contention verdict (R5)")
+    p_spike.add_argument("--scenario", required=True)
+    p_spike.add_argument("--recording", required=True)
+    p_spike.add_argument("--json-out", required=True)
+
+    p_swapattr = sub.add_parser("swap-attribution")
+    p_swapattr.add_argument("wav")
+    p_swapattr.add_argument("--logscan", required=True)
+    p_swapattr.add_argument("--expected", required=True, help="comma-separated Engine:Mode pairs")
+    p_swapattr.add_argument(
+        "--mode-change-after", type=lambda s: [int(x) for x in s.split(",") if x], default=[],
+        help="1-indexed counts of completed engine swaps after which a mode change happened",
+    )
+    p_swapattr.add_argument("--rec-link-epoch", type=float, required=True)
+    p_swapattr.add_argument("--source-onset-s", type=float, default=0.0)
+    p_swapattr.add_argument("--measured-json", default=None, help="the recording's own `measure`d JSON, for Task 1 host evidence on unattributed runs")
+    p_swapattr.add_argument("--scenario", required=True)
+    p_swapattr.add_argument("--recording", required=True)
+    p_swapattr.add_argument("--json-out", required=True)
 
     p_active = sub.add_parser("active-engine")
     p_active.add_argument("--logscan", required=True)
@@ -1499,6 +1771,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_log_check(args)
         if args.cmd == "stress-check":
             return cmd_stress_check(args)
+        if args.cmd == "spike-check":
+            return cmd_spike_check(args)
+        if args.cmd == "swap-attribution":
+            return cmd_swap_attribution(args)
         if args.cmd == "active-engine":
             return cmd_active_engine(args)
         if args.cmd == "attempts":

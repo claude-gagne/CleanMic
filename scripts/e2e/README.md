@@ -192,21 +192,25 @@ After any layout change (new row, wrapped subtitle, reordered engines):
 **Signals** (`scripts/e2e/gen_signals.py`, from `assets/demo/*-before.wav`):
 `speech.wav` (native level), `speech_m40.wav` (-40 dBFS, tiled), `speech_dc.wav`
 (+0.1 DC), `silence_dc.wav` (10 s of 0.1), `pink_m45.wav` (-45 dBFS pink
-noise), `speech_loop60.wav` (tiled ×3, for the swaps-during recording).
+noise), `speech_loop60.wav` (tiled ×3), `speech_loop150.wav` (tiled to
+>= 150 s — quick 260924-n4s: covers the swaps scenario's full 15-swap +
+3-mode sequence, which runs to ~127 s; `speech_loop60` used to cut it off
+after only 8 of 15 swaps).
 
 **Scenarios:**
 
 | Scenario | What it does |
 | --- | --- |
-| `baseline` | One fresh launch + recording per `$BASELINE_ENGINES` entry (default: Dpdfnet2, Dpdfnet8, DeepFilterNet, RNNoise). An engine this build doesn't have is SKIP, not FAIL. |
-| `swaps` | Pre/during(15 live engine swaps + 3 mode changes, driven concurrently with a 60 s playback)/post recordings, the logged swap-sequence check, and the pre-vs-post latency drift check |
+| `baseline` | An attempts loop (up to `$E2E_MAX_ATTEMPTS`) per `$BASELINE_ENGINES` entry (default: Dpdfnet2, Dpdfnet8, DeepFilterNet, RNNoise): fresh launch, an unrecorded `$BASELINE_PREROLL_S`-second pre-roll, then a recording. An engine this build doesn't have is SKIP, not FAIL. See "Load-aware verdict" below. |
+| `swaps` | Pre/during(15 live engine swaps + 3 mode changes, driven concurrently with a `speech_loop150.wav` playback)/post recordings, the logged swap-sequence check, per-swap zero-run attribution (leading/swap/dfn_underrun/dfn_shed/unattributed), and the pre-vs-post latency drift check |
 | `toggle` | Pre, Activer/Enable off (5.8 s) then on, `check-layout`, post; drift check; "≥2 Discarded lines after restart" check |
 | `modes` | LowCpu, Balanced, LowCpu, Balanced; each mode's own latency allowance, plus a same-mode-repeat drift check |
 | `dc` | Speech+DC and silence+DC; both must show the DC blocker removing the offset |
 | `autogain` | ON boosts a quiet (-40 dBFS) mic; OFF is near-unity; ON vs OFF must not audibly pump steady pink noise |
-| `stress` | Per `$STRESS_ENGINES` entry (default DeepFilterNet): fresh launch, settle, then **controlled synthetic CPU load** — every thread of the harness's own CleanMic pinned (`taskset -a`) to one CPU next to `$STRESS_SPINNERS` busy loops — while recording; unload; record again. Asserts the app survives, the vendored DeepFilterNet plugin never reaches its "Processing too slow!" abort, the mic never goes dead (`dead_run_ms`), a runtime fallback (if any) lands within `$STRESS_RECOVERY_MAX_S`, and the post-load recording passes the normal speech rules for whichever engine is then active. Spinners are killed and the app's affinity restored on every exit path. |
+| `stress` | Per `$STRESS_ENGINES` entry (default DeepFilterNet): fresh launch, settle, then **controlled synthetic CPU load** — every thread of the harness's own CleanMic pinned (`taskset -a`) to one CPU next to `$STRESS_SPINNERS` busy loops — while recording; unload; record again. Asserts the app survives, the vendored DeepFilterNet plugin never reaches its "Processing too slow!" abort, the mic never goes dead (`dead_run_ms`), a runtime fallback (if any) lands in `[$STRESS_RECOVERY_MIN_S, $STRESS_RECOVERY_MAX_S]` (D-01: too EARLY is now a FAIL too — the 5 s grace was not honoured), and the post-load recording passes the normal speech rules for whichever engine is then active. Spinners are killed and the app's affinity restored on every exit path. |
+| `spike` | D-01's counterpart to `stress`: per `$SPIKE_ENGINES` entry (default DeepFilterNet, Dpdfnet8), a short `$SPIKE_BURST_S` (1.3 s) CPU burst — `$SPIKE_SPINNERS` (12) busy loops pinned with the app, each self-terminating via `timeout` even if the harness dies — must NEVER trigger a runtime fallback. Asserts zero `Engine fallback:` lines, the app survives, no plugin abort, the mic never goes dead, and the engine selector still shows the launched engine at the end. |
 | `monitor` (needs `--monitor-null-sink`) | `CleanMic-monitor` routed ONLY to a second, audited, RDP-safe null-sink loopback |
-| `all` | `baseline swaps toggle modes dc autogain stress`, plus `monitor` when `--monitor-null-sink` is given |
+| `all` | `baseline swaps toggle modes dc autogain stress spike`, plus `monitor` when `--monitor-null-sink` is given |
 
 **Metrics** (`scripts/e2e/analyze.py`): `latency_ms`/`lag_corr` (band-passed
 log-envelope cross-correlation, ±5 ms accuracy), `latency_spread_ms` (drift

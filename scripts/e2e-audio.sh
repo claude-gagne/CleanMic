@@ -15,7 +15,7 @@
 # config, and without ever touching their real CleanMic.
 #
 # USAGE
-#   scripts/e2e-audio.sh [options] <baseline|swaps|toggle|modes|dc|autogain|stress|monitor|all>...
+#   scripts/e2e-audio.sh [options] <baseline|swaps|toggle|modes|dc|autogain|stress|spike|monitor|all>...
 #
 # OPTIONS
 #   --out DIR             must not exist, or must be empty (default:
@@ -79,6 +79,11 @@ err() { echo "[e2e] $*" >&2; }
 # 2026-09-24; ~65 ms + 10 ms per underrun). The underrun guard
 # (src/engine/deepfilter.rs) restarts the plugin before an 8th, so the
 # plugin can add at most 70 ms: ~65 + 70 = 135 -> 140.
+# quick 260924-n4s (R4): a one-time post-calm re-instantiation ("shed") was
+# tried to remove that per-underrun latency. Measured on quiet, comparable
+# (0 holes) baseline attempts: 130 ms pre-change vs 123 ms with the shed --
+# a ~7 ms drop, well under the plan's 20 ms bar. Per the decision rule the
+# shed was REMOVED (src/engine/deepfilter.rs); this threshold is unchanged.
 : "${LATENCY_MAX_MS_DEEPFILTERNET:=140}"
 # Balanced/LowCpu allowance on top of the engine's MaxQuality threshold.
 # Derived from src/engine/dpdfnet.rs's decimation ratios (Balanced=2,
@@ -111,7 +116,21 @@ err() { echo "[e2e] $*" >&2; }
 # signature. The 2026-09-24 DeepFilterNet crash scored 13150 ms; a healthy
 # quiet run scores 0-10 ms (an isolated plugin gap).
 : "${DEAD_RUN_MAX_MS:=200}"
-: "${SWAP_ZERO_MS_PER_SWAP_MAX:=20}"       # a known ~10 ms silent block per engine swap (crossfade), times headroom
+# R3: swap-CLASS zero ms only (swap_attribution), not the whole recording.
+# The crossfade warm-up hold (src/audio.rs) closed the ~380-465 ms whole-
+# recording defect this budget used to guard against; four full 15-swap +
+# 3-mode runs on the rebuilt AppImage (2026-09-24, target/n4s-verify/
+# t3_green{,2,3}, t3_swaps_final) measured 70.0/86.6/116.7/121.3 ms total
+# swap-class zero ms across 18 swap events each -- max ~6.7 ms/swap. 15 ms
+# is a healthy margin over that, still well under the "never above 20" cap.
+: "${SWAP_ZERO_MS_PER_SWAP_MAX:=15}"
+# R3: zero ms swap_attribution could not explain (not leading, not a swap,
+# not a DFN underrun/shed) -- mostly isolated DeepFilterNet underruns that
+# never reach UNDERRUN_BUDGET (so no timestamped restart/shed log line ever
+# fires for them; see Task 1's `hole_attribution` for what host evidence IS
+# available). Measured 90.7-240.8 ms across the same four runs; a genuine
+# host-scheduling artifact still downgrades a FAIL here to INCONCLUSIVE.
+: "${SWAP_UNATTRIBUTED_MS_MAX:=300}"
 : "${OUT_DC_MAX:=0.001}"                   # the DC blocker should remove essentially all offset
 : "${SILENCE_OUT_MAX_DB:=-60}"             # processed silence should stay near the noise floor
 : "${AUTOGAIN_MIN_BOOST_DB:=10}"           # auto-gain must audibly help a -40 dBFS mic
@@ -146,12 +165,34 @@ err() { echo "[e2e] $*" >&2; }
 # DeepFilterNet inserts isolated 10 ms plugin gaps before it hands over; the
 # pre-fix crash produced a 15 s dead run.
 : "${STRESS_DEAD_RUN_MAX_MS:=200}"
+# quick 260924-n4s (D-01): a fallback FASTER than the grace means the grace
+# was not honoured -- an earlier fallback is now a FAIL, not a pass. Equal to
+# ENGINE_FALLBACK_GRACE (src/audio.rs); re-derived from measurements in
+# Task 3 if the two ever need to diverge.
+: "${STRESS_RECOVERY_MIN_S:=5}"
 # From load start to the logged "Engine fallback: X -> Y", when one happens.
-# The guard gives up ~1 s after sustained overload (tests/deepfilter_overload.rs);
-# the GTK main loop is starved too, so allow several seconds.
-: "${STRESS_RECOVERY_MAX_S:=10}"
+# D-01: about 1-1.5 s to enter Bypass, + the 5 s grace, + app handling on a
+# starved GTK loop. Measured on the rebuilt AppImage (2026-09-24, three runs
+# each): DeepFilterNet 7.08-7.42 s, Dpdfnet8 5.63-6.37 s -- 12 keeps a
+# healthy margin over the observed max (7.42 s) without narrowing it enough
+# to risk flakiness on this shared machine.
+: "${STRESS_RECOVERY_MAX_S:=12}"
 # Under deliberate load the audio thread itself may fall behind: informational.
 : "${STRESS_LOG_FELL_BEHIND_MAX:=1000000}"
+
+# `spike` scenario (R1, D-01): a short CPU burst must NEVER trigger a
+# runtime fallback -- the counterpart to `stress`'s sustained overload.
+# DeepFilterNet exercises the guard's Bypass/Shadow path; Dpdfnet8 exercises
+# the generic capture-backlog trim path (both share ENGINE_FALLBACK_GRACE).
+: "${SPIKE_ENGINES:=DeepFilterNet Dpdfnet8}"
+: "${SPIKE_SPINNERS:=12}"                  # matches tests/deepfilter_overload.rs's starved-worker repro
+: "${SPIKE_BURST_S:=1.3}"                  # well under ENGINE_FALLBACK_GRACE (5s)
+: "${SPIKE_AT_S:=4}"                       # let startup settle before the burst
+: "${SPIKE_DEAD_RUN_MAX_MS:=200}"          # same invariant as STRESS_DEAD_RUN_MAX_MS
+# Under a deliberate 12-spinner burst the audio thread WILL fall behind
+# (that trim path is exactly what the burst exercises): informational, like
+# STRESS_LOG_FELL_BEHIND_MAX.
+: "${SPIKE_LOG_FELL_BEHIND_MAX:=1000000}"
 
 : "${E2E_DISPLAY:=:47}"
 : "${E2E_LANG:=fr}"
@@ -180,7 +221,7 @@ err() { echo "[e2e] $*" >&2; }
 : "${SAMPLER_SCAN_S:=1.0}"                 # slow (whole-/proc) scan cadence -- a full /proc walk is not free
 : "${BASELINE_PREROLL_S:=8}"               # unrecorded warm-up before each baseline attempt (DFN's first-speech underruns)
 
-KNOWN_SCENARIOS="baseline swaps toggle modes dc autogain stress monitor all"
+KNOWN_SCENARIOS="baseline swaps toggle modes dc autogain stress spike monitor all"
 
 # ---------------------------------------------------------------------------
 # Option parsing
@@ -207,7 +248,7 @@ while [ "$#" -gt 0 ]; do
       sed -n '2,45p' "$0"
       exit 0
       ;;
-    baseline | swaps | toggle | modes | dc | autogain | stress | monitor | all)
+    baseline | swaps | toggle | modes | dc | autogain | stress | spike | monitor | all)
       SCENARIOS+=("$1"); shift
       ;;
     *)
@@ -280,6 +321,8 @@ declare -a THRESHOLD_ARGS=(
   --threshold "load_flag_busy_pct=$LOAD_FLAG_BUSY_PCT"
   --threshold "stress_dead_run_max_ms=$STRESS_DEAD_RUN_MAX_MS"
   --threshold "stress_recovery_max_s=$STRESS_RECOVERY_MAX_S"
+  --threshold "stress_recovery_min_s=$STRESS_RECOVERY_MIN_S"
+  --threshold "spike_dead_run_max_ms=$SPIKE_DEAD_RUN_MAX_MS"
   --threshold "e2e_max_attempts=$E2E_MAX_ATTEMPTS"
   --threshold "quiet_other_busy_pct=$QUIET_OTHER_BUSY_PCT"
   --threshold "contended_other_busy_pct=$CONTENDED_OTHER_BUSY_PCT"
@@ -361,6 +404,7 @@ on_exit() {
   fi
   CLEANUP_DONE=1
   stop_cpu_load
+  stop_spike_spinners
   stop_sampler
   [ -n "$RECORDER_PID" ] && kill -INT "$RECORDER_PID" 2>/dev/null
   [ -n "$PLAYER_PID" ] && kill -TERM "$PLAYER_PID" 2>/dev/null
@@ -443,6 +487,23 @@ stop_cpu_load() {
     taskset -a -p -c "0-$(( $(nproc) - 1 ))" "$LOAD_APP_PID" >/dev/null 2>&1 || true
   fi
   LOAD_APP_PID=""
+}
+
+# stop_spike_spinners -- backstop for the `spike` scenario's spinners (T-n4s-02):
+# each is already started under `timeout SPIKE_BURST_S`, so it self-terminates
+# even if this script is killed mid-burst; this just sweeps any PID files left
+# behind (cmdline-verified before killing) so nothing lingers into the next
+# scenario. Safe to call any number of times, on any exit path.
+stop_spike_spinners() {
+  local f pid
+  for f in "$OUT"/harness/spike_*_spinners.pids; do
+    [ -f "$f" ] || continue
+    for pid in $(cat "$f" 2>/dev/null || true); do
+      if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$LOAD_SPINNER_CMD"; then
+        kill "$pid" 2>/dev/null || true
+      fi
+    done
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -940,9 +1001,23 @@ scenario_baseline() {
     done
     [ -s "$aggregate_json" ] && MEASURED_JSON+=("$aggregate_json")
 
+    # R5: `fell_behind` is a log-check (spans the WHOLE session's app.log,
+    # not one recording), so it can't go through decide_attempts' per-
+    # recording contention downgrade. If ANY attempt for this engine was
+    # itself flagged contended, a few real capture-backlog trims are
+    # expected on this shared machine -- same allowance stress/spike already
+    # get, not a loosened bar for a genuinely quiet run.
+    local any_attempt_contended="False" aj
+    for aj in "${attempt_jsons[@]}"; do
+      c="$(python3 -c "import json; print(json.load(open('$aj')).get('contention',{}).get('contended', False))" 2>/dev/null || echo False)"
+      [ "$c" = "True" ] && any_attempt_contended="True"
+    done
+    local baseline_fell_behind_max="$LOG_FELL_BEHIND_MAX"
+    [ "$any_attempt_contended" = "True" ] && baseline_fell_behind_max="$STRESS_LOG_FELL_BEHIND_MAX"
+
     run_nested stop "$DISPLAY_ARG"
     cp "$APP_LOG" "$OUT/logs/baseline_${engine}.log" 2>/dev/null || true
-    scenario_log_checks baseline "baseline_${engine}" "$APP_LOG"
+    scenario_log_checks baseline "baseline_${engine}" "$APP_LOG" "$baseline_fell_behind_max"
   done
 }
 
@@ -1019,7 +1094,11 @@ scenario_swaps() {
   # breaks the single fixed-lag correlation), and a `holes` count > 0 is
   # EXPECTED (one brief gap per swap) rather than a defect -- both are
   # covered instead by the swap-count-scaled budget checks right below.
-  record_pair swaps_during "$OUT/signals/speech_loop60.wav" "CleanMic:capture_MONO" _swaps_driver
+  # speech_loop150.wav (>= 150s) covers the full 15-swap + 3-mode sequence
+  # (~127s); speech_loop60 (~59s) used to cut it off after only 8 of 15.
+  local swaps_rec_link_epoch
+  record_pair swaps_during "$OUT/signals/speech_loop150.wav" "CleanMic:capture_MONO" _swaps_driver
+  swaps_rec_link_epoch="$REC_LINK_EPOCH"
   measure_and_add swaps swaps_during swaps_during --meta "engine=Dpdfnet2" --meta "mode=MaxQuality"
 
   local logscan_json="$OUT/logs/swaps_during.logscan.json"
@@ -1029,19 +1108,64 @@ scenario_swaps() {
     --scenario swaps --recording swaps_sequence --json-out "$OUT/rec/swaps_sequence.json" || true
   [ -s "$OUT/rec/swaps_sequence.json" ] && MEASURED_JSON+=("$OUT/rec/swaps_sequence.json")
 
+  # R3: attribute every zero run (leading/swap/dfn_underrun/dfn_shed/
+  # unattributed) instead of one whole-recording budget; the SWAP_ZERO_MS_
+  # PER_SWAP_MAX budget applies only to the swap-class total.
+  local attr_json="$OUT/rec/swaps_attribution.json"
+  python3 "$E2E_DIR/analyze.py" swap-attribution "$OUT/rec/swaps_during.wav" \
+    --logscan "$logscan_json" --expected "$expected" --mode-change-after 4,9,14 \
+    --rec-link-epoch "$swaps_rec_link_epoch" --source-onset-s 0 \
+    --measured-json "$OUT/rec/swaps_during.json" \
+    --scenario swaps --recording swaps_attribution --json-out "$attr_json" || true
+
   local num_swaps; num_swaps="$(echo "$SWAPS_ENGINE_SEQUENCE" | wc -w)"
-  local zero_budget; zero_budget=$(python3 -c "print($num_swaps * $SWAP_ZERO_MS_PER_SWAP_MAX)")
-  local zero_ms=0
-  zero_ms="$(python3 -c "
+  local swaps_in_speech="$num_swaps" swap_ms=0
+  if [ -s "$attr_json" ]; then
+    swaps_in_speech="$(python3 -c "import json; print(json.load(open('$attr_json'))['swaps_in_speech'])" 2>/dev/null || echo "$num_swaps")"
+    swap_ms="$(python3 -c "import json; print(json.load(open('$attr_json'))['swap_class_ms'])" 2>/dev/null || echo 0)"
+    # Per-swap and per-class rows are INFO (the whole attribution is
+    # evidence, not itself a pass/fail row).
+    python3 -c "
 import json
-print(json.load(open('$OUT/rec/swaps_during.json')).get('zero_run_ms', 0))
-" 2>/dev/null || echo 0)"
+d = json.load(open('$attr_json'))
+print('swap attribution by class:', d['by_class_ms'])
+for r in d['rows']:
+    print(f\"  t={r['t']:.2f}s ms={r['ms']} class={r['class']} engine={r.get('engine')} mode={r.get('mode')} host_evidence={r.get('host_evidence')}\")
+" >>"$OUT/logs/swaps_attribution.txt" 2>/dev/null || true
+  fi
+  python3 "$E2E_DIR/analyze.py" check --scenario swaps --recording swaps_attribution \
+    --metric swap_attribution --value "swaps_in_speech=$swaps_in_speech swap_class_ms=$swap_ms" \
+    --threshold-desc "(informational; see swaps_zero_budget)" --result INFO \
+    --json-out "$OUT/rec/swaps_attribution_info.json"
+  MEASURED_JSON+=("$OUT/rec/swaps_attribution_info.json")
+
+  local zero_budget; zero_budget=$(python3 -c "print($swaps_in_speech * $SWAP_ZERO_MS_PER_SWAP_MAX)")
   local zresult="PASS"
-  python3 -c "raise SystemExit(0 if $zero_ms <= $zero_budget else 1)" 2>/dev/null || zresult="FAIL"
+  python3 -c "raise SystemExit(0 if $swap_ms <= $zero_budget else 1)" 2>/dev/null || zresult="FAIL"
   python3 "$E2E_DIR/analyze.py" check --scenario swaps --recording swaps_during \
-    --metric zero_run_ms_budget --value "$zero_ms" --threshold-desc "<= $zero_budget" \
+    --metric swap_zero_ms_budget --value "$swap_ms" --threshold-desc "<= $zero_budget (swap-class only)" \
     --result "$zresult" --json-out "$OUT/rec/swaps_zero_budget.json"
   MEASURED_JSON+=("$OUT/rec/swaps_zero_budget.json")
+
+  # R3: unattributed zero ms is scheduling-sensitive (a busy host can delay
+  # the crossfade/underrun evidence itself) -- downgrade a FAIL to
+  # INCONCLUSIVE when this very recording was already flagged contended.
+  local unattributed_ms=0
+  if [ -s "$attr_json" ]; then
+    unattributed_ms="$(python3 -c "import json; print(json.load(open('$attr_json'))['by_class_ms'].get('unattributed', 0))" 2>/dev/null || echo 0)"
+  fi
+  local contended="False"
+  contended="$(python3 -c "import json; print(json.load(open('$OUT/rec/swaps_during.json')).get('contention',{}).get('contended', False))" 2>/dev/null || echo False)"
+  local uresult="PASS"
+  python3 -c "raise SystemExit(0 if $unattributed_ms <= $SWAP_UNATTRIBUTED_MS_MAX else 1)" 2>/dev/null || uresult="FAIL"
+  if [ "$uresult" = "FAIL" ] && [ "$contended" = "True" ]; then
+    uresult="INCONCLUSIVE"
+  fi
+  python3 "$E2E_DIR/analyze.py" check --scenario swaps --recording swaps_during \
+    --metric unattributed_zero_ms --value "$unattributed_ms" \
+    --threshold-desc "<= $SWAP_UNATTRIBUTED_MS_MAX (INCONCLUSIVE if this recording was contended)" \
+    --result "$uresult" --json-out "$OUT/rec/swaps_unattributed.json"
+  MEASURED_JSON+=("$OUT/rec/swaps_unattributed.json")
 
   # Holes budget: at most one brief crossfade gap per swap is expected here
   # (unlike a steady recording, where HOLES_MAX=0 applies).
@@ -1261,9 +1385,99 @@ scenario_stress() {
     local check_json="$OUT/rec/stress_${engine}_check.json"
     python3 "$E2E_DIR/analyze.py" stress-check --logscan "$scan" --app-alive "$alive" \
       --load-start "$load_start" --recovery-max-s "$STRESS_RECOVERY_MAX_S" \
+      --recovery-min-s "$STRESS_RECOVERY_MIN_S" \
       --scenario stress --recording "stress_${engine}" --json-out "$check_json" || true
     [ -s "$check_json" ] && MEASURED_JSON+=("$check_json")
     scenario_log_checks stress "stress_${engine}" "$APP_LOG" "$STRESS_LOG_FELL_BEHIND_MAX"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# SCENARIO: spike (R1, D-01) -- a short 1.3 s CPU burst (SPIKE_SPINNERS busy
+# loops pinned with the app, like tests/deepfilter_overload.rs's
+# starved-worker repro) must NEVER trigger a runtime fallback. Per
+# $SPIKE_ENGINES entry: fresh launch, settle, record while the burst hits at
+# SPIKE_AT_S, unload, record again.
+# ---------------------------------------------------------------------------
+
+scenario_spike() {
+  command -v taskset >/dev/null 2>&1 || abort 3 "the spike scenario needs taskset (util-linux)."
+  local engine mode="MaxQuality"
+  for engine in $SPIKE_ENGINES; do
+    log "scenario spike: launching $engine/$mode"
+    launch_and_wait "$engine" "$mode"
+    local actual_engine=""
+    actual_engine="$(grep -Eo 'Engine set to [A-Za-z0-9]+' "$APP_LOG" 2>/dev/null | tail -1 | awk '{print $NF}')" || true
+    if [ "$actual_engine" != "$engine" ]; then
+      log "spike: $engine not available in this build (got '${actual_engine:-none}') -- SKIP"
+      run_nested stop "$DISPLAY_ARG"
+      local skip_json="$OUT/rec/spike_${engine}_skip.json"
+      python3 "$E2E_DIR/analyze.py" check --scenario spike --recording "spike_${engine}" \
+        --metric availability --value "${actual_engine:-none}" --threshold-desc "== $engine" \
+        --result SKIP --note "not available in this build" --json-out "$skip_json"
+      MEASURED_JSON+=("$skip_json")
+      continue
+    fi
+    wait_for_log "Linked cmtest_mic:capture_MONO -> CleanMic-capture:input_MONO" 10 "$APP_LOG" || true
+    sleep "$STRESS_SETTLE_S"
+
+    local app_pid=""
+    app_pid="$(bash "$NESTED_RUN" app-pid "$DISPLAY_ARG" 2>/dev/null)" || abort 5 "spike: no harness app pid for $engine."
+
+    # _spike_driver: waits SPIKE_AT_S, pins the app + SPIKE_SPINNERS spinners
+    # (each self-terminating via `timeout`, so they die even if the harness
+    # is killed) to one CPU for SPIKE_BURST_S, then restores affinity.
+    local spike_pids_file="$OUT/harness/spike_${engine}_spinners.pids"
+    _spike_driver() {
+      sleep "$SPIKE_AT_S"
+      local cpu="$STRESS_CPU"
+      [ -z "$cpu" ] && cpu=$(( $(nproc) - 1 ))
+      taskset -a -p -c "$cpu" "$app_pid" >/dev/null
+      : >"$spike_pids_file"
+      local i
+      for i in $(seq 1 "$SPIKE_SPINNERS"); do
+        taskset -c "$cpu" timeout "$SPIKE_BURST_S" bash -c "$LOAD_SPINNER_CMD" &
+        echo "$!" >>"$spike_pids_file"
+      done
+      sleep "$SPIKE_BURST_S"
+      local pid
+      for pid in $(cat "$spike_pids_file" 2>/dev/null || true); do
+        if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$LOAD_SPINNER_CMD"; then
+          kill "$pid" 2>/dev/null || true
+        fi
+      done
+      taskset -a -p -c "0-$(( $(nproc) - 1 ))" "$app_pid" >/dev/null 2>&1 || true
+      return 0
+    }
+    record_pair "spike_${engine}_load" "$OUT/signals/speech.wav" "CleanMic:capture_MONO" _spike_driver
+    measure_and_add spike "spike_${engine}_load" stress_load --meta "engine=$engine" --meta "mode=$mode" \
+      --meta "stress_spinners=$SPIKE_SPINNERS"
+
+    sleep 2
+    record_pair "spike_${engine}_post" "$OUT/signals/speech.wav" "CleanMic:capture_MONO"
+    measure_and_add spike "spike_${engine}_post" speech --meta "engine=$engine" --meta "mode=$mode"
+
+    local alive="yes"
+    app_alive "$app_pid" || alive="no"
+    run_nested stop "$DISPLAY_ARG"
+    cp "$APP_LOG" "$OUT/logs/spike_${engine}.log" 2>/dev/null || true
+    local scan="$OUT/logs/spike_${engine}.logscan.json"
+    python3 "$E2E_DIR/analyze.py" logscan "$APP_LOG" --json-out "$scan" >/dev/null || true
+    # R5: was the LOAD recording itself flagged contended? A fallback that
+    # only shows up under real ambient contention (not the clean 1.3s burst
+    # alone) can't be blamed on a broken grace -- see evaluate_spike().
+    local spike_contended="" load_contended_arg=()
+    spike_contended="$(python3 -c "
+import json
+print(json.load(open('$OUT/rec/spike_${engine}_load.json')).get('contention', {}).get('contended', False))
+" 2>/dev/null || echo False)"
+    [ "$spike_contended" = "True" ] && load_contended_arg=(--contended)
+    local check_json="$OUT/rec/spike_${engine}_check.json"
+    python3 "$E2E_DIR/analyze.py" spike-check --logscan "$scan" --app-alive "$alive" \
+      --launched-engine "$engine" "${load_contended_arg[@]}" --scenario spike --recording "spike_${engine}" \
+      --json-out "$check_json" || true
+    [ -s "$check_json" ] && MEASURED_JSON+=("$check_json")
+    scenario_log_checks spike "spike_${engine}" "$APP_LOG" "$SPIKE_LOG_FELL_BEHIND_MAX"
   done
 }
 
@@ -1363,7 +1577,7 @@ fi
 
 RUN_LIST="${SCENARIOS[*]}"
 if [[ " $RUN_LIST " == *" all "* ]]; then
-  RUN_LIST="baseline swaps toggle modes dc autogain stress"
+  RUN_LIST="baseline swaps toggle modes dc autogain stress spike"
   [ "$MONITOR_NULL_SINK" = 1 ] && RUN_LIST="$RUN_LIST monitor"
 fi
 
@@ -1377,6 +1591,7 @@ for s in $RUN_LIST; do
     dc) scenario_dc ;;
     autogain) scenario_autogain ;;
     stress) scenario_stress ;;
+    spike) scenario_spike ;;
     monitor) scenario_monitor ;;
     all) : ;;
     *) abort 2 "unknown scenario '$s'." ;;

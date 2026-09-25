@@ -337,11 +337,22 @@ def test_logscan_fallback_and_plugin_abort():
     assert rows["recovery_s"]["value"] == 3.0 and rows["recovery_s"]["result"] == "PASS"
     slow = {x["metric"]: x for x in analyze.evaluate_stress(r, False, fb["t"] - 30.0, 10)}
     assert slow["app_alive"]["result"] == "FAIL" and slow["recovery_s"]["result"] == "FAIL"
+    # quick 260924-n4s: a fallback logged BEFORE the synthetic load even
+    # started tells us nothing about the grace -- INCONCLUSIVE, never PASS.
     early = {x["metric"]: x for x in analyze.evaluate_stress(r, True, fb["t"] + 0.7, 10)}
-    assert early["recovery_s"]["value"] == 0.0 and early["recovery_s"]["result"] == "PASS"
+    assert early["recovery_s"]["result"] == "INCONCLUSIVE"
     assert "before the synthetic load" in early["recovery_s"]["note"]
     none = {x["metric"]: x for x in analyze.evaluate_stress({"fallbacks": []}, True, 0.0, 10)}
     assert none["recovery_s"]["result"] == "INFO"
+
+    # recovery_min_s (D-01): a fallback FASTER than the grace is also a FAIL
+    # -- the grace was not honoured.
+    fast_fallback = {x["metric"]: x for x in analyze.evaluate_stress(r, True, fb["t"] - 3.0, 10, recovery_min_s=5.0)}
+    assert fast_fallback["recovery_s"]["value"] == 3.0
+    assert fast_fallback["recovery_s"]["result"] == "FAIL"
+    ok_fallback = {x["metric"]: x for x in analyze.evaluate_stress(r, True, fb["t"] - 6.0, 10, recovery_min_s=5.0)}
+    assert ok_fallback["recovery_s"]["value"] == 6.0
+    assert ok_fallback["recovery_s"]["result"] == "PASS"
 
 
 def test_stress_load_rule_and_cpu_flag():
@@ -598,6 +609,25 @@ def test_latency_ms_sched_sensitive_only_for_deepfilternet():
     assert analyze.is_sched_sensitive_metric("holes", {"engine": "RNNoise"}) is True
 
 
+def test_lag_corr_and_latency_ms_sched_sensitive_for_baseline_only():
+    # quick 260924-n4s: real-world evidence (a contended baseline attempt
+    # can make lag_corr genuinely unmeasurable) folded lag_corr/latency_ms
+    # into baseline's own majority-of-quiet-attempts retry -- but NOT for
+    # a normal steady-state recording elsewhere (swaps pre/post, etc).
+    assert analyze.is_sched_sensitive_metric("lag_corr", {"engine": "RNNoise", "scenario": "baseline"}) is True
+    assert analyze.is_sched_sensitive_metric("latency_ms", {"engine": "RNNoise", "scenario": "baseline"}) is True
+    assert analyze.is_sched_sensitive_metric("lag_corr", {"engine": "RNNoise", "scenario": "swaps"}) is False
+    assert analyze.is_sched_sensitive_metric("latency_ms", {"engine": "RNNoise", "scenario": "toggle"}) is False
+
+
+def test_dead_run_ms_latency_lag_corr_sched_sensitive_for_stress_and_spike_only():
+    for scenario in ("stress", "spike"):
+        assert analyze.is_sched_sensitive_metric("dead_run_ms", {"scenario": scenario}) is True
+        assert analyze.is_sched_sensitive_metric("latency_ms", {"engine": "RNNoise", "scenario": scenario}) is True
+        assert analyze.is_sched_sensitive_metric("lag_corr", {"engine": "RNNoise", "scenario": scenario}) is True
+    assert analyze.is_sched_sensitive_metric("dead_run_ms", {"scenario": "baseline"}) is False
+
+
 # ---------------------------------------------------------------------------
 # Task 1 (R5): WAV<->epoch mapping + hole attribution
 # ---------------------------------------------------------------------------
@@ -722,6 +752,138 @@ def test_aggregate_kind_renders_in_report():
     assert rows[0].metric == "holes" and rows[0].result == "PASS"
     text, code = analyze.render_report([aggregate], {}, {}, None)
     assert code == 0 and "holes" in text
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (R1): spike-check
+# ---------------------------------------------------------------------------
+
+
+def test_spike_check_fallback_fails():
+    logscan = {"fallbacks": [{"from": "DeepFilterNet", "to": "RNNoise", "reason": "Overloaded"}], "plugin_aborts": 0}
+    rows = {r["metric"]: r for r in analyze.evaluate_spike(logscan, True, "DeepFilterNet")}
+    assert rows["fallback_during_spike"]["result"] == "FAIL"
+
+
+def test_spike_check_fallback_under_contention_is_inconclusive_not_pass():
+    # R5: a fallback that only shows up under real ambient contention isn't
+    # evidence the grace failed on a clean, isolated burst -- but it's still
+    # not a confirmed clean spike either, so INCONCLUSIVE, never PASS.
+    logscan = {"fallbacks": [{"from": "Dpdfnet8", "to": "RNNoise", "reason": "Overloaded"}], "plugin_aborts": 0}
+    rows = {r["metric"]: r for r in analyze.evaluate_spike(logscan, True, "Dpdfnet8", contended=True)}
+    assert rows["fallback_during_spike"]["result"] == "INCONCLUSIVE"
+    assert rows["end_engine"]["result"] == "INCONCLUSIVE"
+    assert "contended" in rows["fallback_during_spike"]["note"]
+    # Not contended: the fallback stays a real FAIL.
+    rows_quiet = {r["metric"]: r for r in analyze.evaluate_spike(logscan, True, "Dpdfnet8", contended=False)}
+    assert rows_quiet["fallback_during_spike"]["result"] == "FAIL"
+    assert rows_quiet["end_engine"]["result"] == "FAIL"
+
+
+def test_spike_check_no_fallback_alive_end_engine_matches_passes():
+    logscan = {"fallbacks": [], "plugin_aborts": 0}
+    rows = {r["metric"]: r for r in analyze.evaluate_spike(logscan, True, "Dpdfnet8")}
+    assert rows["fallback_during_spike"]["result"] == "PASS"
+    assert rows["app_alive"]["result"] == "PASS"
+    assert rows["plugin_abort_lines"]["result"] == "PASS"
+    assert rows["end_engine"]["result"] == "PASS" and rows["end_engine"]["value"] == "Dpdfnet8"
+
+
+def test_spike_check_dead_app_and_abort_fail():
+    logscan = {"fallbacks": [], "plugin_aborts": 1}
+    rows = {r["metric"]: r for r in analyze.evaluate_spike(logscan, False, "Dpdfnet8")}
+    assert rows["app_alive"]["result"] == "FAIL"
+    assert rows["plugin_abort_lines"]["result"] == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (R3): swap_attribution
+# ---------------------------------------------------------------------------
+
+
+def test_epoch_to_wav_is_the_inverse_of_hole_epoch():
+    epoch = analyze.hole_epoch(t_wav=5.0, rec_link_epoch=1000.0, source_onset_s=2.0, input_onset_wav_s=0.0)
+    assert abs(analyze.epoch_to_wav(epoch, 1000.0, 2.0) - 5.0) < 1e-9
+
+
+def test_swap_attribution_classes():
+    fs = 48000
+    # leading run at sample 0, 100ms
+    leading = (0, int(0.1 * fs))
+    # a swap-adjacent run at t=10.0s, within the 0.6s window of a swap at 9.8s
+    swap_run = (int(10.0 * fs), 480)
+    # a run at t=20.0s, within 150ms of a dfn restart at 19.95s, <=480 samples
+    dfn_run = (int(20.0 * fs), 480)
+    # a run at t=30.0s, within 150ms of a dfn shed at 30.05s
+    shed_run = (int(30.0 * fs), 480)
+    # a run at t=50.0s with no nearby evidence
+    mystery_run = (int(50.0 * fs), 480)
+
+    zr = [leading, swap_run, dfn_run, shed_run, mystery_run]
+    swap_events = [(9.8, "RNNoise", "MaxQuality")]
+    dfn_restart_t_wav = [19.95]
+    dfn_shed_t_wav = [30.05]
+
+    rows = analyze.swap_attribution(zr, fs, swap_events, dfn_restart_t_wav, dfn_shed_t_wav)
+    by_t = {r["t"]: r for r in rows}
+    assert by_t[0.0]["class"] == "leading"
+    assert by_t[10.0]["class"] == "swap" and by_t[10.0]["engine"] == "RNNoise"
+    assert by_t[20.0]["class"] == "dfn_underrun"
+    assert by_t[30.0]["class"] == "dfn_shed"
+    assert by_t[50.0]["class"] == "unattributed"
+
+    summary = analyze.swap_attribution_summary(rows)
+    assert summary["swap_class_ms"] == 10.0  # 480 samples @ 48kHz == 10ms
+
+
+def test_swap_attribution_unattributed_gets_task1_host_evidence():
+    fs = 48000
+    mystery_run = (int(50.0 * fs), 480)
+    far_run = (int(80.0 * fs), 480)
+    hole_attribution = [
+        {"t_wav": 50.02, "t_epoch": 0.0, "class": "host_starved"},
+        {"t_wav": 10.0, "t_epoch": 0.0, "class": "engine_slow"},
+    ]
+    rows = analyze.swap_attribution([mystery_run, far_run], fs, [], [], [], hole_attribution=hole_attribution)
+    by_t = {r["t"]: r for r in rows}
+    assert by_t[50.0]["class"] == "unattributed"
+    assert by_t[50.0]["host_evidence"] == "host_starved"  # nearest hole, within the match window
+    assert by_t[80.0]["host_evidence"] is None  # nearest hole (10.0s) is far outside the match window
+
+
+def test_swap_attribution_summary_totals_by_class():
+    rows = [
+        {"class": "swap", "ms": 10.0},
+        {"class": "swap", "ms": 5.0},
+        {"class": "dfn_underrun", "ms": 10.0},
+        {"class": "unattributed", "ms": 3.0},
+    ]
+    summary = analyze.swap_attribution_summary(rows)
+    assert summary["swap_class_ms"] == 15.0
+    assert summary["by_class_ms"]["dfn_underrun"] == 10.0
+    assert summary["by_class_ms"]["unattributed"] == 3.0
+
+
+def test_logscan_captures_new_d01_and_swap_log_lines():
+    log_text = (
+        "[2026-09-24T15:24:07.000Z WARN  cleanmic::audio] Audio thread: active engine (#1) reported "
+        "Overloaded after 5.0 s of sustained trouble — asking the app for a lighter engine\n"
+        "[2026-09-24T15:24:08.000Z WARN  cleanmic::engine::deepfilter] DeepFilterNet: bypassing the plugin "
+        "(overloaded) — passing audio through, retry in 1.0 s (restarts 1/10)\n"
+        "[2026-09-24T15:24:09.000Z INFO  cleanmic::engine::deepfilter] DeepFilterNet: plugin back to real time "
+        "— processing resumed (restart 1/10)\n"
+        "[2026-09-24T15:24:10.000Z INFO  cleanmic::engine::deepfilter] DeepFilterNet: shed 30 ms of accumulated "
+        "plugin latency (one-time restart 2/10)\n"
+        "[2026-09-24T15:24:11.000Z INFO  cleanmic::audio] Engine swap started (crossfading)\n"
+        "[2026-09-24T15:24:12.000Z INFO  cleanmic::audio] Engine mode set to LowCpu\n"
+    )
+    r = analyze.logscan(log_text)
+    assert r["trouble_span_s"] == [5.0]
+    assert r["dfn_bypass_entries"] == 1
+    assert r["dfn_recoveries"] == 1
+    assert len(r["dfn_shed_at"]) == 1 and r["dfn_shed_at"][0][1] == 30
+    assert len(r["swap_started_at"]) == 1
+    assert r["mode_set_at"] == [(r["mode_set_at"][0][0], "LowCpu")]
 
 
 def _run_all():
