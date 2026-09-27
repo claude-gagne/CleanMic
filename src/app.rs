@@ -1575,18 +1575,30 @@ fn run_with_gui(
         };
         {
             let pw = pw_manager_clone.borrow();
-            let devices = pw.device_enumerator().list_input_devices();
-            // Seed the system default so the picker renders `Default (MicName)`
-            // on the very first paint rather than waiting up to 1500ms for the
-            // polling timer's first tick. Without this, users who follow the
-            // OS default see a visible picker flash as the entry appears late
-            // and the selection jumps. Per WR-01.
-            initial_state.system_default_name = current_system_default_name(&pw, &devices);
-            initial_state.available_devices = picker_device_infos(
-                &devices,
-                initial_state.input_device.as_deref(),
-                initial_state.system_default_name.as_deref(),
-            );
+            // D-02 (quick 260927-mvb): without a live PipeWire daemon,
+            // `list_input_devices()` falls back to its pw-dump-failure stub
+            // list (e.g. "Built-in Audio Analog Stereo") — presenting that
+            // as if it were a real, enumerated device would be dishonest,
+            // and there is no daemon to enumerate from in the first place.
+            // Skip enumeration entirely; `set_no_pipewire_device_placeholder`
+            // below shows a neutral, insensitive placeholder instead.
+            if pipewire_available {
+                let devices = pw.device_enumerator().list_input_devices();
+                // Seed the system default so the picker renders `Default (MicName)`
+                // on the very first paint rather than waiting up to 1500ms for the
+                // polling timer's first tick. Without this, users who follow the
+                // OS default see a visible picker flash as the entry appears late
+                // and the selection jumps. Per WR-01.
+                initial_state.system_default_name = current_system_default_name(&pw, &devices);
+                initial_state.available_devices = picker_device_infos(
+                    &devices,
+                    initial_state.input_device.as_deref(),
+                    initial_state.system_default_name.as_deref(),
+                );
+            } else {
+                initial_state.system_default_name = None;
+                initial_state.available_devices = Vec::new();
+            }
             initial_state.khip_available =
                 engine::is_engine_available(EngineType::Khip);
             // Independent five-engine availability/reason map (T-15.1-07/
@@ -1695,6 +1707,15 @@ fn run_with_gui(
         if !pipewire_available {
             handles.set_pipewire_unavailable(true);
             handles.set_enable_sensitive(false);
+            // Quick task 260927-mvb: the enable switch must render OFF (not
+            // just insensitive) since audio genuinely isn't running, without
+            // mutating `config.enabled`. The microphone row already shows
+            // the existing D-10 "No input device available" placeholder,
+            // insensitive, because `initial_state.available_devices` was
+            // left empty above when PipeWire is unavailable — no stub
+            // device (e.g. a pw-dump-failure fallback) is ever presented as
+            // real.
+            handles.set_enable_visual_off();
         }
 
         // Clone the full WindowHandles BEFORE any field moves (MeterRows
@@ -2211,7 +2232,13 @@ fn run_with_gui(
             }
 
             // Keep header bar subtitle in sync with pipeline state.
-            let subtitle = if config_timer.borrow().enabled {
+            //
+            // Quick task 260927-mvb: without PipeWire, audio genuinely is
+            // not running regardless of `config.enabled` — this recurring
+            // sync must not re-claim "Active" a tick after
+            // `set_pipewire_unavailable(true)` set the honest one-shot
+            // "Inactive" subtitle at window build (D-02).
+            let subtitle = if pipewire_available && config_timer.borrow().enabled {
                 gettextrs::gettext("Active")
             } else {
                 gettextrs::gettext("Inactive")

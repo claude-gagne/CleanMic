@@ -144,6 +144,15 @@ pub struct WindowHandles {
     /// `notify::selected` unconditionally, re-emitting a spurious
     /// `UiEvent::ModeChanged` — mirrors `strength_updating`.
     pub mode_updating: Rc<Cell<bool>>,
+    /// Flag set while a programmatic visual-only override of the enable
+    /// switch (currently only [`Self::set_enable_visual_off`], quick task
+    /// 260927-mvb) is running, so `connect_active_notify`'s handler can skip
+    /// it — mirrors `device_updating`/`strength_updating`/`mode_updating`.
+    /// Without this guard, forcing the switch off to render the no-PipeWire
+    /// state honestly would dispatch `UiEvent::EnableToggled(false)`, which
+    /// cascades into `config.enabled = false` and a save — exactly what
+    /// `set_enable_sensitive`'s doc (and T-15.4-02) forbids.
+    enable_updating: Rc<Cell<bool>>,
 }
 
 // Type alias for the SwitchRow closure parameter.
@@ -623,9 +632,17 @@ pub fn build_main_window(
     let enable_row = SwitchRow::new();
     enable_row.set_title(&tr!("Enable"));
     enable_row.set_active(state.active);
+    let enable_updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     {
         let tx = event_tx.clone();
+        let enable_updating_cb = enable_updating.clone();
         enable_row.connect_active_notify(move |row: &SwitchRowRef| {
+            // Quick task 260927-mvb: skip events fired by
+            // `set_enable_visual_off`'s programmatic override — mirrors the
+            // `device_updating`/`strength_updating`/`mode_updating` pattern.
+            if enable_updating_cb.get() {
+                return;
+            }
             if tx.send(UiEvent::EnableToggled(row.is_active())).is_err() {
                 log::warn!("UI event channel closed - EnableToggled dropped");
             }
@@ -886,6 +903,7 @@ pub fn build_main_window(
         pipewire_explanation,
         strength_updating,
         mode_updating,
+        enable_updating,
     }
 }
 
@@ -1208,7 +1226,21 @@ struct FullNameLabelSpec {
     wrap_mode: pango::WrapMode,
     max_width_chars: i32,
     hexpand: bool,
+    /// Minimum width in character units (`GtkLabel::width-chars`), or `-1`
+    /// for GTK's default (no explicit minimum). Quick task 260927-mvb: for
+    /// [`FactoryRole::CollapsedValue`] this reserves enough horizontal room
+    /// for the longest fixed-vocabulary selector value even when a sibling
+    /// row element (e.g. Mode's long DPDFNet-only-scope subtitle) would
+    /// otherwise squeeze this label below its natural single-line width —
+    /// the exact GTK box-allocation squeeze that clipped French "Qualité
+    /// maximale" down to "Qualité" (the row's fixed single-line height hid
+    /// the wrapped second line entirely).
+    width_chars: i32,
 }
+
+/// The char count of "Faible consommation" — the longest French or English
+/// selector value across Mode and Strength.
+const LONGEST_SELECTOR_VALUE_CHARS: i32 = 19;
 
 /// OWNER-LOCK no-truncation label spec for `role`.
 ///
@@ -1227,6 +1259,7 @@ fn full_name_label_spec(role: FactoryRole) -> FullNameLabelSpec {
             wrap_mode: pango::WrapMode::WordChar,
             max_width_chars: 60,
             hexpand: true,
+            width_chars: -1,
         },
         FactoryRole::CollapsedValue => FullNameLabelSpec {
             ellipsize: pango::EllipsizeMode::None,
@@ -1234,6 +1267,7 @@ fn full_name_label_spec(role: FactoryRole) -> FullNameLabelSpec {
             wrap_mode: pango::WrapMode::Word,
             max_width_chars: 60,
             hexpand: false,
+            width_chars: LONGEST_SELECTOR_VALUE_CHARS,
         },
     }
 }
@@ -1277,6 +1311,7 @@ fn full_name_factory(row: &ComboRow, role: FactoryRole) -> gtk4::SignalListItemF
         label.set_wrap(spec.wrap);
         label.set_wrap_mode(spec.wrap_mode);
         label.set_max_width_chars(spec.max_width_chars);
+        label.set_width_chars(spec.width_chars);
 
         hbox.append(&label);
 
@@ -1805,9 +1840,41 @@ impl WindowHandles {
     /// startup; a PipeWire-less session never attempts a live upgrade, so
     /// this is never re-evaluated afterward — the user restarts CleanMic
     /// once the daemon is back.
+    ///
+    /// Also forces the header subtitle to the existing translated
+    /// "Inactive" string when `unavailable` is true (quick task
+    /// 260927-mvb): audio genuinely is not running without PipeWire,
+    /// regardless of `config.enabled` — the subtitle must not keep claiming
+    /// "Active" while the banner right below it says otherwise. Reuses the
+    /// same `tr!("Inactive")` msgid [`update_from_state`] already uses, so
+    /// this introduces no new user-facing string.
     pub fn set_pipewire_unavailable(&self, unavailable: bool) {
         self.pipewire_banner.set_revealed(unavailable);
         self.pipewire_explanation.set_visible(unavailable);
+        if unavailable {
+            self.win_title.set_subtitle(&tr!("Inactive"));
+        }
+    }
+
+    /// Force the enable switch to render OFF, WITHOUT dispatching
+    /// `UiEvent::EnableToggled` or touching `config.enabled` (D-02, quick
+    /// task 260927-mvb).
+    ///
+    /// Unlike [`Self::set_input_available`] (whose `false` branch ALSO
+    /// forces the switch off, but through the normal notify path, since
+    /// D-10's "no input device" case is a real pipeline decision that
+    /// legitimately belongs in `config.enabled`), this only fixes the
+    /// VISUAL contradiction of a PipeWire-less session showing the switch
+    /// ON — the persisted preference must survive untouched so a later
+    /// PipeWire-available relaunch resumes exactly as the user left it.
+    /// Guarded by `enable_updating`, mirroring `device_updating` /
+    /// `strength_updating` / `mode_updating`.
+    pub fn set_enable_visual_off(&self) {
+        self.enable_updating.set(true);
+        if self.enable_row.is_active() {
+            self.enable_row.set_active(false);
+        }
+        self.enable_updating.set(false);
     }
 }
 
@@ -2267,10 +2334,6 @@ mod tests {
     // above: this test binary's single allowed `gtk4::init()` call is
     // already spent elsewhere).
 
-    /// The char count of "Faible consommation" — the longest French or
-    /// English selector value across Mode and Strength.
-    const LONGEST_SELECTOR_VALUE_CHARS: i32 = 19;
-
     #[test]
     fn full_name_label_spec_popup_matches_tua_contract() {
         // Regression guard for the Microphone popup (260923-tua): the Popup
@@ -2294,6 +2357,26 @@ mod tests {
         assert_eq!(spec.wrap_mode, pango::WrapMode::Word);
         assert_eq!(spec.max_width_chars, 60);
         assert!(!spec.hexpand);
+    }
+
+    #[test]
+    fn full_name_label_spec_collapsed_value_reserves_a_minimum_width() {
+        // Quick task 260927-mvb: a sibling row element (e.g. Mode's long
+        // DPDFNet-only-scope subtitle) squeezing this label below its
+        // natural single-line width is exactly what clipped French
+        // "Qualité maximale" down to "Qualité" — the row's fixed
+        // single-line height hides the wrapped second line entirely.
+        // width_chars sets a MINIMUM (distinct from max_width_chars, which
+        // only bounds growth), guaranteeing room for the longest
+        // fixed-vocabulary selector value regardless of squeeze.
+        let collapsed = full_name_label_spec(FactoryRole::CollapsedValue);
+        assert_eq!(collapsed.width_chars, LONGEST_SELECTOR_VALUE_CHARS);
+
+        // The Popup role is unaffected — it already has its own
+        // T-tua-03 popover-width bounding via max_width_chars and needs no
+        // minimum-width guarantee.
+        let popup = full_name_label_spec(FactoryRole::Popup);
+        assert_eq!(popup.width_chars, -1);
     }
 
     #[test]
