@@ -65,6 +65,13 @@ bash scripts/e2e-audio.sh --monitor-null-sink monitor
   otherwise play into the owner's real default sink. The optional
   `cmtest_null` `Audio/Sink` is created only for the `monitor` scenario,
   audited before use, and torn down afterward.
+- **`--no-pipewire` (D-02) never creates nodes or links.** `nested-run.sh
+  launch --no-pipewire` points the app at a harness-owned nonexistent
+  `PIPEWIRE_REMOTE` and an empty private `PIPEWIRE_RUNTIME_DIR`, so its own
+  connect (and any `pw-dump`/`pw-metadata` subprocess it spawns) can never
+  reach a real daemon — the PipeWire graph is never touched. Refused
+  (exit 2) together with `--monitor-sink` / `monitor_enabled = true`, since
+  a monitor stream needs a live graph.
 - **Private XDG homes.** Every launch gets its own
   `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` under
   the harness state root. `launch` refuses (exit 11) if any of those would
@@ -97,7 +104,7 @@ bash scripts/e2e-audio.sh --monitor-null-sink monitor
 | Subcommand | Purpose |
 | --- | --- |
 | `xephyr [:N] [--dry-run]` | Detect the screen, start (or reuse) a correctly-scaled Xephyr |
-| `launch [:N] [--lang fr\|en] [--config 'K = V']... [--appimage P \| --binary P] [--monitor-sink NAME]` | Start CleanMic in isolation |
+| `launch [:N] [--lang fr\|en] [--config 'K = V']... [--appimage P \| --binary P] [--monitor-sink NAME] [--no-pipewire]` | Start CleanMic in isolation |
 | `app-pid [:N]` | Print the marked CleanMic's pid |
 | `status [:N]` | Human-readable dump of recorded state |
 | `shot [:N] FILE` | Screenshot the nested display |

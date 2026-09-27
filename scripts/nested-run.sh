@@ -13,7 +13,7 @@
 # USAGE
 #   scripts/nested-run.sh xephyr [:N] [--dry-run]
 #   scripts/nested-run.sh launch [:N] [--lang fr|en] [--config 'KEY = VALUE']...
-#       [--appimage PATH | --binary PATH] [--monitor-sink NAME]
+#       [--appimage PATH | --binary PATH] [--monitor-sink NAME] [--no-pipewire]
 #   scripts/nested-run.sh app-pid [:N]
 #   scripts/nested-run.sh status [:N]
 #   scripts/nested-run.sh shot [:N] FILE
@@ -376,7 +376,7 @@ xephyr_alive() {
 
 # ---------------------------------------------------------------------------
 # launch [:N] [--lang fr|en] [--config 'KEY = VALUE']... [--appimage PATH |
-#        --binary PATH] [--monitor-sink NAME]   (R2, R4)
+#        --binary PATH] [--monitor-sink NAME] [--no-pipewire]   (R2, R4, D-02)
 # ---------------------------------------------------------------------------
 
 # The known top-level Config fields (src/config.rs) a --config override may
@@ -385,7 +385,7 @@ CONFIG_TOP_KEYS="input_device engine mode monitor_enabled enabled autostart khip
 
 cmd_launch() {
   parse_display "$@"
-  local lang="en" appimage="" binary="" monitor_sink=""
+  local lang="en" appimage="" binary="" monitor_sink="" no_pipewire=0
   local -a config_kvs=()
   local i=0 args=("${REST[@]:-}")
   while [ "$i" -lt "${#args[@]}" ]; do
@@ -404,6 +404,9 @@ cmd_launch() {
         ;;
       --monitor-sink)
         i=$((i + 1)); monitor_sink="${args[$i]:-}"
+        ;;
+      --no-pipewire)
+        no_pipewire=1
         ;;
       "")
         ;;
@@ -476,6 +479,15 @@ except Exception as e:
       seen_monitor_true=1
     fi
   done
+  # --no-pipewire (D-02 harness support): the app never reaches a live
+  # PipeWire daemon, so a monitor stream (which needs one) can never be
+  # created either -- refuse the combination outright, ahead of the
+  # monitor-specific checks below, rather than let monitor_enabled silently
+  # do nothing or get masked behind their own exit code.
+  if [ "$no_pipewire" = 1 ] && { [ -n "$monitor_sink" ] || [ "$seen_monitor_true" = 1 ]; }; then
+    echo "nested-run: launch: --no-pipewire refuses --monitor-sink / monitor_enabled=true (the monitor stream needs a live PipeWire graph)." >&2
+    exit 2
+  fi
   if [ "$seen_monitor_true" = 1 ] && [ -z "$monitor_sink" ]; then
     echo "nested-run: REFUSING -- monitor_enabled=true without --monitor-sink would play into the owner's real default sink." >&2
     exit 11
@@ -619,6 +631,20 @@ SHIM
   if [ -n "$monitor_sink" ]; then
     env_args+=("PATH=$dd/shim:$PATH")
   fi
+  if [ "$no_pipewire" = 1 ]; then
+    # D-02 harness support: a harness-owned nonexistent remote name plus an
+    # empty private runtime dir under the display dir means the app's own
+    # PipeWire connect (and its pw-dump/pw-metadata subprocesses) can never
+    # reach a real socket -- the graph is never touched. This mode never
+    # creates nodes or links.
+    local no_pw_dir="$dd/no-pipewire-runtime"
+    rm -rf "$no_pw_dir"
+    mkdir -p "$no_pw_dir"
+    env_args+=("PIPEWIRE_REMOTE=cleanmic-harness-no-daemon" "PIPEWIRE_RUNTIME_DIR=$no_pw_dir")
+    echo "yes" >"$dd/no-pipewire"
+  else
+    rm -f "$dd/no-pipewire"
+  fi
   if [ "$lang" = "fr" ]; then
     if ! locale -a 2>/dev/null | grep -qi '^fr_FR\.utf8$'; then
       echo "nested-run: launch: fr_FR.utf8 locale is not installed." >&2
@@ -741,6 +767,9 @@ cmd_status() {
     echo "  app: alive (pid $app_pid_out)"
   else
     echo "  app: not running"
+  fi
+  if [ -f "$dd/no-pipewire" ]; then
+    echo "  no-pipewire: yes"
   fi
 }
 
