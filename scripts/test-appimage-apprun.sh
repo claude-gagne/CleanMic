@@ -112,6 +112,11 @@ if ! grep -q '^CLEANMIC_PIPEWIRE_FALLBACK=' "$ENV_OUT_A" 2>/dev/null; then
 else
     fail "case a: CLEANMIC_PIPEWIRE_FALLBACK was unexpectedly exported"
 fi
+if ! grep -qE '^(GSETTINGS_SCHEMA_DIR|GI_TYPELIB_PATH|GDK_PIXBUF_MODULE_FILE)=' "$ENV_OUT_A" 2>/dev/null; then
+    pass "case a: no bundled-GTK exports fire when none of the bundled paths exist (CLEANMIC_BUNDLE_GTK=0 shape)"
+else
+    fail "case a: unexpected bundled-GTK export in env: $(grep -E '^(GSETTINGS_SCHEMA_DIR|GI_TYPELIB_PATH|GDK_PIXBUF_MODULE_FILE)=' "$ENV_OUT_A" 2>/dev/null)"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────
 # Case (b): ldd reports libpipewire unresolved -- fallback appended LAST
@@ -257,6 +262,50 @@ if grep -q '^GDK_BACKEND=fakebackend$' "$ENV_OUT_F2" 2>/dev/null && grep -q '^GT
     pass "case f: AppRun passes through a caller-set GDK_BACKEND/GTK_THEME unchanged"
 else
     fail "case f: expected caller-set GDK_BACKEND/GTK_THEME to survive unchanged, got: $(grep -E '^(GDK_BACKEND|GTK_THEME)=' "$ENV_OUT_F2" 2>/dev/null)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# Case (g): bundled GTK paths present -- guarded exports fire with the
+# expected values (D-01/15.4-03); GDK_BACKEND/GTK_THEME still untouched.
+# ─────────────────────────────────────────────────────────────────────────
+APPDIR_G="$SANDBOX/appdir-g"
+make_appdir "$APPDIR_G"
+CASE_G_BIN="$SANDBOX/case-g-bin"
+mkdir -p "$CASE_G_BIN"
+for f in "$BASE_BIN"/*; do ln -s "$f" "$CASE_G_BIN/$(basename "$f")"; done
+cat > "$CASE_G_BIN/ldd" << 'EOF'
+#!/usr/bin/env bash
+echo "	libpipewire-0.3.so.0 => /usr/lib/x86_64-linux-gnu/libpipewire-0.3.so.0 (0x1234)"
+EOF
+chmod +x "$CASE_G_BIN/ldd"
+
+mkdir -p "$APPDIR_G/usr/share/glib-2.0/schemas"
+mkdir -p "$APPDIR_G/usr/lib/girepository-1.0"
+mkdir -p "$APPDIR_G/usr/lib/gdk-pixbuf-2.0/2.10.0"
+: > "$APPDIR_G/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+
+ENV_OUT_G="$SANDBOX/env-g.txt"
+run_apprun "$APPDIR_G" "$CASE_G_BIN" "$ENV_OUT_G" 0
+
+if grep -q "^GSETTINGS_SCHEMA_DIR=$APPDIR_G/usr/share/glib-2.0/schemas\$" "$ENV_OUT_G" 2>/dev/null; then
+    pass "case g: GSETTINGS_SCHEMA_DIR exported when the bundled schema dir exists"
+else
+    fail "case g: expected GSETTINGS_SCHEMA_DIR, got: $(grep GSETTINGS_SCHEMA_DIR "$ENV_OUT_G" 2>/dev/null)"
+fi
+if grep -q "^GI_TYPELIB_PATH=$APPDIR_G/usr/lib/girepository-1.0\$" "$ENV_OUT_G" 2>/dev/null; then
+    pass "case g: GI_TYPELIB_PATH exported when the bundled typelib dir exists"
+else
+    fail "case g: expected GI_TYPELIB_PATH, got: $(grep GI_TYPELIB_PATH "$ENV_OUT_G" 2>/dev/null)"
+fi
+if grep -q "^GDK_PIXBUF_MODULE_FILE=$APPDIR_G/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache\$" "$ENV_OUT_G" 2>/dev/null; then
+    pass "case g: GDK_PIXBUF_MODULE_FILE exported when the bundled loaders.cache exists"
+else
+    fail "case g: expected GDK_PIXBUF_MODULE_FILE, got: $(grep GDK_PIXBUF_MODULE_FILE "$ENV_OUT_G" 2>/dev/null)"
+fi
+if ! grep -qE '^(GDK_BACKEND|GTK_THEME)=' "$ENV_OUT_G" 2>/dev/null; then
+    pass "case g: GDK_BACKEND/GTK_THEME still not forced when bundled GTK paths exist"
+else
+    fail "case g: unexpected GDK_BACKEND/GTK_THEME in env: $(grep -E '^(GDK_BACKEND|GTK_THEME)=' "$ENV_OUT_G" 2>/dev/null)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────

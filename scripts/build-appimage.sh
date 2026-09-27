@@ -9,11 +9,17 @@
 #   - Development headers for GTK4, libadwaita, PipeWire (build-time only)
 #   - wget or curl (to download appimagetool if not cached)
 #
+# GTK4 + libadwaita (and their non-excluded transitive dependencies) are now
+# BUNDLED by default (D-01, 15.4-03), via linuxdeploy + linuxdeploy-plugin-gtk.
+# Set CLEANMIC_BUNDLE_GTK=0 to fall back to the pre-Plan-03 behavior (host
+# GTK4/libadwaita, faster local iteration -- the resulting AppImage then
+# requires the target system to already have GTK4 + libadwaita installed,
+# same as every release before 15.4-03).
+#
 # The resulting AppImage assumes the target system has:
-#   - GTK4 + libadwaita (standard on Ubuntu 24.04 with GNOME) -- host-provided
-#     until Plan 03 bundles them
-#   - D-Bus -- always host-provided
-# These libraries are NOT bundled in the AppImage.
+#   - D-Bus -- always host-provided (kept off the bundle by design, D-01)
+# GTK4/libadwaita (and their non-excluded deps) are bundled by default; with
+# CLEANMIC_BUNDLE_GTK=0 they fall back to host-provided instead.
 #
 # PipeWire's client library (libpipewire-0.3.so.0) ships as a FALLBACK ONLY
 # (D-10, 15.4-02): a copy lives at usr/lib/pipewire-fallback/, and AppRun
@@ -52,10 +58,80 @@ URUNTIME_CACHE_DIR="$TOOLS_DIR/uruntime/${URUNTIME_VERSION}"
 URUNTIME_BIN="$URUNTIME_CACHE_DIR/$URUNTIME_FILENAME"
 URUNTIME_SHA_SIDECAR="$URUNTIME_BIN.sha256"
 
+# ── GTK4/libadwaita bundling pins (D-01, 15.4-03) ─────────────────────────────
+# CLEANMIC_BUNDLE_GTK controls the new deploy step below: 1 (default) bundles
+# GTK4 + libadwaita + their non-excluded transitive deps via linuxdeploy +
+# linuxdeploy-plugin-gtk; 0 keeps the pre-15.4-03 host-GTK build.
+CLEANMIC_BUNDLE_GTK="${CLEANMIC_BUNDLE_GTK:-1}"
+
+# linuxdeploy: pinned to a real, dated release tag (not the moving
+# "continuous" asset the rest of the AppImage ecosystem tends to use) so a
+# rebuild months from now fetches the exact same bytes. Digest independently
+# verified against a fresh download during 15.4-03 planning (matches GitHub's
+# own reported asset digest).
+LINUXDEPLOY_VERSION="1-alpha-20251107-1"
+LINUXDEPLOY_FILENAME="linuxdeploy-x86_64.AppImage"
+LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/${LINUXDEPLOY_FILENAME}"
+LINUXDEPLOY_CACHE_DIR="$TOOLS_DIR/linuxdeploy/${LINUXDEPLOY_VERSION}"
+LINUXDEPLOY_BIN="$LINUXDEPLOY_CACHE_DIR/$LINUXDEPLOY_FILENAME"
+
+# linuxdeploy-plugin-gtk: no tagged releases upstream (raw script, consumed at
+# `master`) -- pinned to a specific commit SHA instead of a version string, so
+# the URL itself is reproducible.
+LINUXDEPLOY_PLUGIN_GTK_COMMIT="7a3fbc31a9e5075073ff8790f26effbac5f84453"
+LINUXDEPLOY_PLUGIN_GTK_URL="https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/${LINUXDEPLOY_PLUGIN_GTK_COMMIT}/linuxdeploy-plugin-gtk.sh"
+LINUXDEPLOY_PLUGIN_GTK_CACHE_DIR="$TOOLS_DIR/linuxdeploy-plugin-gtk/${LINUXDEPLOY_PLUGIN_GTK_COMMIT}"
+LINUXDEPLOY_PLUGIN_GTK_BIN="$LINUXDEPLOY_PLUGIN_GTK_CACHE_DIR/linuxdeploy-plugin-gtk.sh"
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 info()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m==> %s\033[0m\n' "$*"; }
 error() { printf '\033[1;31m==> %s\033[0m\n' "$*" >&2; exit 1; }
+
+# tofu_fetch URL DEST LABEL -- generic trust-on-first-use cache+verify,
+# mirroring the uruntime pin's own semantics (Step 7b below): first download
+# computes and persists a sha256 sidecar; every later run verifies the cached
+# file against that sidecar via `sha256sum -c` and hard-errors on mismatch
+# (no auto-redownload -- could be tampering or cache corruption; let the
+# operator decide, same as uruntime). Used by the GTK-bundling tool pins
+# (D-01, 15.4-03) below; the uruntime block keeps its own inline copy of this
+# logic unchanged to avoid touching already-verified working code.
+tofu_fetch() {
+    local url="$1" dest="$2" label="$3"
+    local sidecar="$dest.sha256"
+    mkdir -p "$(dirname "$dest")"
+    if [ ! -f "$dest" ]; then
+        info "  Cache miss -- downloading $label..."
+        if command -v wget &>/dev/null; then
+            wget -q -O "$dest.tmp" "$url"
+        elif command -v curl &>/dev/null; then
+            curl -fsSL -o "$dest.tmp" "$url"
+        else
+            error "Neither wget nor curl found. Cannot download $label."
+        fi
+        mv "$dest.tmp" "$dest"
+        chmod +x "$dest"
+        local actual_sha
+        actual_sha=$(sha256sum "$dest" | awk '{print $1}')
+        printf '%s  %s\n' "$actual_sha" "$(basename "$dest")" > "$sidecar"
+        info "  Downloaded $label -> $dest (TOFU sidecar pinned: $actual_sha)"
+    else
+        if [ ! -f "$sidecar" ]; then
+            warn "  Cache hit but sidecar missing for $label -- recomputing (defensive TOFU)."
+            local actual_sha
+            actual_sha=$(sha256sum "$dest" | awk '{print $1}')
+            printf '%s  %s\n' "$actual_sha" "$(basename "$dest")" > "$sidecar"
+        fi
+        if ! ( cd "$(dirname "$dest")" && sha256sum -c "$(basename "$sidecar")" --status ); then
+            error "$label SHA256 mismatch.
+    cached file: $dest
+    sidecar:     $sidecar
+  Either the cache is corrupted/tampered, or the sidecar is stale.
+  To re-establish TOFU: rm -rf \"$(dirname "$dest")\" && re-run this script."
+        fi
+        info "  Cache hit: $dest (SHA256 verified) -- $label"
+    fi
+}
 
 # ── DPDFNet variant selector (Phase 15.1 Plan 07 — D-01/D-02/D-03/D-04) ─────
 # DPDFNET_VARIANTS picks which DPDFNet model asset set (if any) this build
@@ -341,6 +417,164 @@ if [ ! -f "$APPRUN_SRC" ]; then
 fi
 cp "$APPRUN_SRC" "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
+
+# ── Step 6b: Bundle GTK4 + libadwaita via linuxdeploy (D-01, 15.4-03) ───────
+if [ "$CLEANMIC_BUNDLE_GTK" = "1" ]; then
+    info "Bundling GTK4 + libadwaita (CLEANMIC_BUNDLE_GTK=1, D-01)..."
+
+    info "Verifying linuxdeploy + linuxdeploy-plugin-gtk cache..."
+    tofu_fetch "$LINUXDEPLOY_URL" "$LINUXDEPLOY_BIN" "linuxdeploy $LINUXDEPLOY_VERSION"
+    tofu_fetch "$LINUXDEPLOY_PLUGIN_GTK_URL" "$LINUXDEPLOY_PLUGIN_GTK_BIN" "linuxdeploy-plugin-gtk @ ${LINUXDEPLOY_PLUGIN_GTK_COMMIT:0:12}"
+
+    info "Running linuxdeploy --plugin gtk (this can take a minute)..."
+    # --custom-apprun points at the SOURCE template, not the AppDir copy just
+    # made above: linuxdeploy's own custom-AppRun deploy path removes
+    # whatever is already at AppDir/AppRun before copying the given path IN,
+    # so pointing it at the already-in-place copy would delete its own
+    # source out from under itself.
+    # No --desktop-file is passed (we install our own desktop file in Step 4
+    # above) -- this is deliberate: linuxdeploy only wraps AppRun to source
+    # apprun-hooks/ when it also deployed a desktop file of its own, and that
+    # wrapper would force GDK_BACKEND=x11 and a fixed GTK_THEME (violating
+    # this plan's must_haves). Skipping -d keeps our own AppRun authoritative
+    # and apprun-hooks/ inert (deleted below regardless, belt and suspenders).
+    (
+        export APPIMAGE_EXTRACT_AND_RUN=1
+        export DEPLOY_GTK_VERSION=4
+        export PATH="$LINUXDEPLOY_PLUGIN_GTK_CACHE_DIR:$PATH"
+        # linuxdeploy-plugin-gtk's own "more libraries" pass (pango/gio/gobject/
+        # librsvg's transitive deps) re-invokes linuxdeploy IN-PROCESS via
+        # `env LINUXDEPLOY_PLUGIN_MODE=1 linuxdeploy --appdir=... --library=...`
+        # -- a second AppDir/exclude-pattern instance that never sees our
+        # --exclude-library CLI flags below [VERIFIED empirically during
+        # 15.4-03: libdbus-1.so.3 was bundled anyway even with the CLI flag,
+        # traced to this second pass re-discovering it via libgtk-4/
+        # libadwaita's own gio/GDBus dependency]. LINUXDEPLOY_EXCLUDED_LIBRARIES
+        # is read directly from the environment by every linuxdeploy process's
+        # AppDir constructor, so exporting it here (not just passing
+        # --exclude-library) reaches that second pass too.
+        export LINUXDEPLOY_EXCLUDED_LIBRARIES="libpipewire-0.3.so*;libdbus-1.so*"
+        "$LINUXDEPLOY_BIN" \
+            --appdir "$APPDIR" \
+            --executable "$APPDIR/usr/bin/cleanmic" \
+            --custom-apprun "$APPRUN_SRC" \
+            --plugin gtk \
+            --exclude-library 'libpipewire-0.3.so*' \
+            --exclude-library 'libdbus-1.so*'
+    ) || error "linuxdeploy GTK bundling failed (set CLEANMIC_BUNDLE_GTK=0 to fall back to the host-GTK build)"
+
+    # linuxdeploy auto-discovers our desktop file under usr/share/applications
+    # (even though we never pass -d/--desktop-file) and, having found one,
+    # runs its AppDir-root setup -- which, because --plugin gtk already wrote
+    # apprun-hooks/linuxdeploy-plugin-gtk.sh by this point, WRAPS AppRun: our
+    # own script gets renamed to AppRun.wrapped, and a new autogenerated
+    # AppRun is written that sources every apprun-hooks/*.sh (forcing
+    # GDK_BACKEND=x11 and a fixed GTK_THEME) before exec'ing AppRun.wrapped
+    # [VERIFIED empirically during 15.4-03 planning/execution -- confirmed by
+    # inspecting the post-deploy AppDir]. That directly violates this plan's
+    # must_haves (neither GDK_BACKEND nor GTK_THEME may be forced) and would
+    # break launch entirely once apprun-hooks/ is deleted below (the
+    # autogenerated wrapper would then `source` a glob that matches nothing).
+    # Fix: unconditionally re-assert our own AppRun as the real AppRun,
+    # regardless of whatever linuxdeploy did to it.
+    cp "$APPRUN_SRC" "$APPDIR/AppRun"
+    chmod +x "$APPDIR/AppRun"
+    rm -f "$APPDIR/AppRun.wrapped"
+
+    # apprun-hooks/ is never sourced by our own AppRun (scripts/appimage-apprun.sh
+    # carries its own guarded exports for the bundled GSettings schema dir, GI
+    # typelibs, and gdk-pixbuf loaders.cache instead -- see that script).
+    # Delete it so a future change can never accidentally start sourcing it.
+    rm -rf "$APPDIR/apprun-hooks"
+
+    # Post-deploy assertion (D-01): no excludelist soname bundled directly
+    # under usr/lib (the one documented exemption is the D-10
+    # usr/lib/pipewire-fallback/ dir), and no glibc library got pulled in
+    # either -- glibc's own family is on the same excludelist. Fetches the
+    # same excludelist catalog-proxy.sh's own lint uses (and shares its cache
+    # path), but checks only this one condition inline rather than reusing
+    # catalog-proxy's full --appdir --lint-only: that lint also expects a
+    # packaged AppImage's .DirIcon (created by appimagetool in Step 8, which
+    # has not run yet at this point in the build), and would always FAIL here
+    # for a reason unrelated to GTK bundling.
+    info "Asserting the bundle respects the AppImage excludelist..."
+    EXCLUDELIST_CACHE_FOR_BUILD="$BUILD_DIR/tools/excludelist"
+    mkdir -p "$(dirname "$EXCLUDELIST_CACHE_FOR_BUILD")"
+    if [ ! -f "$EXCLUDELIST_CACHE_FOR_BUILD" ]; then
+        EXCLUDELIST_URL="https://raw.githubusercontent.com/AppImage/AppImages/master/excludelist"
+        if command -v curl &>/dev/null; then
+            curl -fsSL --max-time 10 -o "$EXCLUDELIST_CACHE_FOR_BUILD.tmp" "$EXCLUDELIST_URL" \
+                && mv "$EXCLUDELIST_CACHE_FOR_BUILD.tmp" "$EXCLUDELIST_CACHE_FOR_BUILD"
+        elif command -v wget &>/dev/null; then
+            wget -q -O "$EXCLUDELIST_CACHE_FOR_BUILD.tmp" "$EXCLUDELIST_URL" \
+                && mv "$EXCLUDELIST_CACHE_FOR_BUILD.tmp" "$EXCLUDELIST_CACHE_FOR_BUILD"
+        fi
+    fi
+    if [ -f "$EXCLUDELIST_CACHE_FOR_BUILD" ]; then
+        EXCLUDELIST_VIOLATIONS=""
+        while IFS= read -r soname; do
+            [ -n "$soname" ] || continue
+            while IFS= read -r hit; do
+                [ -n "$hit" ] || continue
+                case "$hit" in
+                    "$APPDIR"/usr/lib/pipewire-fallback/*) ;; # documented D-10 exemption
+                    *) EXCLUDELIST_VIOLATIONS="${EXCLUDELIST_VIOLATIONS}
+  - $hit" ;;
+                esac
+            done < <(find "$APPDIR/usr/lib" -type f -name "$soname" 2>/dev/null)
+        done < <(grep -v '^#' "$EXCLUDELIST_CACHE_FOR_BUILD" | grep -v '^[[:space:]]*$' | awk '{print $1}')
+        if [ -n "$EXCLUDELIST_VIOLATIONS" ]; then
+            error "Excludelist violation(s) bundled directly under usr/lib (outside the documented D-10 pipewire-fallback exemption):${EXCLUDELIST_VIOLATIONS}"
+        fi
+        info "  No excludelist soname bundled outside the documented D-10 fallback exemption."
+    else
+        warn "  Could not fetch the AppImage excludelist (offline?) -- skipping this assertion this run. catalog-proxy.sh's own lint (run separately) still checks this against the packed AppImage."
+    fi
+
+    # BUNDLED-LIBRARIES.txt (D-01): every .so under usr/lib, its resolved
+    # source package + version (via dpkg -S / dpkg-query when the build host
+    # knows the file), so THIRD-PARTY-LICENSES.md's "Bundled GTK stack"
+    # section can point here for exact, regenerated-every-build provenance
+    # instead of a hand-maintained list that drifts from what's shipped.
+    info "Recording bundled library provenance (BUNDLED-LIBRARIES.txt)..."
+    BUNDLED_LIBS_OUT="$APPDIR/usr/share/doc/cleanmic/BUNDLED-LIBRARIES.txt"
+    mkdir -p "$(dirname "$BUNDLED_LIBS_OUT")"
+    # set +e for this block only: dpkg -S legitimately exits nonzero for any
+    # file it can't match to a package (common -- see the basename-glob note
+    # below), and under `set -e` that would abort the whole build the first
+    # time it happened, not just skip that one line.
+    set +e
+    {
+        echo "# Bundled libraries under usr/lib -- generated by scripts/build-appimage.sh"
+        echo "# CLEANMIC_BUNDLE_GTK=1 (D-01, 15.4-03). Regenerated on every build; do not hand-edit."
+        echo "# file | soname (best-effort) | source package | package version"
+        echo
+        while IFS= read -r -d '' f; do
+            rel="${f#"$APPDIR"/}"
+            soname="$(objdump -p "$f" 2>/dev/null | awk '/SONAME/{print $2; exit}')"
+            [ -n "$soname" ] || soname="$(basename "$f")"
+            # Match by basename glob, not by the copied-into-AppDir path:
+            # once linuxdeploy has copied a file into build/AppDir/usr/lib,
+            # its own path no longer resolves to anything dpkg's database
+            # knows about (dpkg -S on the AppDir copy's path always misses).
+            pkg_name=""
+            if command -v dpkg >/dev/null 2>&1; then
+                pkg_name="$(dpkg -S "*/$(basename "$f")" 2>/dev/null | head -1 | cut -d: -f1)"
+            fi
+            if [ -n "$pkg_name" ] && command -v dpkg-query >/dev/null 2>&1; then
+                pkg_ver="$(dpkg-query -W -f='${Version}' "$pkg_name" 2>/dev/null)"
+                printf '%s | %s | %s | %s\n' "$rel" "$soname" "$pkg_name" "${pkg_ver:-unknown}"
+            else
+                printf '%s | %s | built from source: unknown NAME/VERSION (not a distro package on the build host)\n' "$rel" "$soname"
+            fi
+        done < <(find "$APPDIR/usr/lib" -type f \( -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null | sort -z)
+    } > "$BUNDLED_LIBS_OUT"
+    BUNDLED_LIBS_COUNT="$(grep -c ' | ' "$BUNDLED_LIBS_OUT")"
+    set -e
+    info "  Wrote $BUNDLED_LIBS_OUT ($BUNDLED_LIBS_COUNT entries)"
+else
+    info "CLEANMIC_BUNDLE_GTK=0 -- keeping GTK4/libadwaita host-provided (legacy behavior, pre-15.4-03)"
+fi
 
 # ── Step 7: Download appimagetool if needed ──────────────────────────────────
 if [ ! -x "$APPIMAGETOOL" ]; then

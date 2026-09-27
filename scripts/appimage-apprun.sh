@@ -9,6 +9,30 @@ export APPDIR="${APPDIR:-$HERE}"
 # Add bundled libraries to search path so dlopen() can find them.
 export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# D-01/15.4-03: with GTK4 + libadwaita bundled (CLEANMIC_BUNDLE_GTK=1, the
+# default in scripts/build-appimage.sh), linuxdeploy-plugin-gtk installs the
+# bundled GSettings schemas, GObject-Introspection typelibs, and gdk-pixbuf
+# loaders at these conventional paths under usr/. Each export below is
+# guarded on that bundled path actually existing, so this script behaves
+# exactly as it did before 15.4-03 when CLEANMIC_BUNDLE_GTK=0 (host-GTK
+# build -- none of these paths exist, none of these exports fire).
+#
+# Deliberately NOT exported here: GDK_BACKEND, GTK_THEME. The plugin's own
+# apprun-hooks/linuxdeploy-plugin-gtk.sh would force GDK_BACKEND=x11
+# (breaking Wayland-native behavior) and a fixed GTK_THEME=Adwaita:<variant>
+# (overriding libadwaita's own light/dark styling) -- scripts/build-appimage.sh
+# deletes that hooks directory at build time specifically so it can never be
+# sourced, and this script never reintroduces either variable.
+if [ -d "$HERE/usr/share/glib-2.0/schemas" ]; then
+    export GSETTINGS_SCHEMA_DIR="$HERE/usr/share/glib-2.0/schemas"
+fi
+if [ -d "$HERE/usr/lib/girepository-1.0" ]; then
+    export GI_TYPELIB_PATH="$HERE/usr/lib/girepository-1.0"
+fi
+if [ -f "$HERE/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ]; then
+    export GDK_PIXBUF_MODULE_FILE="$HERE/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+fi
+
 # D-10: libpipewire-0.3.so.0 ships as a FALLBACK ONLY, in
 # usr/lib/pipewire-fallback/ -- never in usr/lib itself. The official
 # AppImage excludelist singles PipeWire out (like libjack) because a

@@ -23,7 +23,8 @@
 # USAGE
 #   scripts/catalog-proxy.sh (--binary PATH | --appimage PATH | --appdir DIR)
 #     [--out DIR] [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]...
-#     [--hide-pipewire-stack] [--expect-lib SONAME=appdir|fallback|host]...
+#     [--hide-pipewire-stack] [--hide-bundled]
+#     [--expect-lib SONAME=appdir|fallback|host]...
 #     [--lint-only] [--max-glibc X.Y]
 #
 # --binary PATH      Launch a bare binary directly (no AppDir, no AppRun,
@@ -52,6 +53,15 @@
 #                     Shorthand for hiding libpipewire-0.3.so.0 AND its SPA
 #                     plugin dir, module dir, and /usr/share/pipewire -- a
 #                     host with no PipeWire installed at all.
+# --hide-bundled     Hide the host's own copy of every soname found under
+#                     the AppDir's usr/lib (recursively -- this also covers
+#                     usr/lib/pipewire-fallback/, so combining this with
+#                     --hide-pipewire-stack is redundant but harmless for
+#                     that one soname). Proves the D-01 bundle (GTK4,
+#                     libadwaita, GLib, Pango, gdk-pixbuf, and the rest)
+#                     does not lean on the host's own copies -- requires
+#                     --appimage or --appdir (there is no "bundled" set for
+#                     a bare --binary) and --sandbox bwrap.
 # --expect-lib SONAME=appdir|fallback|host
 #                     Repeatable. After a window appears, reads
 #                     /proc/<app-pid>/maps and asserts which tree the given
@@ -120,9 +130,59 @@ set -euo pipefail
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
+USAGE_LINE="usage: scripts/catalog-proxy.sh (--binary PATH | --appimage PATH | --appdir DIR) [--out DIR] [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]... [--hide-pipewire-stack] [--hide-bundled] [--expect-lib SONAME=appdir|fallback|host]... [--lint-only] [--max-glibc X.Y]"
+
 usage() {
-  echo "usage: scripts/catalog-proxy.sh (--binary PATH | --appimage PATH | --appdir DIR) [--out DIR] [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]... [--hide-pipewire-stack] [--expect-lib SONAME=appdir|fallback|host]... [--lint-only] [--max-glibc X.Y]" >&2
+  echo "$USAGE_LINE" >&2
   exit 2
+}
+
+show_help() {
+  cat <<EOF
+$USAGE_LINE
+
+Local reproduction of the AppImageHub catalog's launch check (a private
+Xvfb, the catalog's own 10s-grace + 20x1s xwininfo poll, a screenshot, and
+an OCR pass against the catalog's hard-phrase list), plus static AppDir
+lint checks and library-provenance assertions used by 15.4's D-01/D-09/D-10
+work. See this script's own header comment for full documentation.
+
+TARGET (exactly one required):
+  --binary PATH       Launch a bare binary directly (no AppDir, no lint).
+  --appimage PATH     Extract via --appimage-extract, lint, launch AppRun.
+  --appdir DIR        Lint and launch an already-extracted AppDir directly.
+
+SANDBOX MODES (--sandbox MODE):
+  bwrap    Unprivileged bubblewrap sandbox (default for --appimage/--appdir
+           when bwrap is available). Enables --hide-lib, --hide-pipewire-stack,
+           and --hide-bundled.
+  none     No sandbox (default for --binary, and the only valid value when
+           bwrap is unavailable).
+  firejail Reproduces the catalog worker's own exact invocation --
+           \`firejail --quiet --noprofile --net=none --appimage FILE\` --
+           under this script's own private Xvfb (15.4-03 D-09 catalog-mimic).
+
+OTHER OPTIONS:
+  --out DIR                    Output directory (default: a fresh
+                                target/catalog-proxy/<timestamp>/ dir).
+  --lang en|fr                 Locale to launch under (default: en).
+  --hide-lib SONAME             Repeatable. Hide one host library (bwrap only).
+  --hide-pipewire-stack          Hide the host's whole PipeWire stack (bwrap only).
+  --hide-bundled                 Hide the host's own copy of every soname
+                                  bundled under the AppDir's usr/lib (bwrap only).
+  --expect-lib SONAME=appdir|fallback|host
+                                  Repeatable. Assert which tree a soname
+                                  actually resolved from after launch.
+  --lint-only                   Run only the static AppDir lint checks, skip
+                                  the launch/window-check entirely (--appimage/
+                                  --appdir only).
+  --max-glibc X.Y                FAIL the glibc-ceiling lint check above X.Y
+                                  (INFO-only without this flag).
+
+EXIT CODES: 0 PASS, 1 FAIL, 2 bad usage, 3 missing tool/setup failure,
+11 refused (a private path would resolve under an owner XDG/home path).
+EOF
+  exit 0
 }
 
 need() {
@@ -199,9 +259,11 @@ resolve_host_lib_paths() {
 }
 
 BINARY="" APPIMAGE="" APPDIR_ARG="" OUT_DIR="" LANG_ARG="en" SANDBOX_MODE=""
-HIDE_LIBS=() EXPECT_LIBS=() HIDE_PIPEWIRE_STACK=0 LINT_ONLY=0 MAX_GLIBC=""
+HIDE_LIBS=() EXPECT_LIBS=() HIDE_PIPEWIRE_STACK=0 HIDE_BUNDLED=0 LINT_ONLY=0 MAX_GLIBC=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    -h | --help)
+      show_help ;;
     --binary)
       shift; BINARY="${1:-}" ;;
     --appimage)
@@ -218,6 +280,8 @@ while [ "$#" -gt 0 ]; do
       shift; HIDE_LIBS+=("${1:-}") ;;
     --hide-pipewire-stack)
       HIDE_PIPEWIRE_STACK=1 ;;
+    --hide-bundled)
+      HIDE_BUNDLED=1 ;;
     --expect-lib)
       shift; EXPECT_LIBS+=("${1:-}") ;;
     --lint-only)
@@ -276,8 +340,12 @@ case "$SANDBOX_MODE" in
     ;;
 esac
 
-if { [ "${#HIDE_LIBS[@]}" -gt 0 ] || [ "$HIDE_PIPEWIRE_STACK" = 1 ]; } && [ "$SANDBOX_MODE" != "bwrap" ]; then
-  echo "catalog-proxy: --hide-lib/--hide-pipewire-stack require --sandbox bwrap" >&2
+if { [ "${#HIDE_LIBS[@]}" -gt 0 ] || [ "$HIDE_PIPEWIRE_STACK" = 1 ] || [ "$HIDE_BUNDLED" = 1 ]; } && [ "$SANDBOX_MODE" != "bwrap" ]; then
+  echo "catalog-proxy: --hide-lib/--hide-pipewire-stack/--hide-bundled require --sandbox bwrap" >&2
+  usage
+fi
+if [ "$HIDE_BUNDLED" = 1 ] && [ -z "$APPIMAGE" ] && [ -z "$APPDIR_ARG" ]; then
+  echo "catalog-proxy: --hide-bundled requires --appimage or --appdir (a bare --binary has no bundled usr/lib to enumerate)" >&2
   usage
 fi
 
@@ -647,6 +715,49 @@ if [ "$HIDE_PIPEWIRE_STACK" = 1 ]; then
   done
 fi
 
+# --hide-bundled (D-01/15.4-03): every *.so / *.so.N file basename found
+# anywhere under the AppDir's usr/lib -- a single recursive find already
+# covers usr/lib/pipewire-fallback/ too, so no separate case is needed for
+# that one. Deliberately basename-only (matches resolve_host_lib_paths'
+# own SONAME-keyed lookup below), not a soname read off the ELF itself --
+# good enough to prove the bundle doesn't lean on a host copy of the same
+# filename, which is exactly what this flag is for.
+# Sandbox-bootstrap exemption: `env` and `dbus-run-session` (see LAUNCH_CMD
+# below) run INSIDE the bwrap mount namespace too, before the actual AppRun
+# exec -- they must still resolve their OWN host libraries to run at all.
+# --hide-bundled's "every soname under usr/lib" is broad enough to catch an
+# incidental host lib (e.g. libselinux, pulled in only because this build
+# host's system GTK4 package links against far more than the GTK4/libadwaita
+# core -- gstreamer, appstream, curl, kerberos, ...) that those bootstrap
+# tools also happen to need, which would break the sandbox before cleanmic
+# ever execs -- a false FAIL unrelated to whether cleanmic itself leans on a
+# host copy of anything it bundles. Exempt only sonames those specific
+# tools need, computed from THIS host's own copies (the same ones that will
+# actually run inside the sandbox).
+BOOTSTRAP_SONAMES=()
+if [ "$HIDE_BUNDLED" = 1 ]; then
+  for bstool in env dbus-run-session bash sh; do
+    bstool_path="$(command -v "$bstool" 2>/dev/null || true)"
+    [ -n "$bstool_path" ] || continue
+    while IFS= read -r bs; do
+      [ -n "$bs" ] || continue
+      case " ${BOOTSTRAP_SONAMES[*]:-} " in *" $bs "*) continue ;; esac
+      BOOTSTRAP_SONAMES+=("$bs")
+    done < <(ldd "$bstool_path" 2>/dev/null | awk '{print $1}')
+  done
+fi
+
+BUNDLED_SONAME_COUNT=0
+if [ "$HIDE_BUNDLED" = 1 ] && [ -n "$EXTRACT_DIR" ] && [ -d "$EXTRACT_DIR/usr/lib" ]; then
+  while IFS= read -r -d '' bf; do
+    bn="$(basename "$bf")"
+    case " ${BOOTSTRAP_SONAMES[*]:-} " in *" $bn "*) continue ;; esac
+    case " ${SONAMES_TO_HIDE[*]:-} " in *" $bn "*) continue ;; esac
+    SONAMES_TO_HIDE+=("$bn")
+    BUNDLED_SONAME_COUNT=$((BUNDLED_SONAME_COUNT + 1))
+  done < <(find "$EXTRACT_DIR/usr/lib" -type f \( -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null)
+fi
+
 MASKED_FILES=()
 for s in "${SONAMES_TO_HIDE[@]}"; do
   while IFS= read -r p; do
@@ -937,6 +1048,9 @@ fi
   if [ "$SANDBOX_MODE" = "bwrap" ]; then
     echo "- Masked lib files: ${MASKED_FILES[*]:-none}"
     echo "- Masked dirs (tmpfs): ${MASKED_DIRS[*]:-none}"
+    if [ "$HIDE_BUNDLED" = 1 ]; then
+      echo "- --hide-bundled: masked $BUNDLED_SONAME_COUNT distinct soname(s) found under the AppDir's usr/lib"
+    fi
   fi
   echo "- Git HEAD: $GIT_HEAD ($GIT_DIRTY)"
   echo

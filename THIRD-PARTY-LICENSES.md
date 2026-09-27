@@ -18,6 +18,9 @@ only:
 - `libpipewire-0.3.so.0` (PipeWire client library — bundled as a **fallback
   only**, used exclusively on hosts with no PipeWire installed at all; see
   "PipeWire client library" below)
+- GTK4, libadwaita, and their non-excluded transitive dependencies (D-01,
+  15.4-03) — bundled by default (`CLEANMIC_BUNDLE_GTK=1`); see "Bundled GTK
+  stack" below
 
 A full **Rust-crate** (Cargo) license inventory — i.e. auditing every `cargo`
 dependency CleanMic links against at the source level — is out of scope here.
@@ -353,6 +356,81 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
+
+## Bundled GTK stack (D-01, 15.4-03)
+
+- **What:** GTK4, libadwaita, and their non-excluded transitive shared-library
+  dependencies (GLib/GObject/GIO, Pango, gdk-pixbuf, librsvg, Cairo,
+  HarfBuzz, GObject-Introspection typelibs, and more), bundled by
+  `scripts/build-appimage.sh`'s GTK deploy step (`CLEANMIC_BUNDLE_GTK=1`,
+  the default) via `linuxdeploy` + `linuxdeploy-plugin-gtk`. Set
+  `CLEANMIC_BUNDLE_GTK=0` to fall back to the pre-15.4-03 host-provided
+  build instead. The AppImage excludelist's own libraries (glibc, `libGL`/
+  `libEGL`/Mesa, `libdrm`, fontconfig, freetype, HarfBuzz's own excludelist
+  entry note aside, X11/Wayland client libraries, `libpipewire-0.3.so.0`,
+  and the rest — see `https://github.com/AppImage/AppImages/excludelist`)
+  are never bundled directly under `usr/lib`; `libdbus-1.so*` is also kept
+  host-provided by explicit choice (D-01), even though it is not on that
+  excludelist. `libpipewire-0.3.so.0` ships separately as the documented
+  D-10 fallback-only copy (see "PipeWire client library" above) — not part
+  of this bundle.
+- **Why so many libraries:** the exact transitive closure bundled depends
+  entirely on the build host's own GTK4 package — a desktop-full Ubuntu
+  GTK4 build links against far more than the GTK4/libadwaita core itself
+  (image codecs, a GStreamer-based media backend, AppStream integration,
+  CUPS printing, and more all transitively resolve through GTK4's own
+  optional features). The CI-built jammy/noble variants (D-09,
+  `scripts/ci/build-gtk-stack.sh`) compile a deliberately minimal GTK4 +
+  libadwaita (introspection, media-gstreamer, print backends, demos,
+  examples, tests, and docs all off) and therefore bundle a much smaller
+  set. Either way, the **exact** file list, resolved soname, and source
+  package + version for a given build is always in
+  `usr/share/doc/cleanmic/BUNDLED-LIBRARIES.txt` inside that build's own
+  AppImage — regenerated on every build, never hand-maintained, and the
+  authoritative record for that build's LGPL "accompanying offer" /
+  provenance requirement. This document only records the core families
+  D-01 explicitly bundles and their license family; it does not attempt to
+  re-enumerate every transitively-swept-in library license text (the
+  bundle can exceed 150 files depending on the build host) — the exact
+  package + version for any of them is one line away in
+  BUNDLED-LIBRARIES.txt, and from there, the distro's own published source
+  package (`apt-get source <package>` or the distro's package archive) or
+  upstream release tarball for that exact version.
+- **Core license families** (the libraries D-01 is actually about — GTK4,
+  libadwaita, and their immediate GNOME-stack neighbors):
+
+  | Library | Source | Primary runtime license (SPDX) |
+  |---|---|---|
+  | GTK4 (`libgtk-4.so.1`) | https://gitlab.gnome.org/GNOME/gtk | `LGPL-2.1-or-later` |
+  | libadwaita (`libadwaita-1.so.0`) | https://gitlab.gnome.org/GNOME/libadwaita | `LGPL-2.1-or-later` |
+  | GLib / GObject / GIO (`libglib-2.0.so.0`, `libgobject-2.0.so.0`, `libgio-2.0.so.0`) | https://gitlab.gnome.org/GNOME/glib | `LGPL-2.1-or-later` |
+  | Pango (`libpango-1.0.so.0` and friends) | https://gitlab.gnome.org/GNOME/pango | `LGPL-2.0-or-later` |
+  | gdk-pixbuf (`libgdk_pixbuf-2.0.so.0`) | https://gitlab.gnome.org/GNOME/gdk-pixbuf | `LGPL-2.0-or-later` |
+  | librsvg (`librsvg-2.so.2`) | https://gitlab.gnome.org/GNOME/librsvg | `MIT` / `BSD-3-Clause` (Rust-based since librsvg 2.5x) |
+  | Cairo (`libcairo.so.2` and friends) | https://gitlab.freedesktop.org/cairo/cairo | `LGPL-2.1-or-later` (dual with `MPL-1.1`, not exercised here) |
+  | HarfBuzz (`libharfbuzz.so.0`) | https://github.com/harfbuzz/harfbuzz | `MIT` |
+  | graphene (`libgraphene-1.0.so.0`) | https://github.com/ebassi/graphene | `MIT` |
+  | GObject-Introspection typelibs (`usr/lib/girepository-1.0/*.typelib`) | https://gitlab.gnome.org/GNOME/gobject-introspection | `LGPL-2.1-or-later` (generated metadata, not compiled code) |
+
+  Every one of these is copyleft-lenient (LGPL) or permissive (MIT/BSD) at
+  the runtime-library level — none requires CleanMic's own MIT-licensed
+  source to change license, only that LGPL's own terms (source availability
+  for the LGPL'd library itself, at the version actually shipped) are met.
+  That requirement is satisfied by each library's own public upstream
+  source (linked above) at the version BUNDLED-LIBRARIES.txt records for a
+  given release, or — for a distro-packaged build — the distro's own
+  published source package for that exact version.
+- **Everything else bundled** (the remainder of the transitive closure —
+  image format codecs, GStreamer plugins, TLS/crypto/network libraries
+  incidentally pulled in through GLib's optional GIO network backends, and
+  more): every one of these is itself an ordinary Linux desktop shared
+  library, each independently licensed (predominantly LGPL, MIT, or
+  BSD-family in this closure — no GPL-only library was found in it). Their
+  exact identity, source package, and version for any given build are in
+  that build's `usr/share/doc/cleanmic/BUNDLED-LIBRARIES.txt`, generated
+  from `dpkg -S`/`dpkg-query` against the build host's own package
+  database (or "built from source" for anything not owned by a distro
+  package — e.g. `libdeep_filter_ladspa.so`, already covered above).
 
 ## DPDFNet-2 / DPDFNet-8 (pretrained ONNX model weights)
 
