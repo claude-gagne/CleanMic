@@ -15,6 +15,9 @@ only:
 - `dpdfnet2_48khz_hr.onnx` / `dpdfnet8_48khz_hr.onnx` (DPDFNet-2 / DPDFNet-8
   pretrained model weights — bundled independently per variant; see
   "DPDFNet-2 / DPDFNet-8" below)
+- `libpipewire-0.3.so.0` (PipeWire client library — bundled as a **fallback
+  only**, used exclusively on hosts with no PipeWire installed at all; see
+  "PipeWire client library" below)
 
 A full **Rust-crate** (Cargo) license inventory — i.e. auditing every `cargo`
 dependency CleanMic links against at the source level — is out of scope here.
@@ -289,6 +292,66 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+```
+
+## PipeWire client library (`libpipewire-0.3.so.0`, fallback only)
+
+- **What:** The PipeWire client shared library, bundled as a **fallback
+  copy only** at `usr/lib/pipewire-fallback/libpipewire-0.3.so.0` — never
+  placed in `usr/lib` itself, where it would shadow the host's own copy.
+  `scripts/appimage-apprun.sh` (AppRun) adds the fallback directory to
+  `LD_LIBRARY_PATH` ONLY when the host has no `libpipewire-0.3.so.0` on its
+  linker search path at all (D-10, 15.4-02). On any host that already has
+  PipeWire installed — i.e. every real user — the host's own copy is the
+  one that resolves first, so CleanMic never loads a client library that
+  could be at a different ABI version than the host's own PipeWire
+  daemon/session manager. This is the intent behind the official AppImage
+  excludelist singling out `libpipewire-0.3.so.0` for exactly this
+  client/daemon skew risk (see 15.4-RESEARCH.md's "Architecture Decision:
+  PipeWire Bundling").
+- **Source:** https://gitlab.freedesktop.org/pipewire/pipewire
+- **Version bundled:** whichever `libpipewire-0.3.so.0` the build host has
+  installed at build time — `scripts/build-appimage.sh` resolves it via
+  `ldd`/`readlink -f` and fails the build if it cannot be resolved, or if
+  the resolved file needs anything beyond glibc and the dynamic loader.
+  This repo's own build host had Ubuntu package `libpipewire-0.3-0t64`
+  version `1.6.2-1ubuntu1.2` installed.
+- **SPDX license identifier:** `MIT` (Debian's packaged `copyright` file for
+  `libpipewire-0.3-0t64` calls this "Expat" — the same license text as MIT —
+  for every file under this library's own build; the `LGPL-2+` /
+  `LGPL-2.1+` / `GPL-2` entries in PipeWire's upstream copyright file cover
+  JACK-compat shims, ALSA mixer profile data, and Bluetooth modules that are
+  not part of `libpipewire-0.3.so.0`'s own runtime and are not bundled here
+  — confirmed empirically: the bundled file's own `ldd` output lists only
+  `libc.so.6` and the dynamic loader).
+- **Copyright:** 2009 Lennart Poettering; 2010 David Henningsson; 2013
+  Inigo Quilez; 2015–2022 Wim Taymans; 2016–2021 Axis Communications;
+  2018–2022 Collabora Ltd.; 2020 Konsulko Group; 2020 Sergey Bugaev; 2020
+  Georges Basile Stavracas Neto; 2021 jothepro; 2019–2021 Red Hat, Inc.;
+  2021 Arun Raghavan; 2013 The Chromium OS Authors; 2010 Google Inc.; 2017
+  HiFi-LoFi; 2000–2002 Richard W.E. Furse, Paul Barton-Davis; 2021 Sanchayan
+  Maity; 2021 Pauli Virtanen; 2021 Florian Hülsmann.
+
+### PipeWire — MIT ("Expat") License (full text)
+
+```
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 ## DPDFNet-2 / DPDFNet-8 (pretrained ONNX model weights)

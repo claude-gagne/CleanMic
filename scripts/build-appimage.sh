@@ -10,10 +10,17 @@
 #   - wget or curl (to download appimagetool if not cached)
 #
 # The resulting AppImage assumes the target system has:
-#   - GTK4 + libadwaita (standard on Ubuntu 24.04 with GNOME)
-#   - PipeWire (standard on Ubuntu 22.04+)
-#   - D-Bus
+#   - GTK4 + libadwaita (standard on Ubuntu 24.04 with GNOME) -- host-provided
+#     until Plan 03 bundles them
+#   - D-Bus -- always host-provided
 # These libraries are NOT bundled in the AppImage.
+#
+# PipeWire's client library (libpipewire-0.3.so.0) ships as a FALLBACK ONLY
+# (D-10, 15.4-02): a copy lives at usr/lib/pipewire-fallback/, and AppRun
+# (scripts/appimage-apprun.sh) adds that dir to LD_LIBRARY_PATH ONLY when the
+# host has no libpipewire-0.3.so.0 at all. A normal install always resolves
+# its own system copy first -- there is never a client/daemon ABI mismatch.
+# See THIRD-PARTY-LICENSES.md's "PipeWire client library" section.
 
 set -euo pipefail
 
@@ -189,6 +196,38 @@ info "Installing binary..."
 cp "$BINARY" "$APPDIR/usr/bin/cleanmic"
 strip "$APPDIR/usr/bin/cleanmic" 2>/dev/null || warn "strip not available, binary not stripped"
 
+# ── Step 3-pw: Bundle libpipewire-0.3.so.0 as a host-absent fallback (D-10) ─
+# Real users keep loading their own system PipeWire client library -- this
+# copy is NEVER placed in usr/lib itself (which AppRun's LD_LIBRARY_PATH
+# always resolves first); it lives only in usr/lib/pipewire-fallback/, which
+# AppRun (scripts/appimage-apprun.sh) appends to LD_LIBRARY_PATH ONLY when
+# ldd reports libpipewire-0.3.so.0 unresolved on the host. This respects the
+# AppImage excludelist's intent (client/daemon ABI-skew risk) while still
+# fixing the catalog's actual failure: a host with no libpipewire at all.
+info "Bundling libpipewire-0.3.so.0 fallback (host-absent only, D-10)..."
+PIPEWIRE_SONAME="libpipewire-0.3.so.0"
+PIPEWIRE_LDD_LINE="$(ldd "$BINARY" 2>/dev/null | grep "$PIPEWIRE_SONAME" || true)"
+PIPEWIRE_RESOLVED="$(printf '%s' "$PIPEWIRE_LDD_LINE" | awk '{print $3}')"
+if [ -z "$PIPEWIRE_RESOLVED" ] || [ ! -e "$PIPEWIRE_RESOLVED" ]; then
+    error "Could not resolve $PIPEWIRE_SONAME on the build host via ldd -- cannot bundle the D-10 fallback copy. (ldd output: ${PIPEWIRE_LDD_LINE:-<empty>})"
+fi
+PIPEWIRE_REAL="$(readlink -f "$PIPEWIRE_RESOLVED")"
+if [ ! -f "$PIPEWIRE_REAL" ]; then
+    error "Resolved $PIPEWIRE_SONAME target does not exist: $PIPEWIRE_REAL"
+fi
+mkdir -p "$APPDIR/usr/lib/pipewire-fallback"
+cp "$PIPEWIRE_REAL" "$APPDIR/usr/lib/pipewire-fallback/$PIPEWIRE_SONAME"
+# The fallback copy must depend on nothing beyond glibc/the loader -- if the
+# build host's own PipeWire client needed anything else, bundling it here
+# would just move the "cannot open shared object file" failure one level
+# down, onto a host that also lacks whatever that extra dependency is.
+PIPEWIRE_FALLBACK_DEPS="$(ldd "$APPDIR/usr/lib/pipewire-fallback/$PIPEWIRE_SONAME" 2>/dev/null | grep -Ev 'linux-vdso\.so|libc\.so|ld-linux' || true)"
+if [ -n "$PIPEWIRE_FALLBACK_DEPS" ]; then
+    error "The resolved $PIPEWIRE_SONAME ($PIPEWIRE_REAL) needs more than glibc/the loader -- refusing to bundle it as a D-10 fallback:
+$PIPEWIRE_FALLBACK_DEPS"
+fi
+info "  Bundled fallback: usr/lib/pipewire-fallback/$PIPEWIRE_SONAME (from $PIPEWIRE_REAL)"
+
 # ── Step 3a: Bundle the pre-flight dependency-check helper ──────────────────
 # AppRun invokes this immediately before exec to catch a missing host library
 # (e.g. libadwaita-1.so.0) with a clear message instead of a cryptic linker
@@ -272,54 +311,16 @@ for podir in "$PROJECT_ROOT"/locale/*/LC_MESSAGES; do
 done
 
 # ── Step 6: Create AppRun entry point ────────────────────────────────────────
+# AppRun now lives in its own template (scripts/appimage-apprun.sh) instead
+# of a heredoc here, so scripts/test-appimage-apprun.sh can exercise it
+# directly (D-10's fallback decision, the pre-flight exit-code contract).
 info "Creating AppRun..."
 
-cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
-#!/bin/bash
-# AppRun -- entry point for CleanMic AppImage
-HERE="$(dirname "$(readlink -f "$0")")"
-
-# APPDIR is set by the AppImage runtime before AppRun is called.
-# Export it explicitly so child processes can find bundled libraries.
-export APPDIR="${APPDIR:-$HERE}"
-
-# Add bundled libraries to search path so dlopen() can find them.
-export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-# Constrain FFTW/OpenBLAS thread pools to prevent Khip from saturating all cores.
-export OPENBLAS_NUM_THREADS=1
-export OMP_NUM_THREADS=1
-export FFTW_NUM_THREADS=1
-
-export PATH="$HERE/usr/bin:$PATH"
-export XDG_DATA_DIRS="$HERE/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
-
-# Set up locale search path so gettext finds bundled .mo files
-export TEXTDOMAIN=cleanmic
-export TEXTDOMAINDIR="$HERE/usr/share/locale"
-
-# Pre-flight: abort launch with a clear message if a required host library
-# (e.g. libadwaita-1.so.0) is missing, instead of a cryptic linker crash.
-# Inherits the LD_LIBRARY_PATH/env exported above so ldd sees exactly what
-# the real launch would resolve. Fails open (exits 0 fast) when nothing is
-# missing, so the happy path pays only this one extra invocation.
-#
-# Exit code 3 is the ONE sentinel meaning "a required library is genuinely
-# missing" -- only that code aborts launch. Any OTHER nonzero exit means the
-# helper itself failed to run (crash, bad shebang, lost +x, etc.), which is
-# unrelated to a missing library; fail OPEN in that case so a bug in the
-# ~90-line helper can never brick a healthy launch.
-"$HERE/usr/bin/cleanmic-preflight" "$HERE/usr/bin/cleanmic"
-PREFLIGHT_STATUS=$?
-if [ "$PREFLIGHT_STATUS" -eq 3 ]; then
-    exit 1
-elif [ "$PREFLIGHT_STATUS" -ne 0 ]; then
-    echo "cleanmic-preflight: unexpected exit status $PREFLIGHT_STATUS -- ignoring and launching anyway (fail-open)" >&2
+APPRUN_SRC="$SCRIPT_DIR/appimage-apprun.sh"
+if [ ! -f "$APPRUN_SRC" ]; then
+    error "Required file not found: $APPRUN_SRC"
 fi
-
-exec "$HERE/usr/bin/cleanmic" "$@"
-APPRUN_EOF
-
+cp "$APPRUN_SRC" "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
 
 # ── Step 7: Download appimagetool if needed ──────────────────────────────────
