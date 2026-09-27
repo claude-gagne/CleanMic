@@ -153,21 +153,16 @@ impl PipeWireManager {
 
     /// Build a manager that never contacts the PipeWire daemon.
     ///
-    /// Every unit test that does not specifically exercise the live path
-    /// (see the `live_pw_*` tests, opt-in via `CLEANMIC_LIVE_PW_TESTS=1` /
-    /// `make test-live`) must use this instead of [`Self::connect()`], which
-    /// under the `pipewire` feature reaches the real daemon and would create
-    /// a real "CleanMic" node in the developer's session on every
-    /// `cargo test --all-features` run.
-    ///
-    /// Builds the same ring buffers, device enumerator and monitor output as
-    /// [`Self::connect()`]; under the `pipewire` feature `inner` is `None`
-    /// (no daemon connection), so every delegating method behaves exactly
-    /// like the non-pipewire stub branch of that method (create/destroy flip
-    /// only `virtual_mic_active`, `cleanup_orphans` is `Ok`, `enable_monitor`
-    /// returns the writer without touching PipeWire, etc).
-    #[cfg(test)]
-    pub(crate) fn offline() -> Self {
+    /// Used when the daemon (or the client library itself) is absent at
+    /// startup (D-02): [`crate::app::run`] falls back to this instead of
+    /// propagating [`Self::connect()`]'s error, so the app can still build
+    /// its window and show a translated banner rather than exiting before
+    /// any UI appears. Every delegating method behaves exactly like the
+    /// non-`pipewire`-feature stub branch of that method — create/destroy
+    /// flip only `virtual_mic_active`, `cleanup_orphans` is `Ok`,
+    /// `enable_monitor` returns the writer without touching PipeWire, etc.
+    /// [`Self::offline()`] (test-only) is built on top of this.
+    pub fn unavailable() -> Self {
         let (capture_writer, capture_reader) = ringbuf::ring_buffer(RING_BUF_CAPACITY);
         let (output_writer, output_reader) = ringbuf::ring_buffer(RING_BUF_CAPACITY);
 
@@ -182,6 +177,23 @@ impl PipeWireManager {
             #[cfg(feature = "pipewire")]
             inner: None,
         }
+    }
+
+    /// Build a manager that never contacts the PipeWire daemon.
+    ///
+    /// Every unit test that does not specifically exercise the live path
+    /// (see the `live_pw_*` tests, opt-in via `CLEANMIC_LIVE_PW_TESTS=1` /
+    /// `make test-live`) must use this instead of [`Self::connect()`], which
+    /// under the `pipewire` feature reaches the real daemon and would create
+    /// a real "CleanMic" node in the developer's session on every
+    /// `cargo test --all-features` run.
+    ///
+    /// Identical to [`Self::unavailable()`] — kept as a distinct, test-only
+    /// name so test call sites read as "no daemon in this test" rather than
+    /// "the daemon is genuinely absent on this system".
+    #[cfg(test)]
+    pub(crate) fn offline() -> Self {
+        Self::unavailable()
     }
 
     /// Create the "CleanMic" virtual source node.

@@ -41,6 +41,14 @@ const MONITOR_SCRATCH_MAX_FRAMES: usize = 8_192;
 /// past the end of the struct PipeWire allocated, so it must never be read.
 const PW_BUFFER_REQUESTED_SINCE: (u32, u32, u32) = (0, 3, 50);
 
+/// Bounds how long [`LivePipeWireManager::connect`] waits for the PW
+/// thread's connect handshake (D-02, T-15.4-01). The daemon-unreachable case
+/// normally resolves in milliseconds (the socket connect fails fast), so 3s
+/// is generous headroom for a slow/loaded system without leaving the caller
+/// (and, through it, the whole GTK window) hanging indefinitely on a daemon
+/// that will never answer.
+const PW_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Parses a libpipewire version string (`"1.6.2"`, `"0.3.48"`) into
 /// `(major, minor, micro)`; a missing micro counts as 0.
 fn parse_pw_version(version: &str) -> Option<(u32, u32, u32)> {
@@ -183,6 +191,39 @@ enum PipeWireCommand {
     Quit,
 }
 
+/// Waits on `receiver` for the PW thread's one-shot connect-handshake
+/// report, bounded by `timeout` (D-02, T-15.4-01).
+///
+/// Pure with respect to PipeWire — takes a plain `std::sync::mpsc::Receiver`
+/// so it is unit-testable with a synthetic channel and no live daemon. Maps
+/// every outcome to a `PipeWireError::ConnectionFailed` except a clean
+/// `Ok(())` report:
+/// - `Ok(Ok(()))` — the handshake (MainLoop -> Context -> Core) succeeded.
+/// - `Ok(Err(msg))` — one of the three steps failed; `msg` names which.
+/// - `RecvTimeoutError::Timeout` — the PW thread never reported within
+///   `timeout` (e.g. a hung `context.connect()`).
+/// - `RecvTimeoutError::Disconnected` — the PW thread died (panicked) before
+///   sending anything, dropping its end of the channel.
+fn await_connect_status(
+    receiver: &std::sync::mpsc::Receiver<Result<(), String>>,
+    timeout: std::time::Duration,
+) -> Result<(), PipeWireError> {
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(PipeWireError::ConnectionFailed(msg)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(PipeWireError::ConnectionFailed(
+            format!("timed out after {timeout:?} waiting for the PipeWire connect handshake"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(PipeWireError::ConnectionFailed(
+                "the PipeWire thread dropped the connect-status channel before responding \
+                 (it likely panicked)"
+                    .into(),
+            ))
+        }
+    }
+}
+
 impl LivePipeWireManager {
     /// Connect to the PipeWire daemon by initializing the library and spawning
     /// the main-loop thread.
@@ -214,15 +255,37 @@ impl LivePipeWireManager {
 
         // Channel for sending commands to the PW thread.
         let (sender, receiver) = pw::channel::channel::<PipeWireCommand>();
+        // Separate, plain std channel the PW thread uses to report exactly
+        // once whether the connect handshake (MainLoop -> Context -> Core)
+        // succeeded (D-02, T-15.4-01). Kept independent of `pw::channel` so
+        // `await_connect_status` is testable with no PipeWire involved.
+        let (status_tx, status_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
         let pw_thread = thread::Builder::new()
             .name("cleanmic-pw".into())
             .spawn(move || {
-                Self::pw_thread_main(receiver, stream_active_clone, daemon_disconnected_clone);
+                Self::pw_thread_main(
+                    receiver,
+                    stream_active_clone,
+                    daemon_disconnected_clone,
+                    status_tx,
+                );
             })
             .map_err(|e| {
                 PipeWireError::ConnectionFailed(format!("failed to spawn PW thread: {e}"))
             })?;
+
+        if let Err(e) = await_connect_status(&status_rx, PW_CONNECT_TIMEOUT) {
+            // Best-effort: ask the PW thread to quit in case it is still
+            // alive past the handshake window (e.g. blocked inside
+            // `context.connect()`), so no orphan main loop keeps running.
+            // This is a no-op if the thread already returned on its own
+            // (the receiver end of `loop_sender`'s channel is gone) or if it
+            // never got far enough to attach the command receiver — either
+            // way there is nothing left to leak.
+            let _ = sender.send(PipeWireCommand::Quit);
+            return Err(e);
+        }
 
         log::info!("Connected to PipeWire daemon (main loop running on dedicated thread)");
 
@@ -245,18 +308,51 @@ impl LivePipeWireManager {
     }
 
     /// Body of the PipeWire thread: runs the main loop and handles commands.
+    ///
+    /// D-02 / T-15.4-01: none of the three connect steps may panic anymore —
+    /// each failure is reported through `status_tx` and the thread returns
+    /// cleanly instead, so a daemon-unreachable session degrades to a
+    /// non-fatal `Err` at the `connect()` call site rather than crashing the
+    /// process before any window can appear.
     fn pw_thread_main(
         receiver: pw::channel::Receiver<PipeWireCommand>,
         stream_active: Arc<AtomicBool>,
         daemon_disconnected: Arc<AtomicBool>,
+        status_tx: std::sync::mpsc::Sender<Result<(), String>>,
     ) {
-        let mainloop =
-            pw::main_loop::MainLoop::new(None).expect("failed to create PipeWire MainLoop");
-        let context =
-            pw::context::Context::new(&mainloop).expect("failed to create PipeWire Context");
-        let core = context
-            .connect(None)
-            .expect("failed to connect to PipeWire Core");
+        let mainloop = match pw::main_loop::MainLoop::new(None) {
+            Ok(ml) => ml,
+            Err(e) => {
+                let _ = status_tx.send(Err(format!("failed to create PipeWire MainLoop: {e}")));
+                return;
+            }
+        };
+        let context = match pw::context::Context::new(&mainloop) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                let _ = status_tx.send(Err(format!("failed to create PipeWire Context: {e}")));
+                return;
+            }
+        };
+        let core = match context.connect(None) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = status_tx.send(Err(format!("failed to connect to PipeWire Core: {e}")));
+                return;
+            }
+        };
+
+        // Report the successful handshake before doing anything else. If
+        // this fails, `connect()` already gave up (timed out) and dropped
+        // its receiver — there is no caller left to serve, so tear down
+        // without attaching the command receiver or running the main loop.
+        if status_tx.send(Ok(())).is_err() {
+            log::warn!(
+                "PW thread: connect handshake succeeded but connect() had already timed out \
+                 and stopped listening — exiting without starting the main loop"
+            );
+            return;
+        }
 
         // Attach a core error listener to detect daemon disconnects.
         let daemon_disconnected_core = Arc::clone(&daemon_disconnected);
@@ -1448,5 +1544,58 @@ mod tests {
         assert!(ok("1.0.5"), "Ubuntu 24.04");
         assert!(ok("1.6.2"));
         assert!(!ok("not-a-version"), "unparsable must fall back safely");
+    }
+
+    // `await_connect_status` is a pure function over a plain
+    // `std::sync::mpsc::Receiver`, so all four handshake outcomes (D-02,
+    // T-15.4-01) are testable here with a synthetic channel — no PipeWire,
+    // no live daemon, no PW thread involved.
+
+    #[test]
+    fn await_connect_status_ok_on_successful_handshake() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        tx.send(Ok(())).unwrap();
+        let result = await_connect_status(&rx, std::time::Duration::from_millis(100));
+        assert!(matches!(result, Ok(())), "got {result:?}");
+    }
+
+    #[test]
+    fn await_connect_status_maps_reported_failure() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        tx.send(Err("no such file or directory".to_string()))
+            .unwrap();
+        let result = await_connect_status(&rx, std::time::Duration::from_millis(100));
+        match result {
+            Err(PipeWireError::ConnectionFailed(msg)) => {
+                assert!(msg.contains("no such file or directory"), "got: {msg}");
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn await_connect_status_maps_timeout() {
+        // Sender kept alive but never sends — recv_timeout must expire.
+        let (_tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let result = await_connect_status(&rx, std::time::Duration::from_millis(50));
+        match result {
+            Err(PipeWireError::ConnectionFailed(msg)) => {
+                assert!(msg.to_lowercase().contains("timed out"), "got: {msg}");
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn await_connect_status_maps_dropped_sender() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        drop(tx);
+        let result = await_connect_status(&rx, std::time::Duration::from_millis(100));
+        match result {
+            Err(PipeWireError::ConnectionFailed(msg)) => {
+                assert!(msg.contains("panicked"), "got: {msg}");
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
     }
 }

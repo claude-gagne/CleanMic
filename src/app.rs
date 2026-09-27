@@ -121,6 +121,57 @@ fn resolve_initial_capture_target(pw: &PipeWireManager, config: &Config) -> Opti
     )
 }
 
+/// Startup audio decisions derived from environment state (D-02, D-10).
+///
+/// Pure so the two independent "the pipeline can't safely start yet"
+/// conditions — PipeWire being unreachable at all, vs. PipeWire being up but
+/// no physical input device being enumerable — can be reasoned about (and
+/// unit-tested) without any GTK/PipeWire side effects. `run()` and
+/// `run_with_gui()` apply the decision; this function never touches
+/// `Config` or the pipeline itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupAudioPlan {
+    /// Whether `pipeline.start()` should be called this session.
+    pub start_pipeline: bool,
+    /// Whether the enable toggle should render as interactive.
+    pub enable_toggle_available: bool,
+    /// Whether the no-PipeWire banner (D-02) should be revealed at window
+    /// build.
+    pub show_pipewire_banner: bool,
+}
+
+/// Derive the startup audio plan from the three signals available at boot.
+///
+/// When PipeWire itself is unreachable (`!pipewire_available`), the plan
+/// unconditionally refuses to start the pipeline and reveals the banner —
+/// regardless of `config_enabled` or `startup_no_input` — because a session
+/// without a daemon has no ring buffers to process through and no daemon to
+/// create a virtual mic on. Critically, the caller must NOT fold this
+/// decision back into `config.enabled`: the user's saved preference must
+/// survive a PipeWire-less session untouched (T-15.4-02).
+///
+/// When PipeWire is reachable, this collapses to the pre-D-02 behavior:
+/// start only if the user had it enabled AND a physical input device is
+/// available (D-10).
+fn startup_audio_plan(
+    pipewire_available: bool,
+    config_enabled: bool,
+    startup_no_input: bool,
+) -> StartupAudioPlan {
+    if !pipewire_available {
+        return StartupAudioPlan {
+            start_pipeline: false,
+            enable_toggle_available: false,
+            show_pipewire_banner: true,
+        };
+    }
+    StartupAudioPlan {
+        start_pipeline: config_enabled && !startup_no_input,
+        enable_toggle_available: !startup_no_input,
+        show_pipewire_banner: false,
+    }
+}
+
 /// Compute the picker's device list (R1, R2, OWNER-LOCK) as `DeviceInfo`s
 /// ready for `UiState`/`WindowHandles::update_device_list`.
 ///
@@ -1002,56 +1053,91 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
     }
 
     // -- Connect to PipeWire --
+    // D-02: with the `gui` feature, a failed connect is no longer fatal —
+    // the app degrades to a window-only, un-started session instead of
+    // exiting before any window appears (the catalog's exact failure mode).
+    // Without `gui` there is no window to carry a translated message to, so
+    // the headless build keeps failing fast with the original error context.
+    #[cfg(not(feature = "gui"))]
     let mut pw_manager = PipeWireManager::connect()
         .inspect_err(|_e| {
             log::error!("{}", errors::PIPEWIRE_NOT_RUNNING);
         })
         .context("failed to connect to PipeWire")?;
+    #[cfg(not(feature = "gui"))]
+    let pipewire_available = true;
 
-    // Clean up any orphaned nodes from a previous crashed session.
-    if let Err(e) = pw_manager.cleanup_orphans() {
-        log::warn!("Orphan cleanup failed (non-fatal): {}", e);
+    #[cfg(feature = "gui")]
+    let (mut pw_manager, pipewire_available) = match PipeWireManager::connect() {
+        Ok(m) => (m, true),
+        Err(e) => {
+            log::error!("{}: {e}", errors::PIPEWIRE_NOT_RUNNING);
+            (PipeWireManager::unavailable(), false)
+        }
+    };
+
+    // Everything below that talks to the daemon (orphan cleanup, resolving
+    // a capture target, creating the virtual mic) is skipped outright when
+    // PipeWire is unavailable — there is no daemon to clean up after, pin a
+    // target on, or create a node on.
+    if pipewire_available {
+        // Clean up any orphaned nodes from a previous crashed session.
+        if let Err(e) = pw_manager.cleanup_orphans() {
+            log::warn!("Orphan cleanup failed (non-fatal): {}", e);
+        }
+
+        // -- Resolve the initial capture target --
+        // The capture stream is pinned to a specific physical mic via
+        // PW_KEY_TARGET_OBJECT. Pinning prevents WirePlumber's default-source
+        // policy from re-routing the capture stream at runtime. The resolver
+        // (`resolve_runtime_capture_target`) never returns CleanMic itself
+        // because `list_input_devices()` filters it out — so we cannot
+        // accidentally pin the capture to CleanMic even when the user has
+        // selected CleanMic as the OS default input. Per D-06, the resolver
+        // result is NOT persisted to `config.input_device`; only explicit picks
+        // via the picker write there.
+        let initial_capture_target = resolve_initial_capture_target(&pw_manager, &config);
+        if initial_capture_target.is_none() {
+            log::warn!(
+                "No physical input devices found — capture will start unpinned; \
+                 enable toggle will be grayed out until a mic becomes available."
+            );
+        }
+
+        // -- Create the virtual mic --
+        pw_manager
+            .create_virtual_mic(initial_capture_target)
+            .context("failed to create virtual mic")?;
     }
-
-    // -- Resolve the initial capture target --
-    // The capture stream is pinned to a specific physical mic via
-    // PW_KEY_TARGET_OBJECT. Pinning prevents WirePlumber's default-source
-    // policy from re-routing the capture stream at runtime. The resolver
-    // (`resolve_runtime_capture_target`) never returns CleanMic itself
-    // because `list_input_devices()` filters it out — so we cannot
-    // accidentally pin the capture to CleanMic even when the user has
-    // selected CleanMic as the OS default input. Per D-06, the resolver
-    // result is NOT persisted to `config.input_device`; only explicit picks
-    // via the picker write there.
-    let initial_capture_target = resolve_initial_capture_target(&pw_manager, &config);
-    if initial_capture_target.is_none() {
-        log::warn!(
-            "No physical input devices found — capture will start unpinned; \
-             enable toggle will be grayed out until a mic becomes available."
-        );
-    }
-
-    // -- Create the virtual mic --
-    pw_manager
-        .create_virtual_mic(initial_capture_target)
-        .context("failed to create virtual mic")?;
 
     // -- Create audio pipeline --
     // Take ring buffer halves from the PipeWire manager so the audio thread
-    // can exchange audio with the PipeWire RT callbacks.
-    let pipeline = match (
-        pw_manager.take_capture_reader(),
-        pw_manager.take_output_writer(),
-    ) {
-        (Some(capture_reader), Some(output_writer)) => {
-            log::info!("Audio pipeline created with PipeWire ring buffers");
-            AudioPipeline::with_ring_buffers(capture_reader, output_writer)
-                .context("failed to spawn audio thread with ring buffers")?
+    // can exchange audio with the PipeWire RT callbacks. With PipeWire
+    // unavailable, force the simulation-mode fallback outright rather than
+    // going through `take_capture_reader`/`take_output_writer` — the
+    // unavailable manager's ring buffers are always `Some` (just never fed
+    // by anything real), so relying on that pair as an implicit branch
+    // would silently take the "real" path with a manager that isn't real.
+    let pipeline = if pipewire_available {
+        match (
+            pw_manager.take_capture_reader(),
+            pw_manager.take_output_writer(),
+        ) {
+            (Some(capture_reader), Some(output_writer)) => {
+                log::info!("Audio pipeline created with PipeWire ring buffers");
+                AudioPipeline::with_ring_buffers(capture_reader, output_writer)
+                    .context("failed to spawn audio thread with ring buffers")?
+            }
+            _ => {
+                log::warn!(
+                    "Ring buffers not available — audio pipeline running in simulation mode" // i18n-ignore
+                );
+                AudioPipeline::new().context("failed to spawn audio thread in simulation mode")?
+            }
         }
-        _ => {
-            log::warn!("Ring buffers not available — audio pipeline running in simulation mode");
-            AudioPipeline::new().context("failed to spawn audio thread in simulation mode")?
-        }
+    } else {
+        log::info!("PipeWire unavailable — audio pipeline running in simulation mode (D-02)");
+        AudioPipeline::new().context("failed to spawn audio thread in simulation mode")?
     };
 
     // Set the engine from config using the full fallback chain (D-02).
@@ -1102,7 +1188,13 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
     // monitor stream + ring-buffer writer are only created in the
     // MonitorToggled(true) handler, which never fires on pure startup.
     // Mirror that handler here to make startup equivalent to an on-toggle.
-    if config.monitor_enabled {
+    //
+    // Skipped outright when PipeWire is unavailable (D-02, T-15.4-02): there
+    // is no daemon to create a monitor stream on, and — critically —
+    // `config.monitor_enabled` must never be flipped to `false` just because
+    // this session couldn't restore it; the user's saved preference must
+    // survive a PipeWire-less session untouched.
+    if pipewire_available && config.monitor_enabled {
         match pw_manager.enable_monitor() {
             Ok(writer) => {
                 pipeline.set_monitor_writer(Some(writer));
@@ -1129,19 +1221,30 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
     // pipeline does not auto-start on an absent source and the enable toggle
     // does not render as sensitive/on for up to 1500ms before the polling
     // timer's first tick corrects it. Per WR-02.
-    let startup_no_input = {
+    //
+    // Only meaningful when PipeWire is reachable — D-02's own "PipeWire
+    // unavailable" state is a separate, stronger condition handled by
+    // `startup_audio_plan` below and must never fall through to this
+    // block's `config.enabled = false` mutation (T-15.4-02: a session
+    // without a daemon enumerates zero devices by construction, which would
+    // otherwise misreport as D-10 and persist a preference change the user
+    // never asked for).
+    let startup_no_input = if pipewire_available {
         let devices = pw_manager.device_enumerator().list_input_devices();
         let system_default_name = current_system_default_name(&pw_manager, &devices);
-        devices.is_empty() && system_default_name.is_none()
+        let no_input = devices.is_empty() && system_default_name.is_none();
+        if no_input {
+            log::warn!("D-10 at startup: no input device available — pipeline will not auto-start");
+            // Prevent the enable toggle from rendering as on against an absent
+            // source. Matches the transition-into-D-10 behaviour from the 1500ms
+            // timer (set_input_available(false) forces the toggle off which
+            // cascades to config.enabled = false).
+            config.enabled = false;
+        }
+        no_input
+    } else {
+        false
     };
-    if startup_no_input {
-        log::warn!("D-10 at startup: no input device available — pipeline will not auto-start");
-        // Prevent the enable toggle from rendering as on against an absent
-        // source. Matches the transition-into-D-10 behaviour from the 1500ms
-        // timer (set_input_available(false) forces the toggle off which
-        // cascades to config.enabled = false).
-        config.enabled = false;
-    }
 
     // Apply the persisted automatic-mic-volume preference before the
     // pipeline (potentially) auto-starts below, so the very first processed
@@ -1153,12 +1256,21 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
         config.auto_gain_enabled
     );
 
-    // Auto-start pipeline if enabled (including first run with default enabled=true).
-    if config.enabled {
+    // D-02: derive the startup plan from all three signals in one place —
+    // see `startup_audio_plan`'s own doc comment for why PipeWire-unavailable
+    // always wins regardless of `config.enabled`/`startup_no_input`.
+    let startup_plan = startup_audio_plan(pipewire_available, config.enabled, startup_no_input);
+
+    // Auto-start pipeline if the plan allows it (including first run with default enabled=true).
+    if startup_plan.start_pipeline {
         pipeline.start();
         log::info!("Audio pipeline auto-started (enabled=true)");
     } else {
-        log::info!("Audio pipeline not started (enabled=false)");
+        log::info!(
+            "Audio pipeline not started (enabled={}, pipewire_available={})", // i18n-ignore
+            config.enabled,
+            pipewire_available
+        );
     }
 
     // -- Run with GUI or headless --
@@ -1172,6 +1284,7 @@ pub fn run(launched_via_autostart: bool) -> Result<()> {
             startup_no_input,
             launched_via_autostart,
             startup_engine_fallback,
+            pipewire_available,
         )?;
     }
 
@@ -1260,7 +1373,16 @@ fn run_headless(
 /// is the common case (no fallback). Threaded through so the very first
 /// `UiState` reports the truthful active engine and a non-empty fallback
 /// notice rather than silently claiming `requested` is active.
+///
+/// `pipewire_available` is `false` when `run()` couldn't reach the daemon at
+/// all (D-02): the window still builds, but the no-PipeWire banner is
+/// revealed, the enable toggle renders insensitive (without touching
+/// `config.enabled`), and the D-05 reconnect check + 1500ms device-poll
+/// timer are never even registered — there is nothing for either to poll. A
+/// PipeWire-less session never attempts a live upgrade; the user restarts
+/// CleanMic once the daemon is back.
 #[cfg(feature = "gui")]
+#[allow(clippy::too_many_arguments)]
 fn run_with_gui(
     mut config: Config,
     pipeline: AudioPipeline,
@@ -1269,6 +1391,7 @@ fn run_with_gui(
     startup_no_input: bool,
     launched_via_autostart: bool,
     startup_engine_fallback: Option<(EngineType, EngineType)>,
+    pipewire_available: bool,
 ) -> Result<()> {
     use gtk4::glib;
     use gtk4::prelude::*;
@@ -1561,6 +1684,17 @@ fn run_with_gui(
         // Per WR-02.
         if startup_no_input {
             handles.set_input_available(false);
+        }
+
+        // D-02: reveal the no-PipeWire banner and gray out the enable
+        // toggle when the daemon was unreachable at startup. Deliberately
+        // uses `set_enable_sensitive` (sensitivity only) rather than
+        // `set_input_available` (which also forces the switch off and, via
+        // the row's active-notify handler, would persist
+        // `config.enabled = false` — exactly what T-15.4-02 forbids).
+        if !pipewire_available {
+            handles.set_pipewire_unavailable(true);
+            handles.set_enable_sensitive(false);
         }
 
         // Clone the full WindowHandles BEFORE any field moves (MeterRows
@@ -1979,9 +2113,15 @@ fn run_with_gui(
             }
 
             // --- PipeWire disconnect detection and one-attempt reconnect (D-05) ---
+            // Skipped outright when PipeWire was unavailable at startup
+            // (D-02): there is no live daemon connection to have disconnected
+            // from, and `pw_timer` holds the stub `unavailable()` manager
+            // whose `check_disconnected()` always reads false anyway — this
+            // guard just avoids polling an always-false flag on every tick.
             // Poll non-blocking: check_disconnected() reads an AtomicBool set by
             // the PW thread's core error callback when the daemon goes away.
-            if pw_timer.borrow().check_disconnected()
+            if pipewire_available
+                && pw_timer.borrow().check_disconnected()
                 && !pw_reconnect_attempted_timer.get()
             {
                 pw_reconnect_attempted_timer.set(true);
@@ -2089,7 +2229,12 @@ fn run_with_gui(
         // OS default just became CleanMic. Also enforces D-10: when no
         // physical mic is available, gray out the enable toggle and stop
         // the pipeline. Per D-03, D-04, D-06, D-08, D-10.
-        {
+        //
+        // Never even registered when PipeWire is unavailable (D-02): there
+        // is no live `pw-dump`/`pw-metadata` graph to poll, so registering
+        // this timer anyway would just spawn those subprocesses every 1.5s
+        // against a daemon that was never there, for no benefit.
+        if pipewire_available {
             let pw_timer_slow = pw_manager_clone.clone();
             let pipeline_timer_slow = pipeline_clone.clone();
             let config_timer_slow = config_clone.clone();
@@ -2846,6 +2991,60 @@ mod tests {
             "manual launch → always show, even with tray"
         );
         assert!(!gate(false, false), "manual launch + no tray → show");
+    }
+
+    /// Truth table for `startup_audio_plan` (D-02, T-15.4-02).
+    ///
+    /// PipeWire-unavailable must win unconditionally: neither
+    /// `config_enabled` nor `startup_no_input` can override it. When
+    /// PipeWire IS available, this collapses to the pre-D-02 D-10 behavior.
+    #[test]
+    fn startup_audio_plan_pipewire_unavailable_always_wins() {
+        for config_enabled in [false, true] {
+            for startup_no_input in [false, true] {
+                let plan = startup_audio_plan(false, config_enabled, startup_no_input);
+                assert!(
+                    !plan.start_pipeline,
+                    "pipewire unavailable must never start the pipeline \
+                     (config_enabled={config_enabled}, startup_no_input={startup_no_input})"
+                );
+                assert!(
+                    !plan.enable_toggle_available,
+                    "pipewire unavailable must gray out the enable toggle"
+                );
+                assert!(
+                    plan.show_pipewire_banner,
+                    "pipewire unavailable must reveal the banner"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_audio_plan_available_and_enabled_starts_when_input_present() {
+        let plan = startup_audio_plan(true, true, false);
+        assert!(plan.start_pipeline);
+        assert!(plan.enable_toggle_available);
+        assert!(!plan.show_pipewire_banner);
+    }
+
+    #[test]
+    fn startup_audio_plan_available_but_no_input_never_starts_regardless_of_enabled() {
+        let plan = startup_audio_plan(true, true, true);
+        assert!(
+            !plan.start_pipeline,
+            "D-10: no input device available must block auto-start"
+        );
+        assert!(!plan.enable_toggle_available);
+        assert!(!plan.show_pipewire_banner);
+    }
+
+    #[test]
+    fn startup_audio_plan_available_but_disabled_never_starts() {
+        let plan = startup_audio_plan(true, false, false);
+        assert!(!plan.start_pipeline);
+        assert!(plan.enable_toggle_available);
+        assert!(!plan.show_pipewire_banner);
     }
 
     /// Ensure the atomic shutdown flag can be set and read.

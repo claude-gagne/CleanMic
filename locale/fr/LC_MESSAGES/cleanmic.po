@@ -327,3 +327,15 @@ msgstr "%s n'arrivait pas à suivre sur cet ordinateur ; CleanMic a donc changé
 # FAILED engine's name.
 msgid "%s stopped working, so CleanMic switched engines to keep your microphone working. You can switch back in the main window."
 msgstr "%s a cessé de fonctionner ; CleanMic a donc changé de moteur pour que votre micro continue de fonctionner. Vous pouvez revenir en arrière depuis la fenêtre principale."
+
+# Phase 15.4 Plan 01: No-PipeWire banner title (D-02, src/ui/window.rs).
+# Kept deliberately short — AdwBanner titles get cut off at this window's
+# 420px width (quick task 260510-wqm). Must avoid the catalog OCR hard-phrase
+# list (research Pitfall 2): no "failed to", "unable to start", etc.
+msgid "Audio is off: PipeWire isn't running"
+msgstr "Audio désactivé : PipeWire n'est pas actif"
+
+# Phase 15.4 Plan 01: No-PipeWire wrapping explanation, shown alongside the
+# banner above (D-02, src/ui/window.rs).
+msgid "CleanMic needs PipeWire, the standard Linux audio service, to clean your microphone. Start or install PipeWire, then open CleanMic again."
+msgstr "CleanMic a besoin de PipeWire, le service audio standard de Linux, pour nettoyer votre micro. Démarrez ou installez PipeWire, puis rouvrez CleanMic."

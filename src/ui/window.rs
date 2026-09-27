@@ -103,6 +103,17 @@ pub struct WindowHandles {
     /// The update notification banner at the top of the window.
     /// Revealed when a new version is available (per D-05, D-08).
     pub update_banner: Banner,
+    /// The no-PipeWire banner (D-02) — revealed once at window build when
+    /// the daemon was unreachable at startup; never re-evaluated afterward
+    /// (a PipeWire-less session never attempts a live upgrade). Distinct
+    /// widget from `update_banner`: different trigger, different lifetime.
+    pipewire_banner: Banner,
+    /// The wrapping explanation label shown together with
+    /// `pipewire_banner`. AdwBanner titles get cut off at this window's
+    /// 420px width (quick task 260510-wqm dropped a banner for exactly this
+    /// reason), so the full sentence lives in its own label instead of
+    /// being crammed into the banner's title.
+    pipewire_explanation: gtk4::Label,
     /// Flag set while a programmatic engine switch (either a user row click
     /// handled in `build_engine_selector`, or a full state sync in
     /// [`update_from_state`](WindowHandles::update_from_state)) is
@@ -459,9 +470,36 @@ pub fn build_main_window(
         }
     });
 
+    // No-PipeWire banner (D-02) — hidden initially, revealed only when the
+    // app layer discovers the daemon is unreachable (`set_pipewire_unavailable`,
+    // called from `run_with_gui`). No button: there is nothing to click here,
+    // unlike the update banner's "Download".
+    let pipewire_banner = Banner::new(&tr!("Audio is off: PipeWire isn't running"));
+    pipewire_banner.set_revealed(false);
+
+    // The full explanation wraps in its own label (see the doc comment on
+    // `WindowHandles::pipewire_explanation` for why it isn't in the banner
+    // title itself). Every user-facing string here is short of the catalog
+    // OCR hard-phrase list (research Pitfall 2) — no "failed to", "unable
+    // to start", "cannot open", etc.
+    let pipewire_explanation = gtk4::Label::new(Some(&tr!(
+        "CleanMic needs PipeWire, the standard Linux audio service, to clean \
+         your microphone. Start or install PipeWire, then open CleanMic again."
+    )));
+    pipewire_explanation.set_wrap(true);
+    pipewire_explanation.set_wrap_mode(pango::WrapMode::WordChar);
+    pipewire_explanation.set_xalign(0.0);
+    pipewire_explanation.set_margin_start(12);
+    pipewire_explanation.set_margin_end(12);
+    pipewire_explanation.set_margin_top(6);
+    pipewire_explanation.set_margin_bottom(6);
+    pipewire_explanation.set_visible(false);
+
     let root = GBox::new(Orientation::Vertical, 0);
     root.append(&header);
     root.append(&update_banner);
+    root.append(&pipewire_banner);
+    root.append(&pipewire_explanation);
     root.append(&clamp);
     window.set_content(Some(&root));
 
@@ -679,6 +717,8 @@ pub fn build_main_window(
         device_updating,
         device_targets,
         update_banner,
+        pipewire_banner,
+        pipewire_explanation,
         strength_updating,
         mode_updating,
     }
@@ -1478,6 +1518,29 @@ impl WindowHandles {
                 self.enable_row.set_active(false);
             }
         }
+    }
+
+    /// Set the enable toggle's sensitivity WITHOUT touching its active
+    /// state (D-02, T-15.4-02).
+    ///
+    /// Unlike [`Self::set_input_available`], this never calls
+    /// `set_active(false)` — doing so would fire the row's
+    /// `active-notify` handler and dispatch `UiEvent::EnableToggled(false)`,
+    /// which cascades into `config.enabled = false` and a save. Used when
+    /// PipeWire itself is unreachable: the user's saved preference must
+    /// survive a PipeWire-less session untouched.
+    pub fn set_enable_sensitive(&self, sensitive: bool) {
+        self.enable_row.set_sensitive(sensitive);
+    }
+
+    /// Reveal or hide the no-PipeWire banner and its wrapping explanation
+    /// (D-02). Called once at window build when PipeWire was unreachable at
+    /// startup; a PipeWire-less session never attempts a live upgrade, so
+    /// this is never re-evaluated afterward — the user restarts CleanMic
+    /// once the daemon is back.
+    pub fn set_pipewire_unavailable(&self, unavailable: bool) {
+        self.pipewire_banner.set_revealed(unavailable);
+        self.pipewire_explanation.set_visible(unavailable);
     }
 }
 
