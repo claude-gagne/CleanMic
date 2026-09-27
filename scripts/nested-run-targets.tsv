@@ -27,7 +27,17 @@
 # is insensitive and deliberately has no target here). All numbers below were
 # measured with PIL against real screenshots taken via `nested-run.sh shot`
 # at GDK_SCALE 1 on a 520x960 Xephyr (`scripts/e2e/README.md` documents the
-# recalibration procedure step by step).
+# recalibration procedure step by step). The original numbers came from the
+# natural-height window (about 1215 px) clamped to that 520x960 display.
+#
+# Quick task 260927-mvb: the window opens 420 px wide at a 720 px default
+# height (down from the natural ~1215) and is now vertically resizable, with
+# the remembered height clamped to [400, min(natural, smallest monitor - 96,
+# 4320)]. Every target below is bottom-anchored (bottom_off) or top-anchored
+# (top_y) relative to the WINDOW's own edges, so none of these numbers needed
+# recalibration for the shorter default — `check-layout` was re-verified
+# (OK/UNREACHABLE only, never DRIFT) at the new 720 px default height in both
+# en and fr, real app, real Xephyr.
 #
 # WHY BOTTOM_OFF DIFFERS BY LANGUAGE ONLY FOR SOME ROWS: DPDFNet-8's subtitle
 # wraps to 3 lines in fr vs 2 in en, shifting every row's distance from the

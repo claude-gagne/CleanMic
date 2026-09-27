@@ -381,7 +381,7 @@ xephyr_alive() {
 
 # The known top-level Config fields (src/config.rs) a --config override may
 # touch, plus the strengths.<Engine> form.
-CONFIG_TOP_KEYS="input_device engine mode monitor_enabled enabled autostart khip_library_path tray_hint_shown tray_absent_notified autostart_hidden_notified last_seen_update_version auto_gain_enabled dpdfnet_default_migration_complete"
+CONFIG_TOP_KEYS="input_device engine mode monitor_enabled enabled autostart khip_library_path tray_hint_shown tray_absent_notified autostart_hidden_notified last_seen_update_version auto_gain_enabled dpdfnet_default_migration_complete window_height"
 
 cmd_launch() {
   parse_display "$@"

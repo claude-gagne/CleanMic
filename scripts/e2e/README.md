@@ -139,14 +139,30 @@ bash scripts/e2e-audio.sh --monitor-null-sink monitor
 run — the owner docks and undocks). Any connected output whose name is not
 `eDP*`/`LVDS*` means an external screen: scale 2, sized against the largest
 such output. Otherwise the laptop panel is used at scale 1. The logical
-window is 520×1300 (420 px wide + combo-popover headroom); the **size** is
-clamped to the screen (`width-40`, `height-120`) — the **scale** never is.
-`CLEANMIC_GDK_SCALE` can override the automatic scale, but a value SMALLER
-than the rule is ignored (with a printed explanation) unless
-`CLEANMIC_ALLOW_TINY=1` is also set — a leftover tiny override from another
-run must never silently reappear. The chosen scale and geometry are recorded
-per display; `launch`/`click`/`click-target`/`check-layout` read that record
-instead of recomputing it.
+**Xephyr display** is 520×1300 (420 px wide + combo-popover/resize headroom);
+the **size** is clamped to the screen (`width-40`, `height-120`) — the
+**scale** never is. `CLEANMIC_GDK_SCALE` can override the automatic scale,
+but a value SMALLER than the rule is ignored (with a printed explanation)
+unless `CLEANMIC_ALLOW_TINY=1` is also set — a leftover tiny override from
+another run must never silently reappear. The chosen scale and geometry are
+recorded per display; `launch`/`click`/`click-target`/`check-layout` read
+that record instead of recomputing it.
+
+**The CleanMic app window itself is a separate, smaller size from the
+Xephyr display it runs inside (quick task 260927-mvb):** 420 px wide, and
+420×720 by default — down from a natural content height of about 1215,
+which is why the Xephyr display above still needs 1300 px of logical
+headroom. The window is now vertically resizable (the width stays visually
+fixed via a content clamp — see `src/ui/window_geometry.rs`'s module doc for
+the full policy and its documented limits) and remembers its height in
+`config.toml`'s `window_height` key across launches. A fresh private config
+has no `window_height` at all, so every `launch` without an explicit
+override opens at the 720 px default. `--config 'window_height = N'`
+reproduces a specific remembered height (e.g. to re-check a smaller viewport
+without a live resize step first); at heights below a target's row, that
+target reports UNREACHABLE (exit 15) rather than DRIFT (exit 13) — the row
+genuinely isn't on screen, which is a different failure mode from a target
+whose calibrated coordinates now point at the wrong pixel.
 
 ## UI driving
 

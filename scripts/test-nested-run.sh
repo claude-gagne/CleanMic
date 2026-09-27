@@ -297,6 +297,7 @@ bad_config_case "bad config: monitor_enabled=true without --monitor-sink" 11 --c
 bad_config_case "bad config: --monitor-sink not prefixed cmtest_" 11 --monitor-sink alsa_output.foo
 bad_config_case "bad config: --no-pipewire refuses --monitor-sink" 2 --no-pipewire --monitor-sink cmtest_x
 bad_config_case "bad config: --no-pipewire refuses monitor_enabled=true" 2 --no-pipewire --config 'monitor_enabled = true'
+bad_config_case "config: window_height is a known key (stops at the Xephyr check)" 5 --config 'window_height = 560'
 
 # ---------------------------------------------------------------------------
 # summary
