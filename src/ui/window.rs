@@ -3,30 +3,45 @@
 //! Constructs the window using the GNOME preferences layout pattern:
 //!
 //! ```text
-//! AdwApplicationWindow
-//! ├── AdwHeaderBar
-//! └── AdwPreferencesPage
-//!     ├── [status group] — headline + routing info
-//!     ├── AdwPreferencesGroup "Input"
-//!     │   ├── AdwComboRow    — microphone picker
-//!     │   └── AdwSwitchRow   — enable / disable
-//!     ├── AdwPreferencesGroup "Noise Processing"
-//!     │   └── AdwActionRow×5 — engine selector (radio-grouped, fixed order
-//!     │                        per D-07: RNNoise / DeepFilterNet / DPDFNet-2
-//!     │                        / DPDFNet-8 / Khip)
-//!     ├── AdwPreferencesGroup "Strength"
-//!     │   └── AdwComboRow    — strength picker (Light / Balanced / Strong)
-//!     ├── AdwPreferencesGroup "Levels"
-//!     │   ├── MeterRow       — input level meter
-//!     │   └── MeterRow       — output level meter
-//!     └── AdwPreferencesGroup "Settings"
-//!         ├── AdwSwitchRow   — autostart
-//!         ├── AdwSwitchRow   — monitor (listen to processed mic)
-//!         └── AdwSwitchRow   — automatic mic volume (input auto-gain)
+//! AdwApplicationWindow (resizable, 420x400 min, 420x720 default — R1-R4)
+//! ├── AdwHeaderBar (":minimize,close" — no maximize, see below)
+//! ├── update_banner / pipewire_banner (hidden unless triggered)
+//! └── AdwClamp (420px, unit Px, maximum == tightening_threshold — R1)
+//!     └── AdwPreferencesPage
+//!         ├── (its own internal GtkScrolledWindow: Never/Automatic — R2)
+//!         ├── [status group] — headline + routing info
+//!         ├── AdwPreferencesGroup "Input"
+//!         │   ├── AdwComboRow    — microphone picker
+//!         │   └── AdwSwitchRow   — enable / disable
+//!         ├── AdwPreferencesGroup "Noise Processing"
+//!         │   └── AdwActionRow×5 — engine selector (radio-grouped, fixed
+//!         │                        order per D-07: RNNoise / DeepFilterNet /
+//!         │                        DPDFNet-2 / DPDFNet-8 / Khip)
+//!         ├── AdwPreferencesGroup "Strength"
+//!         │   └── AdwComboRow    — strength picker (Light / Balanced / Strong)
+//!         ├── AdwPreferencesGroup "Mode"
+//!         │   └── AdwComboRow    — CPU/quality trade-off (D-03/D-04)
+//!         ├── AdwPreferencesGroup "Levels"
+//!         │   ├── MeterRow       — input level meter
+//!         │   └── MeterRow       — output level meter
+//!         └── AdwPreferencesGroup "Settings"
+//!             ├── AdwSwitchRow   — autostart
+//!             ├── AdwSwitchRow   — monitor (listen to processed mic)
+//!             └── AdwSwitchRow   — automatic mic volume (input auto-gain)
 //! ```
 //!
 //! Only compiled when the `gui` feature is enabled (gated on the `pub mod
 //! window` declaration in `src/ui/mod.rs`).
+//!
+//! # Sizing and width policy (quick task 260927-mvb)
+//!
+//! The window is vertically resizable and remembers its height across
+//! launches; its width is fixed by convention (a hard-clamped content column
+//! plus a WM minimum-size hint), never persisted. See
+//! `src/ui/window_geometry.rs`'s module doc for the full sizing policy,
+//! including the "Width policy and its limits" section — the honest
+//! documentation of why GTK4 cannot hard-lock a *resizable* window's maximum
+//! width.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -423,8 +438,14 @@ pub fn build_main_window(
     header.set_title_widget(Some(&win_title));
 
     // 260510-ec4: explicit decoration layout — show minimize + close.
-    // Maximize is omitted because the window is .resizable(false) (line 281),
-    // so a maximize button would be a no-op.
+    // Maximize stays hidden even though the window now resizes vertically
+    // (quick task 260927-mvb, R1): the content column is clamped to
+    // WINDOW_WIDTH, so a maximized window would just be the same 420px
+    // column with empty side margins — a maximize button would be a no-op
+    // for anything the user can see. A header double-click, Super+Up, or
+    // edge tiling can still maximize or tile the window; those sizes are
+    // never persisted (`record_window_height` skips maximized/fullscreen,
+    // and GTK does not track `default-size` while maximized or tiled).
     header.set_decoration_layout(Some(":minimize,close"));
 
     // ── Hamburger menu (primary menu) ─────────────────────────────────────────
@@ -458,9 +479,35 @@ pub fn build_main_window(
     // ── Preferences page ──────────────────────────────────────────────────────
     let page = PreferencesPage::new();
 
-    // Wrap in a clamp for comfortable width on large screens.
+    // The page's own scroller (Task 2, R2): AdwPreferencesPage embeds a
+    // GtkScrolledWindow internally; this makes its policy explicit
+    // (Never/Automatic) instead of relying on the libadwaita default, and
+    // must run before any group (and therefore any combo popover) exists.
+    // See `page_scroller`'s doc for why no second scroller is added around
+    // the page.
+    match page_scroller(&page) {
+        Some(scroller) => {
+            scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        }
+        None => {
+            log::warn!(
+                "could not locate AdwPreferencesPage's internal scroller — \
+                 libadwaita's internal page layout may have changed; the \
+                 page's own scrolling defaults apply instead"
+            );
+        }
+    }
+
+    // Fixed-width content column (R1): GTK4 has no max-size hint for a
+    // *resizable* toplevel (see window_geometry's "Width policy and its
+    // limits" doc), so the width is hard-clamped here instead. With
+    // maximum_size == tightening_threshold, the clamp never eases — a wider,
+    // tiled, or maximized window only gains empty side margins; the header
+    // bar and banners still span the full width.
     let clamp = libadwaita::Clamp::new();
-    clamp.set_maximum_size(500);
+    clamp.set_maximum_size(WINDOW_WIDTH);
+    clamp.set_tightening_threshold(WINDOW_WIDTH);
+    clamp.set_unit(libadwaita::LengthUnit::Px);
     clamp.set_child(Some(&page));
 
     let subtitle = if state.active {
@@ -750,12 +797,41 @@ pub fn build_main_window(
         });
     }
 
+    // ── Quit paths without close-request (R4) ─────────────────────────────────
+    // Ctrl+Q (app.quit), the tray's Quit command, and SIGTERM all end the
+    // GLib main loop WITHOUT ever running `connect_close_request` below —
+    // that handler only fires for a user closing the window itself. Persist
+    // the height here too so those paths aren't silently lossy. This ONLY
+    // calls `record_window_height` (no `.save()`): `src/app.rs`'s single
+    // ordered shutdown save, which runs after `run_with_args` returns (i.e.
+    // after GApplication shutdown), persists this same shared `Config` Rc
+    // and picks up the in-memory change made here.
+    {
+        let window_shutdown = window.downgrade();
+        let config_shutdown = config.clone();
+        app.connect_shutdown(move |_app| {
+            if let Some(win) = window_shutdown.upgrade() {
+                record_window_height(&win, &config_shutdown);
+            }
+        });
+    }
+
     // ── Close behaviour: depends on tray availability ────────────────────────────
     // When the tray is available: hide window so the app continues in background.
     // When the tray is absent: closing the window quits the application.
     {
         let config_close = config;
         window.connect_close_request(move |win| {
+            // R4: persist the current height BEFORE the tray-hint logic
+            // below, whichever close path is taken — this covers both
+            // close-to-tray and close-to-quit. The borrow started here ends
+            // before the following `borrow_mut()`.
+            if record_window_height(win, &config_close)
+                && let Err(e) = config_close.borrow().save()
+            {
+                log::warn!("Failed to save window_height on close: {e}");
+            }
+
             if tray_available {
                 // Tray is available: hide window, app continues in tray.
                 let mut cfg = config_close.borrow_mut();
@@ -840,6 +916,43 @@ pub(crate) fn smallest_monitor_height() -> Option<i32> {
         });
     }
     min_height
+}
+
+/// Depth-first search for `AdwPreferencesPage`'s own internal
+/// `GtkScrolledWindow` (quick task 260927-mvb, R2).
+///
+/// libadwaita's embedded template
+/// (`/org/gnome/Adwaita/ui/adw-preferences-page.ui`) already wraps its
+/// content in `AdwPreferencesPage > GtkScrolledWindow > AdwClamp > GtkBox` —
+/// with `propagate-natural-height` true, which Task 1's natural-height
+/// measurement at window-build time depends on. This function only makes the
+/// scroller's policy explicit (`Never`/`Automatic`); it never constructs a
+/// second, nesting `ScrolledWindow` around the page, which would create two
+/// scroll containers and break the harness's wheel-scroll driving and scroll
+/// anchors (`scripts/nested-run.sh scroll`).
+fn page_scroller(page: &PreferencesPage) -> Option<gtk4::ScrolledWindow> {
+    fn search(widget: &gtk4::Widget) -> Option<gtk4::ScrolledWindow> {
+        if let Ok(scrolled) = widget.clone().downcast::<gtk4::ScrolledWindow>() {
+            return Some(scrolled);
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = search(&w) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    let mut child = page.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = search(&widget) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 
 /// Compute and, if it changed, persist the window's current "normal" height
@@ -2551,5 +2664,121 @@ mod tests {
     /// (it would otherwise be an unused import outside `mod tests`).
     fn window_geometry_test_margin() -> i32 {
         crate::ui::window_geometry::MONITOR_MARGIN
+    }
+
+    // ── Fixed-width clamp, explicit scroller, decoration (quick 260927-mvb) ──
+
+    #[test]
+    fn main_window_scrolls_vertically_with_fixed_width_content() {
+        let ran = crate::ui::gtk_test::run(|| {
+            let Some(app) = test_application("com.cleanmic.CleanMic.test.scroll-clamp") else {
+                return;
+            };
+            let config = Rc::new(RefCell::new(Config::default()));
+            let state = UiState::from_config(&config.borrow());
+            let (tx, _rx) = mpsc::channel::<UiEvent>();
+            let handles = build_main_window(&app, &state, tx, config, false);
+            let window = handles.window.clone();
+
+            // The outer AdwClamp is a direct child of the content root.
+            let root = window.content().expect("window content must be set");
+            let clamp = root
+                .first_child()
+                .and_then(|w| {
+                    let mut child = Some(w);
+                    while let Some(widget) = child {
+                        if let Ok(c) = widget.clone().downcast::<libadwaita::Clamp>() {
+                            return Some(c);
+                        }
+                        child = widget.next_sibling();
+                    }
+                    None
+                })
+                .expect("an AdwClamp must be a child of the content root");
+            assert_eq!(clamp.maximum_size(), WINDOW_WIDTH);
+            assert_eq!(clamp.tightening_threshold(), WINDOW_WIDTH);
+            assert_eq!(clamp.unit(), libadwaita::LengthUnit::Px);
+
+            let page = clamp
+                .child()
+                .and_then(|w| w.downcast::<PreferencesPage>().ok())
+                .expect("clamp's child must be the AdwPreferencesPage");
+
+            // The page's own scroller: explicit policy, no nesting.
+            let scroller = page_scroller(&page).expect("page must expose its own scroller");
+            assert_eq!(scroller.hscrollbar_policy(), gtk4::PolicyType::Never);
+            assert_eq!(scroller.vscrollbar_policy(), gtk4::PolicyType::Automatic);
+            assert!(
+                scroller.propagates_natural_height(),
+                "Task 1's natural-height measurement depends on this staying true" // i18n-ignore
+            );
+            // No ancestor of the page up to the window is ALSO a
+            // ScrolledWindow (no nested scroller was added around the page).
+            let window_widget = window.clone().upcast::<gtk4::Widget>();
+            let mut ancestor = page.parent();
+            while let Some(w) = ancestor {
+                if let Ok(sw) = w.clone().downcast::<gtk4::ScrolledWindow>() {
+                    assert_eq!(
+                        sw, scroller,
+                        "found a second, nesting ScrolledWindow above the page's own scroller"
+                    );
+                }
+                if w == window_widget {
+                    break;
+                }
+                ancestor = w.parent();
+            }
+
+            // 800px allocation: the page still gets exactly WINDOW_WIDTH.
+            clamp.measure(Orientation::Horizontal, -1);
+            clamp.measure(Orientation::Vertical, 800);
+            clamp.size_allocate(&gtk4::Allocation::new(0, 0, 800, 700), -1);
+            assert_eq!(page.width(), WINDOW_WIDTH);
+
+            // Header decoration: maximize stays hidden.
+            let header = root
+                .first_child()
+                .and_then(|w| w.downcast::<HeaderBar>().ok())
+                .expect("header must be the first child of the content root");
+            assert_eq!(
+                header.decoration_layout().as_deref(),
+                Some(":minimize,close")
+            );
+
+            window.destroy();
+        });
+        if ran.is_none() {
+            eprintln!("skipped: no display server for GTK");
+        }
+    }
+
+    #[test]
+    fn close_request_records_the_current_height() {
+        let ran = crate::ui::gtk_test::run(|| {
+            let Some(app) = test_application("com.cleanmic.CleanMic.test.close-persists") else {
+                return;
+            };
+            let config = Rc::new(RefCell::new(Config {
+                tray_hint_shown: true,
+                ..Config::default()
+            }));
+            let state = UiState::from_config(&config.borrow());
+            let (tx, _rx) = mpsc::channel::<UiEvent>();
+            // tray_available: true so the close path hides rather than quits.
+            let handles = build_main_window(&app, &state, tx, config.clone(), true);
+            let window = handles.window.clone();
+
+            window.set_default_size(WINDOW_WIDTH, 590);
+            // No main-context pump: the debounce timer must NOT be what
+            // persists this — close-request must record it immediately.
+            let _: bool = window.emit_by_name("close-request", &[]);
+
+            assert_eq!(config.borrow().window_height, Some(590));
+
+            window.destroy();
+        });
+        if ran.is_none() {
+            eprintln!("skipped: no display server for GTK");
+        }
     }
 }
