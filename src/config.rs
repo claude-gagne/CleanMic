@@ -1,8 +1,9 @@
 //! Settings persistence.
 //!
 //! Reads and writes user preferences (selected mic, engine, strength, mode,
-//! monitor state, autostart, automatic mic volume) in TOML format under the
-//! XDG config directory (`~/.config/cleanmic/config.toml`).
+//! monitor state, autostart, automatic mic volume, main-window height) in
+//! TOML format under the XDG config directory
+//! (`~/.config/cleanmic/config.toml`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -158,6 +159,15 @@ pub struct Config {
     /// to gate a migration attempt that could not happen anyway (D-12).
     pub dpdfnet_default_migration_complete: bool,
 
+    /// The last normal (never maximized or fullscreen) main-window height in
+    /// logical px, recorded by `src/ui/window.rs`. `None` means the window
+    /// was never resized, so the default is used. An older config file
+    /// without this key loads as `None` through the struct-level
+    /// `#[serde(default)]`. The value is always re-clamped at restore by
+    /// [`crate::ui::window_geometry::initial_window_height`], so a
+    /// hand-edited number is never trusted raw (quick task 260927-mvb).
+    pub window_height: Option<i32>,
+
     /// The engine the user chose, while a runtime engine fallback stands in
     /// for it this session (it could not keep up or crashed — see
     /// `app::handle_engine_fault`; `engine` then names the stand-in so the
@@ -194,6 +204,7 @@ impl Default for Config {
             last_seen_update_version: None,
             auto_gain_enabled: true,
             dpdfnet_default_migration_complete: false,
+            window_height: None,
             runtime_fallback_from: None,
         }
     }
@@ -459,6 +470,7 @@ mod tests {
         assert!(!cfg.autostart);
         assert!(cfg.auto_gain_enabled);
         assert!(!cfg.dpdfnet_default_migration_complete);
+        assert_eq!(cfg.window_height, None);
     }
 
     #[test]
@@ -765,5 +777,40 @@ mod tests {
         let loaded = Config::load_from(&path).expect("load failed");
         assert!(loaded.dpdfnet_default_migration_complete);
         assert_eq!(loaded.engine, EngineType::Dpdfnet2);
+    }
+
+    // ── window_height (quick 260927-mvb, R4) ────────────────────────────────
+
+    #[test]
+    fn window_height_defaults_to_none_from_partial_toml() {
+        let (_tmp, path) = temp_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Old config file without this field — should load as None.
+        std::fs::write(&path, "engine = \"RNNoise\"\nstrength = 0.5\n").unwrap();
+        let cfg = Config::load_from(&path).expect("load failed");
+        assert_eq!(cfg.window_height, None);
+    }
+
+    #[test]
+    fn window_height_roundtrips() {
+        let (_tmp, path) = temp_config_path();
+        let original = Config {
+            window_height: Some(640),
+            ..Config::default()
+        };
+        original.save_to(&path).expect("save failed");
+        let loaded = Config::load_from(&path).expect("load failed");
+        assert_eq!(loaded.window_height, Some(640));
+    }
+
+    #[test]
+    fn window_height_none_is_not_serialized() {
+        let (_tmp, path) = temp_config_path();
+        Config::default().save_to(&path).expect("save failed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("window_height"),
+            "a None window_height must not appear in the saved file: {text}"
+        );
     }
 }

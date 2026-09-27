@@ -26,6 +26,10 @@ pub(crate) mod gtk_test;
 
 pub mod meters;
 pub mod welcome;
+/// Pure, GTK-free main-window sizing policy (quick task 260927-mvb) — kept
+/// ungated (unlike `window`/`status`) so its table-driven tests run in every
+/// feature set, including builds without the `gui` feature.
+pub mod window_geometry;
 
 use std::collections::BTreeMap;
 

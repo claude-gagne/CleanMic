@@ -137,6 +137,10 @@ type SwitchRowRef = SwitchRow;
 use crate::config::Config;
 use crate::engine::{AvailabilityReason, EngineAvailability, EngineType, ProcessingMode};
 use crate::tr;
+use crate::ui::window_geometry::{
+    DEFAULT_WINDOW_HEIGHT, MIN_WINDOW_HEIGHT, SAVE_DEBOUNCE_MS, WINDOW_WIDTH, height_to_remember,
+    initial_window_height,
+};
 use crate::ui::{DeviceInfo, UiEvent, UiState};
 
 // ── Engine selector helpers ───────────────────────────────────────────────────
@@ -402,10 +406,16 @@ pub fn build_main_window(
     let window = ApplicationWindow::builder()
         .application(app)
         .title(tr!("CleanMic"))
-        .default_width(420)
-        .default_height(-1)
-        .resizable(false)
+        .default_width(WINDOW_WIDTH)
+        .default_height(DEFAULT_WINDOW_HEIGHT)
+        .resizable(true)
         .build();
+
+    // R2/R4: the WM-enforced floor. Becomes the X11 WM_NORMAL_HINTS PMinSize
+    // hint / the Wayland xdg_toplevel.set_min_size request — see
+    // `window_geometry`'s "Width policy and its limits" doc for why there is
+    // no matching maximum-size hint.
+    window.set_size_request(WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
 
     // ── Header bar ────────────────────────────────────────────────────────────
     let header = HeaderBar::new();
@@ -667,6 +677,79 @@ pub fn build_main_window(
 
     page.add(&settings_group);
 
+    // ── Window sizing: restore + debounced persistence (R2-R4) ───────────────
+    //
+    // Must run after every group has been added to `page`: the page's own
+    // scroller propagates its natural height (see Task 2's explicit
+    // `set_policy` on that scroller), so this measurement is only the FULL
+    // content height once every group is present.
+    let natural_content_height = {
+        let (_min, nat, _min_baseline, _nat_baseline) =
+            root.measure(Orientation::Vertical, WINDOW_WIDTH);
+        (nat > 0).then_some(nat)
+    };
+    let restore_height = initial_window_height(
+        config.borrow().window_height,
+        natural_content_height,
+        smallest_monitor_height(),
+    );
+    log::debug!(
+        "restoring window height: remembered={:?} natural={:?} monitor={:?} -> {}",
+        config.borrow().window_height,
+        natural_content_height,
+        smallest_monitor_height(),
+        restore_height
+    );
+    window.set_default_size(WINDOW_WIDTH, restore_height);
+
+    // Debounced persistence: `connect_default_height_notify` fires on every
+    // resize pixel while the user drags, but the shared `Config` should only
+    // be rewritten once per drag. The app.rs "UI state sync from config"
+    // timer (~30fps) compares the WHOLE `Config` on every tick and calls
+    // `sync_tray_state` on any difference, which sends an unconditional ksni
+    // `LayoutUpdated` D-Bus signal — a per-pixel write would spam the tray
+    // host during a drag. A monotonically increasing generation counter lets
+    // a stale scheduled save recognize it has been superseded and skip
+    // itself; no GLib source removal (FFI) is needed.
+    {
+        let generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let config_resize = config.clone();
+        let window_weak = window.downgrade();
+        window.connect_default_height_notify(move |_win| {
+            let this_generation = generation.get().wrapping_add(1);
+            generation.set(this_generation);
+            let generation_check = generation.clone();
+            let config_cb = config_resize.clone();
+            let window_weak_cb = window_weak.clone();
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(SAVE_DEBOUNCE_MS),
+                move || {
+                    if generation_check.get() != this_generation {
+                        // Superseded by a later resize notification.
+                        return;
+                    }
+                    let Some(win) = window_weak_cb.upgrade() else {
+                        return;
+                    };
+                    if record_window_height(&win, &config_cb) {
+                        match config_cb.try_borrow() {
+                            Ok(cfg) => {
+                                if let Err(e) = cfg.save() {
+                                    log::warn!("Failed to save window_height: {e}");
+                                } else {
+                                    log::debug!("Saved window_height = {:?}", cfg.window_height);
+                                }
+                            }
+                            Err(_) => {
+                                log::debug!("Config busy — skipping this window_height save tick");
+                            }
+                        }
+                    }
+                },
+            );
+        });
+    }
+
     // ── Close behaviour: depends on tray availability ────────────────────────────
     // When the tray is available: hide window so the app continues in background.
     // When the tray is absent: closing the window quits the application.
@@ -727,6 +810,71 @@ pub fn build_main_window(
         pipewire_explanation,
         strength_updating,
         mode_updating,
+    }
+}
+
+/// Return the smallest connected monitor's logical height, or `None` if
+/// there is no display or no monitor (quick task 260927-mvb, R3/R4).
+///
+/// Before the window is mapped, GTK4 cannot say which monitor it will
+/// eventually appear on (Wayland never exposes global monitor positions to a
+/// client), so the smallest monitor is used as a conservative upper bound —
+/// it guarantees the window fits on whichever monitor it lands on. This
+/// value is only ever used as a CAP on the restored height; it never
+/// overwrites the remembered value itself.
+pub(crate) fn smallest_monitor_height() -> Option<i32> {
+    let display = gtk4::gdk::Display::default()?;
+    let monitors = display.monitors();
+    let mut min_height: Option<i32> = None;
+    for i in 0..monitors.n_items() {
+        let Some(item) = monitors.item(i) else {
+            continue;
+        };
+        let Ok(monitor) = item.downcast::<gtk4::gdk::Monitor>() else {
+            continue;
+        };
+        let height = monitor.geometry().height();
+        min_height = Some(match min_height {
+            Some(current) => current.min(height),
+            None => height,
+        });
+    }
+    min_height
+}
+
+/// Compute and, if it changed, persist the window's current "normal" height
+/// into `config.window_height` (quick task 260927-mvb, R4).
+///
+/// Returns `false` (and touches nothing) when:
+/// - the window is currently maximized or fullscreen — those sizes are never
+///   remembered, since restoring into a maximized/fullscreen state would be
+///   meaningless and GTK does not track `default-size` while in either state;
+/// - [`height_to_remember`] rejects the current height (`<= 0`);
+/// - the shared `Config` is currently borrowed elsewhere
+///   (`try_borrow_mut` failing) — logged at debug level, never a panic.
+///
+/// Returns `true` only when the config's `window_height` was actually
+/// changed, so callers know whether a save is warranted.
+fn record_window_height(window: &ApplicationWindow, config: &Rc<RefCell<Config>>) -> bool {
+    if window.is_maximized() || window.is_fullscreen() {
+        return false;
+    }
+    let Some(height) = height_to_remember(window.default_size().1) else {
+        return false;
+    };
+    match config.try_borrow_mut() {
+        Ok(mut cfg) => {
+            if cfg.window_height == Some(height) {
+                false
+            } else {
+                cfg.window_height = Some(height);
+                true
+            }
+        }
+        Err(_) => {
+            log::debug!("Config busy — skipping this window_height record");
+            false
+        }
     }
 }
 
@@ -2255,5 +2403,153 @@ mod tests {
                 "Mode entry {entry:?} must not reuse a Strength vocabulary word" // i18n-ignore
             );
         }
+    }
+
+    // ── Window height restore + debounced persistence (quick 260927-mvb) ────
+
+    /// Build a registered, `NON_UNIQUE` throwaway `libadwaita::Application`
+    /// for a GTK-thread test, or `None` (with an explanatory `eprintln!`) if
+    /// registration fails — GTK rejects a window built without one.
+    fn test_application(id: &str) -> Option<libadwaita::Application> {
+        let app = libadwaita::Application::builder()
+            .application_id(id)
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        match app.register(gio::Cancellable::NONE) {
+            Ok(()) => Some(app),
+            Err(e) => {
+                eprintln!("skipped: could not register test application: {e}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn window_height_survives_resize_save_and_relaunch() {
+        let ran = crate::ui::gtk_test::run(|| {
+            let Some(app) = test_application("com.cleanmic.CleanMic.test.window-height") else {
+                return;
+            };
+
+            // ── Restore: a config with a remembered height opens at that
+            // height, within the WM-enforced minimum size request. ──────────
+            let config = Rc::new(RefCell::new(Config {
+                window_height: Some(560),
+                ..Config::default()
+            }));
+            let state = UiState::from_config(&config.borrow());
+            let (tx, _rx) = mpsc::channel::<UiEvent>();
+            let handles = build_main_window(&app, &state, tx, config.clone(), false);
+            let window = handles.window.clone();
+
+            assert!(window.is_resizable());
+            assert_eq!(window.size_request(), (WINDOW_WIDTH, MIN_WINDOW_HEIGHT));
+            match smallest_monitor_height() {
+                Some(monitor_height) if monitor_height < 560 + window_geometry_test_margin() => {
+                    eprintln!(
+                        "skipped default_size assertion: monitor height {monitor_height} \
+                         is too small to fit 560 + margin"
+                    );
+                }
+                _ => {
+                    assert_eq!(window.default_size(), (WINDOW_WIDTH, 560));
+                }
+            }
+
+            // ── Resize -> debounced save -> a second resize -> save again. ──
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let pump_until = |config: &Rc<RefCell<Config>>, expected: Option<i32>| {
+                let ctx = glib::MainContext::default();
+                while std::time::Instant::now() < deadline
+                    && config.borrow().window_height != expected
+                {
+                    ctx.iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert_eq!(config.borrow().window_height, expected);
+            };
+
+            window.set_default_size(WINDOW_WIDTH, 610);
+            pump_until(&config, Some(610));
+
+            window.set_default_size(WINDOW_WIDTH, 250);
+            pump_until(&config, Some(MIN_WINDOW_HEIGHT));
+
+            window.set_default_size(WINDOW_WIDTH, 610);
+            pump_until(&config, Some(610));
+
+            // ── Relaunch: save to a fresh tempdir, load it back, build a
+            // second window from the loaded config — it must restore 610. ──
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("config.toml");
+            config.borrow().save_to(&path).expect("save_to failed");
+            let loaded = Config::load_from(&path).expect("load_from failed");
+            assert_eq!(loaded.window_height, Some(610));
+            let loaded_config = Rc::new(RefCell::new(loaded));
+            let loaded_state = UiState::from_config(&loaded_config.borrow());
+            let (tx2, _rx2) = mpsc::channel::<UiEvent>();
+            let relaunch_handles =
+                build_main_window(&app, &loaded_state, tx2, loaded_config.clone(), false);
+            match smallest_monitor_height() {
+                Some(monitor_height) if monitor_height < 610 + window_geometry_test_margin() => {
+                    eprintln!(
+                        "skipped relaunch default_size assertion: monitor height \
+                         {monitor_height} is too small to fit 610 + margin"
+                    );
+                }
+                _ => {
+                    assert_eq!(relaunch_handles.window.default_size(), (WINDOW_WIDTH, 610));
+                }
+            }
+
+            // ── A default config's content genuinely needs scrolling: its
+            // natural height exceeds DEFAULT_WINDOW_HEIGHT, and the window
+            // itself opens at DEFAULT_WINDOW_HEIGHT (not the natural size). ──
+            let default_config = Rc::new(RefCell::new(Config::default()));
+            let default_state = UiState::from_config(&default_config.borrow());
+            let (tx3, _rx3) = mpsc::channel::<UiEvent>();
+            let default_handles =
+                build_main_window(&app, &default_state, tx3, default_config.clone(), false);
+            if let Some(content) = default_handles.window.content() {
+                let (_min, nat, _min_baseline, _nat_baseline) =
+                    content.measure(Orientation::Vertical, WINDOW_WIDTH);
+                assert!(
+                    nat > DEFAULT_WINDOW_HEIGHT,
+                    "default content's natural height ({nat}) must exceed \
+                     DEFAULT_WINDOW_HEIGHT ({DEFAULT_WINDOW_HEIGHT}) — otherwise \
+                     nothing would need scrolling"
+                );
+            }
+            match smallest_monitor_height() {
+                Some(monitor_height)
+                    if monitor_height < DEFAULT_WINDOW_HEIGHT + window_geometry_test_margin() =>
+                {
+                    eprintln!(
+                        "skipped default-height assertion: monitor height \
+                         {monitor_height} is too small to fit the default + margin"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        default_handles.window.default_size(),
+                        (WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+                    );
+                }
+            }
+
+            window.destroy();
+            relaunch_handles.window.destroy();
+            default_handles.window.destroy();
+        });
+        if ran.is_none() {
+            eprintln!("skipped: no display server for GTK");
+        }
+    }
+
+    /// The margin used by the skip-guard above — mirrors
+    /// `window_geometry::MONITOR_MARGIN` without importing it at module scope
+    /// (it would otherwise be an unused import outside `mod tests`).
+    fn window_geometry_test_margin() -> i32 {
+        crate::ui::window_geometry::MONITOR_MARGIN
     }
 }
