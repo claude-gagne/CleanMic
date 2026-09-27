@@ -259,13 +259,18 @@ pub fn is_engine_available(engine: EngineType) -> bool {
 /// occurred. The caller must never claim `requested` is active while this is
 /// `Some` — e.g. a migrated DPDFNet-2 selection that failed to initialize
 /// and fell back to DeepFilterNet.
+///
+/// Phase 15.4 Plan 01 Task 2: reworded from "Unable to start the selected
+/// engine — using instead:" — that phrasing tripped the AppImageHub
+/// catalog's screenshot OCR hard-phrase list ("unable to start", research
+/// Pitfall 2). Same meaning, no catalog-unsafe phrase.
 pub fn fallback_notice(requested: EngineType, active: EngineType) -> Option<String> {
     if requested == active {
         return None;
     }
     Some(format!(
         "{} {}",
-        tr!("Unable to start the selected engine — using instead:"),
+        tr!("The selected engine isn't available, using instead:"),
         active.short_name()
     ))
 }

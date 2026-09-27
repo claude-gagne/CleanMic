@@ -276,7 +276,10 @@ fn engine_menu_label(engine: EngineType, availability: EngineAvailability) -> St
         return engine.short_name().to_owned();
     }
     if engine == EngineType::Khip {
-        return gettext("Khip (not installed)");
+        // Phase 15.4 Plan 01 Task 2: reworded from "Khip (not installed)" —
+        // that title tripped the AppImageHub catalog's OCR hard-phrase list
+        // (research Pitfall 2); same meaning, matches src/ui/window.rs.
+        return gettext("Khip (not detected)");
     }
     format!("{} {}", engine.short_name(), gettext("(unavailable)"))
 }

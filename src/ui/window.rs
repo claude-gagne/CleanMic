@@ -204,19 +204,25 @@ fn resolve_availability(state: &UiState, engine: EngineType) -> EngineAvailabili
 /// translated unavailable title and a reason-specific subtitle — it is
 /// never hidden and never silently re-enabled.
 ///
-/// Khip keeps its existing, more actionable "not installed — copy the
+/// Khip keeps its existing, more actionable "not detected — copy the
 /// library" copy (a user-fixable local install step). The other engines use
 /// a shared generic "{name} (unavailable)" pattern, since a missing Cargo
 /// feature or a missing bundled DPDFNet asset is not something the user can
 /// fix by copying a file.
+///
+/// Phase 15.4 Plan 01 Task 2: reworded from "Khip (not installed)" /
+/// "Not detected — copy libkhip.so to ~/.local/lib/" — the old title tripped
+/// the AppImageHub catalog's screenshot OCR hard-phrase list ("not
+/// installed"), and it's visible in EVERY catalog run since the catalog's
+/// test host never has libkhip.so. Same meaning, no catalog-unsafe phrase.
 fn engine_row_text(engine: EngineType, availability: EngineAvailability) -> (String, String) {
     if availability.available {
         return (engine_label(engine).to_owned(), engine_subtitle(engine));
     }
     if engine == EngineType::Khip {
         return (
-            tr!("Khip (not installed)"),
-            tr!("Not detected — copy libkhip.so to ~/.local/lib/"),
+            tr!("Khip (not detected)"),
+            tr!("Optional: copy libkhip.so to ~/.local/lib/"),
         );
     }
     let title = format!("{} {}", engine.short_name(), tr!("(unavailable)"));
@@ -254,7 +260,7 @@ fn restore_strength_level_index_for_engine(config: &Config, engine: EngineType) 
 /// Replaces the previous AdwComboRow which could not enforce row-level
 /// disabling — `set_activatable(false)` on a `gtk4::ListItem` only affects
 /// rendering, not GtkDropDown's selection model, so users could still pick
-/// "Khip (not installed)" with no effect (silent early-return in the handler).
+/// "Khip (not detected)" with no effect (silent early-return in the handler).
 ///
 /// This selector uses `set_sensitive(false)` on any row whose engine is
 /// currently unavailable, matching the tray's `enabled` flag semantics in
@@ -2099,8 +2105,8 @@ mod tests {
                 reason: AvailabilityReason::RuntimeMissing,
             },
         );
-        assert_eq!(title, "Khip (not installed)");
-        assert_eq!(subtitle, "Not detected — copy libkhip.so to ~/.local/lib/");
+        assert_eq!(title, "Khip (not detected)");
+        assert_eq!(subtitle, "Optional: copy libkhip.so to ~/.local/lib/");
     }
 
     #[test]

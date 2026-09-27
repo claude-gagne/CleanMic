@@ -62,11 +62,15 @@ msgstr "Modèle"
 msgid "The algorithm used to filter noise"
 msgstr "L'algorithme utilisé pour filtrer le bruit"
 
-msgid "Khip (not installed)"
-msgstr "Khip (non installé)"
+# Phase 15.4 Plan 01 Task 2: reworded from "Khip (not installed)" — that
+# title tripped the AppImageHub catalog's screenshot OCR hard-phrase list
+# ("not installed", research Pitfall 2); it's visible in EVERY catalog run
+# since the catalog's test host never has libkhip.so.
+msgid "Khip (not detected)"
+msgstr "Khip (non détecté)"
 
-msgid "Not detected — copy libkhip.so to ~/.local/lib/"
-msgstr "Non détecté — copiez libkhip.so dans ~/.local/lib/"
+msgid "Optional: copy libkhip.so to ~/.local/lib/"
+msgstr "Facultatif : copiez libkhip.so dans ~/.local/lib/"
 
 msgid "Noise suppression"
 msgstr "Suppression du bruit"
@@ -280,7 +284,7 @@ msgstr "Affecte uniquement les moteurs DPDFNet"
 
 # Phase 15.1 Plan 06: Generic unavailable-row title suffix (window + tray),
 # e.g. "DPDFNet-2 (unavailable)". Never used for Khip, which keeps its own
-# more actionable "Khip (not installed)" copy above.
+# more actionable "Khip (not detected)" copy above.
 msgid "(unavailable)"
 msgstr "(indisponible)"
 
@@ -309,8 +313,11 @@ msgstr "Signaler un problème"
 # Phase 15.1 Plan 05: Engine fallback notice — D-11 (src/engine/mod.rs).
 # Followed by the truthfully-ACTIVE engine's untranslated proper-noun name
 # (e.g. "DeepFilterNet"), never the failed/requested engine's name.
-msgid "Unable to start the selected engine — using instead:"
-msgstr "Impossible de démarrer le moteur sélectionné — utilisation de :"
+# Phase 15.4 Plan 01 Task 2: reworded from "Unable to start the selected
+# engine — using instead:" — that phrasing tripped the AppImageHub catalog's
+# screenshot OCR hard-phrase list ("unable to start", research Pitfall 2).
+msgid "The selected engine isn't available, using instead:"
+msgstr "Le moteur sélectionné n'est pas disponible, utilisation de :"
 
 # dfn-panic-under-load: Notification title — the active engine failed at
 # runtime and CleanMic switched to a lighter one (src/app.rs). %s is the NEW

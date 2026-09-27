@@ -88,7 +88,7 @@ The Khip engine is user-supplied — CleanMic does not ship the library. To enab
     Rocky, Alma) or `/usr/lib/` on Debian-family distros (Debian, Ubuntu).
 
 2. CleanMic auto-detects within ~1.5 seconds — no relaunch needed.
-   The "Khip (not installed)" row in the engine selector flips to
+   The "Khip (not detected)" row in the engine selector flips to
    plain "Khip" and becomes selectable.
 
 ## FAQ
