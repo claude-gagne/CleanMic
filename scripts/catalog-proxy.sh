@@ -40,10 +40,14 @@
 # --max-glibc X.Y    FAIL the glibc-ceiling lint check if any bundled ELF's
 #                     highest required GLIBC_ symbol version exceeds X.Y.
 #                     Without this flag the ceiling is INFO-only.
-# --sandbox MODE     bwrap (default for --appimage, when bwrap exists) or
-#                     none (default for --binary, and the only valid value
-#                     when bwrap is unavailable). --hide-lib and
-#                     --hide-pipewire-stack require bwrap.
+# --sandbox MODE     bwrap (default for --appimage/--appdir, when bwrap
+#                     exists), none (default for --binary, and the only
+#                     valid value when bwrap is unavailable), or firejail
+#                     (15.4-03 D-09 catalog-mimic: reproduces the catalog
+#                     worker's own exact `firejail --quiet --noprofile
+#                     --net=none --appimage FILE` invocation; requires
+#                     --appimage, not --appdir/--binary). --hide-lib,
+#                     --hide-pipewire-stack, and --hide-bundled require bwrap.
 # --hide-lib SONAME  Repeatable. Inside the bwrap sandbox, `--ro-bind
 #                     /dev/null` every host path that resolves that soname
 #                     (ldd/ldconfig's view plus the default lib dirs, symlink
@@ -130,7 +134,7 @@ set -euo pipefail
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-USAGE_LINE="usage: scripts/catalog-proxy.sh (--binary PATH | --appimage PATH | --appdir DIR) [--out DIR] [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]... [--hide-pipewire-stack] [--hide-bundled] [--expect-lib SONAME=appdir|fallback|host]... [--lint-only] [--max-glibc X.Y]"
+USAGE_LINE="usage: scripts/catalog-proxy.sh (--binary PATH | --appimage PATH | --appdir DIR) [--out DIR] [--lang en|fr] [--sandbox bwrap|none|firejail] [--hide-lib SONAME]... [--hide-pipewire-stack] [--hide-bundled] [--expect-lib SONAME=appdir|fallback|host]... [--lint-only] [--max-glibc X.Y]"
 
 usage() {
   echo "$USAGE_LINE" >&2
@@ -195,6 +199,15 @@ need() {
   command -v dbus-run-session >/dev/null 2>&1 || missing+=("dbus-bin")
   if [ "$SANDBOX_MODE" = "bwrap" ]; then
     command -v bwrap >/dev/null 2>&1 || missing+=("bubblewrap")
+  fi
+  if [ "$SANDBOX_MODE" = "firejail" ]; then
+    command -v firejail >/dev/null 2>&1 || missing+=("firejail")
+    # Unlike the default OCR SKIP (run_ocr_check), tesseract is a HARD
+    # requirement in --sandbox firejail mode: this mode exists specifically
+    # to answer "does the catalog's actual test pass", and the catalog's
+    # own test includes the OCR pass -- a SKIP here would silently make
+    # this mode weaker than the thing it's reproducing.
+    command -v tesseract >/dev/null 2>&1 || missing+=("tesseract-ocr")
   fi
   if [ "${#missing[@]}" -gt 0 ]; then
     echo "catalog-proxy: missing tools -- install: ${missing[*]}" >&2
@@ -333,12 +346,16 @@ if [ -z "$SANDBOX_MODE" ]; then
   fi
 fi
 case "$SANDBOX_MODE" in
-  bwrap | none) : ;;
+  bwrap | none | firejail) : ;;
   *)
-    echo "catalog-proxy: --sandbox must be bwrap or none, got '$SANDBOX_MODE'" >&2
+    echo "catalog-proxy: --sandbox must be bwrap, none, or firejail, got '$SANDBOX_MODE'" >&2
     usage
     ;;
 esac
+if [ "$SANDBOX_MODE" = "firejail" ] && [ -z "$APPIMAGE" ]; then
+  echo "catalog-proxy: --sandbox firejail requires --appimage (firejail's own --appimage flag runs the packed file directly, matching the catalog worker's exact invocation)" >&2
+  usage
+fi
 
 if { [ "${#HIDE_LIBS[@]}" -gt 0 ] || [ "$HIDE_PIPEWIRE_STACK" = 1 ] || [ "$HIDE_BUNDLED" = 1 ]; } && [ "$SANDBOX_MODE" != "bwrap" ]; then
   echo "catalog-proxy: --hide-lib/--hide-pipewire-stack/--hide-bundled require --sandbox bwrap" >&2
@@ -858,20 +875,32 @@ ENV_ARGS=(
   "CATALOG_PROXY_MARKER=$APP_MARKER"
 )
 
-LAUNCH_CMD=(env "${ENV_ARGS[@]}" dbus-run-session -- "$LAUNCH_TARGET")
-if [ "$SANDBOX_MODE" = "bwrap" ]; then
-  BWRAP_ARGS=(
-    --ro-bind / /
-    --dev /dev
-    --proc /proc
-    --tmpfs /tmp
-    --ro-bind /tmp/.X11-unix /tmp/.X11-unix
-    --bind "$OUT_DIR" "$OUT_DIR"
-    --unshare-net
-    --die-with-parent
-  )
-  BWRAP_ARGS+=("${MASK_ARGS[@]}")
-  LAUNCH_CMD=(bwrap "${BWRAP_ARGS[@]}" -- "${LAUNCH_CMD[@]}")
+if [ "$SANDBOX_MODE" = "firejail" ]; then
+  # The catalog worker's own exact invocation is
+  # `firejail --quiet --noprofile --net=none --appimage ./"$FILENAME" &` --
+  # no dbus-run-session, no bwrap: firejail's own `--appimage` flag runs the
+  # packed file directly (it handles the AppImage's own FUSE/extraction
+  # internally). We still wrap it in our own private HOME/XDG env (the
+  # catalog worker runs in an ephemeral CI VM with nothing to protect;
+  # this script's own SAFETY contract protects the owner's real session
+  # regardless of sandbox mode).
+  LAUNCH_CMD=(env "${ENV_ARGS[@]}" firejail --quiet --noprofile --net=none --appimage "$APPIMAGE")
+else
+  LAUNCH_CMD=(env "${ENV_ARGS[@]}" dbus-run-session -- "$LAUNCH_TARGET")
+  if [ "$SANDBOX_MODE" = "bwrap" ]; then
+    BWRAP_ARGS=(
+      --ro-bind / /
+      --dev /dev
+      --proc /proc
+      --tmpfs /tmp
+      --ro-bind /tmp/.X11-unix /tmp/.X11-unix
+      --bind "$OUT_DIR" "$OUT_DIR"
+      --unshare-net
+      --die-with-parent
+    )
+    BWRAP_ARGS+=("${MASK_ARGS[@]}")
+    LAUNCH_CMD=(bwrap "${BWRAP_ARGS[@]}" -- "${LAUNCH_CMD[@]}")
+  fi
 fi
 
 setsid sh -c "echo \$\$ > '$SESSION_PIDFILE'; exec \"\$@\"" -- "${LAUNCH_CMD[@]}" \

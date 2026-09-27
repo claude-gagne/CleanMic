@@ -1,0 +1,175 @@
+name: AppImage build (glibc widening spike)
+
+# D-09 (15.4-03): builds a glibc-2.35 (jammy) variant and a glibc-2.39
+# (noble, D-09's locked Plan B) variant of the self-contained
+# (GTK4/libadwaita bundled, D-01) AppImage, then runs a firejail catalog
+# mimic on the catalog's own ubuntu-22.04 runner image against the jammy
+# artifact. This workflow never publishes anything -- no tag, no release,
+# no PR. Triggers: a push to a ci/appimage-* branch (the owner's explicit
+# push-checkpoint decision, 15.4-03 Task 3), or workflow_call from a future
+# release workflow (Plan 04+) that wants to reuse this exact build.
+#
+# D-11 (15.4-CONTEXT.md): this workflow builds and verifies only -- the
+# release/publish decision stays fully separate and gated on the owner's
+# own DPDFNet testing being done first.
+
+on:
+  push:
+    branches:
+      - 'ci/appimage-*'
+  workflow_call:
+    inputs:
+      variant:
+        description: 'Which variant(s) to build: jammy | noble | both'
+        type: string
+        default: 'both'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-jammy:
+    name: build (jammy, glibc 2.35)
+    if: github.event_name == 'push' || inputs.variant == 'jammy' || inputs.variant == 'both'
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    timeout-minutes: 120
+    steps:
+      - name: Install apt build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential curl git ca-certificates python3 ninja-build \
+            pkg-config gettext clang libclang-dev \
+            libdbus-1-dev libpipewire-0.3-dev \
+            libpango1.0-dev libharfbuzz-dev libcairo2-dev libgdk-pixbuf-2.0-dev \
+            libgraphene-1.0-dev librsvg2-dev libepoxy-dev libfribidi-dev \
+            libexpat1-dev libxkbcommon-dev libxml2-dev \
+            libselinux1-dev libmount-dev \
+            file desktop-file-utils appstream
+
+      - uses: actions/checkout@v4
+
+      - name: Cache the compiled GTK4/libadwaita stack prefix
+        id: gtk-stack-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/cleanmic-gtk
+          key: gtk-stack-jammy-${{ hashFiles('scripts/ci/build-gtk-stack.sh') }}
+
+      - name: Build the GTK4/libadwaita stack (D-09, idempotent)
+        run: bash scripts/ci/build-gtk-stack.sh --prefix /opt/cleanmic-gtk
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch vendor binaries
+        run: bash scripts/fetch-vendors.sh
+
+      - name: Compile locale files
+        run: make mo
+
+      - name: Build AppImage (bundled GTK stack, jammy)
+        env:
+          CLEANMIC_BUNDLE_GTK: "1"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          PKG_CONFIG_PATH: "/opt/cleanmic-gtk/lib/x86_64-linux-gnu/pkgconfig:/opt/cleanmic-gtk/lib/pkgconfig:/opt/cleanmic-gtk/share/pkgconfig"
+          LD_LIBRARY_PATH: "/opt/cleanmic-gtk/lib/x86_64-linux-gnu:/opt/cleanmic-gtk/lib"
+          PATH: "/opt/cleanmic-gtk/bin:/usr/bin:/bin"
+        run: bash scripts/build-appimage.sh
+
+      - name: Lint (excludelist, glibc ceiling <= 2.35, AppStream, .DirIcon)
+        run: bash scripts/catalog-proxy.sh --appimage build/CleanMic-x86_64.AppImage --lint-only --max-glibc 2.35 --out target/catalog-proxy-jammy
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleanmic-appimage-jammy
+          path: |
+            build/CleanMic-x86_64.AppImage
+            target/catalog-proxy-jammy/report.md
+          retention-days: 7
+
+  build-noble:
+    name: build (noble, glibc 2.39, D-09 Plan B)
+    if: github.event_name == 'push' || inputs.variant == 'noble' || inputs.variant == 'both'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libpipewire-0.3-dev \
+            libdbus-1-dev \
+            pkg-config \
+            gettext \
+            curl
+
+      - name: Fetch vendor binaries
+        run: bash scripts/fetch-vendors.sh
+
+      - name: Compile locale files
+        run: make mo
+
+      - name: Build AppImage (bundled GTK stack, noble/system GTK4)
+        env:
+          CLEANMIC_BUNDLE_GTK: "1"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: bash scripts/build-appimage.sh
+
+      - name: Lint (excludelist, glibc ceiling <= 2.39, AppStream, .DirIcon)
+        run: bash scripts/catalog-proxy.sh --appimage build/CleanMic-x86_64.AppImage --lint-only --max-glibc 2.39 --out target/catalog-proxy-noble
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleanmic-appimage-noble
+          path: |
+            build/CleanMic-x86_64.AppImage
+            target/catalog-proxy-noble/report.md
+          retention-days: 7
+
+  catalog-mimic:
+    name: catalog mimic (firejail, ubuntu-22.04)
+    needs: build-jammy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deliberately NOT GTK4, libadwaita, or PipeWire -- only the exact
+      # harness the catalog worker itself uses, so a PASS here means the
+      # jammy artifact stands on its own bundled libraries, same as it
+      # would have to on the real catalog runner.
+      - name: Install only the catalog worker's own test harness
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y firejail xvfb x11-utils imagemagick tesseract-ocr
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cleanmic-appimage-jammy
+          path: build
+
+      - name: Make AppImage executable
+        run: chmod +x build/CleanMic-x86_64.AppImage
+
+      - name: Run the catalog's own firejail invocation
+        run: bash scripts/catalog-proxy.sh --appimage build/CleanMic-x86_64.AppImage --sandbox firejail --out target/catalog-proxy-mimic
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: catalog-mimic-report
+          path: target/catalog-proxy-mimic/
+          retention-days: 7
