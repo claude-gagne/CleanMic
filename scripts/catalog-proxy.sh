@@ -21,13 +21,24 @@
 # the host's own copy must win.
 #
 # USAGE
-#   scripts/catalog-proxy.sh (--binary PATH | --appimage PATH) [--out DIR]
-#     [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]...
+#   scripts/catalog-proxy.sh (--binary PATH | --appimage PATH | --appdir DIR)
+#     [--out DIR] [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]...
 #     [--hide-pipewire-stack] [--expect-lib SONAME=appdir|fallback|host]...
+#     [--lint-only] [--max-glibc X.Y]
 #
-# --binary PATH      Launch a bare binary directly (no AppDir, no AppRun).
-# --appimage PATH    Extract PATH via `--appimage-extract` (no FUSE needed)
-#                     and launch the extracted squashfs-root/AppRun.
+# --binary PATH      Launch a bare binary directly (no AppDir, no AppRun,
+#                     no lint checks -- lint needs an AppDir).
+# --appimage PATH    Extract PATH via `--appimage-extract` (no FUSE needed),
+#                     lint the extracted tree, then launch its AppRun.
+# --appdir DIR       Lint and launch an already-extracted AppDir directly
+#                     (e.g. build/AppDir), skipping the extraction step.
+# --lint-only        Run the static lint checks (Task 3/D-03/D-08) and skip
+#                     the launch/window-check entirely (no Xvfb, no app
+#                     process). Only valid with --appimage/--appdir. The OCR
+#                     check always SKIPs in this mode (no screenshot exists).
+# --max-glibc X.Y    FAIL the glibc-ceiling lint check if any bundled ELF's
+#                     highest required GLIBC_ symbol version exceeds X.Y.
+#                     Without this flag the ceiling is INFO-only.
 # --sandbox MODE     bwrap (default for --appimage, when bwrap exists) or
 #                     none (default for --binary, and the only valid value
 #                     when bwrap is unavailable). --hide-lib and
@@ -47,16 +58,32 @@
 #                     soname was actually mapped from. A mismatch FAILs the
 #                     run just like a missing window would.
 #
+# LINT CHECKS (Task 3/D-03/D-08, --appimage/--appdir only, runs by default
+# BEFORE the launch): exactly one root *.desktop, clean under
+# desktop-file-validate with Icon=/Categories= present once; AppRun present
+# + executable; .DirIcon present (PASS for PNG, WARN for SVG-only);
+# `appstreamcli validate`/`validate-tree --no-net`; a glibc-ceiling scan
+# (objdump -T's *UND* GLIBC_ symbols) across every bundled ELF, INFO unless
+# --max-glibc is given; an excludelist comparison (cached under
+# build/tools/excludelist, fetched once, SKIP if offline) that WARNs on any
+# listed soname anywhere and FAILs one bundled directly under usr/lib
+# outside usr/lib/pipewire-fallback/ (the one documented, allowed WARN); and
+# (after a real launch only) an OCR pass over the screenshot against the
+# same catalog hard-phrase list tests/catalog_ocr_phrases.rs guards, SKIP
+# when tesseract is absent.
+#
 # This script always starts its OWN private Xvfb on a free display it picks
 # itself -- never the owner's real X/Xephyr/Wayland session, and never a
 # `:N` the caller names (unlike scripts/nested-run.sh's Xephyr harness).
 #
 # EXIT CODES
-#   0   PASS -- a window titled "CleanMic" appeared within the catalog's
-#       window, the app was still alive right after the screenshot, and
-#       every --expect-lib assertion matched.
-#   1   FAIL -- the app exited before a window appeared, died afterward, or
-#       an --expect-lib assertion did not match.
+#   0   PASS -- lint has no FAIL, and (unless --lint-only) a window titled
+#       "CleanMic" appeared within the catalog's window, the app was still
+#       alive right after the screenshot, and every --expect-lib assertion
+#       matched.
+#   1   FAIL -- a lint check FAILed, or (unless --lint-only) the app exited
+#       before a window appeared, died afterward, or an --expect-lib
+#       assertion did not match.
 #   2   bad usage
 #   3   a required tool is missing (Xvfb, xwininfo, import/magick,
 #       dbus-run-session, bwrap when --sandbox bwrap is in effect), the
@@ -94,7 +121,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 usage() {
-  echo "usage: scripts/catalog-proxy.sh (--binary PATH | --appimage PATH) [--out DIR] [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]... [--hide-pipewire-stack] [--expect-lib SONAME=appdir|fallback|host]..." >&2
+  echo "usage: scripts/catalog-proxy.sh (--binary PATH | --appimage PATH | --appdir DIR) [--out DIR] [--lang en|fr] [--sandbox bwrap|none] [--hide-lib SONAME]... [--hide-pipewire-stack] [--expect-lib SONAME=appdir|fallback|host]... [--lint-only] [--max-glibc X.Y]" >&2
   exit 2
 }
 
@@ -171,14 +198,16 @@ resolve_host_lib_paths() {
   printf '%s\n' "${all[@]}"
 }
 
-BINARY="" APPIMAGE="" OUT_DIR="" LANG_ARG="en" SANDBOX_MODE=""
-HIDE_LIBS=() EXPECT_LIBS=() HIDE_PIPEWIRE_STACK=0
+BINARY="" APPIMAGE="" APPDIR_ARG="" OUT_DIR="" LANG_ARG="en" SANDBOX_MODE=""
+HIDE_LIBS=() EXPECT_LIBS=() HIDE_PIPEWIRE_STACK=0 LINT_ONLY=0 MAX_GLIBC=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --binary)
       shift; BINARY="${1:-}" ;;
     --appimage)
       shift; APPIMAGE="${1:-}" ;;
+    --appdir)
+      shift; APPDIR_ARG="${1:-}" ;;
     --out)
       shift; OUT_DIR="${1:-}" ;;
     --lang)
@@ -191,6 +220,10 @@ while [ "$#" -gt 0 ]; do
       HIDE_PIPEWIRE_STACK=1 ;;
     --expect-lib)
       shift; EXPECT_LIBS+=("${1:-}") ;;
+    --lint-only)
+      LINT_ONLY=1 ;;
+    --max-glibc)
+      shift; MAX_GLIBC="${1:-}" ;;
     *)
       echo "catalog-proxy: unknown option '$1'" >&2
       usage
@@ -199,11 +232,16 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ -n "$BINARY" ] && [ -n "$APPIMAGE" ]; then
-  echo "catalog-proxy: --binary and --appimage are mutually exclusive" >&2
+TARGET_COUNT=0
+[ -n "$BINARY" ] && TARGET_COUNT=$((TARGET_COUNT + 1))
+[ -n "$APPIMAGE" ] && TARGET_COUNT=$((TARGET_COUNT + 1))
+[ -n "$APPDIR_ARG" ] && TARGET_COUNT=$((TARGET_COUNT + 1))
+if [ "$TARGET_COUNT" -ne 1 ]; then
+  echo "catalog-proxy: exactly one of --binary, --appimage, --appdir is required" >&2
   usage
 fi
-if [ -z "$BINARY" ] && [ -z "$APPIMAGE" ]; then
+if [ "$LINT_ONLY" = 1 ] && [ -n "$BINARY" ]; then
+  echo "catalog-proxy: --lint-only requires --appimage or --appdir (a bare --binary has no AppDir to lint)" >&2
   usage
 fi
 case "$LANG_ARG" in
@@ -213,9 +251,18 @@ case "$LANG_ARG" in
     usage
     ;;
 esac
+if [ -n "$MAX_GLIBC" ]; then
+  case "$MAX_GLIBC" in
+    [0-9]*.[0-9]*) : ;;
+    *)
+      echo "catalog-proxy: --max-glibc must look like X.Y, got '$MAX_GLIBC'" >&2
+      usage
+      ;;
+  esac
+fi
 
 if [ -z "$SANDBOX_MODE" ]; then
-  if [ -n "$APPIMAGE" ] && command -v bwrap >/dev/null 2>&1; then
+  if { [ -n "$APPIMAGE" ] || [ -n "$APPDIR_ARG" ]; } && command -v bwrap >/dev/null 2>&1; then
     SANDBOX_MODE="bwrap"
   else
     SANDBOX_MODE="none"
@@ -253,6 +300,13 @@ if [ -n "$APPIMAGE" ]; then
   APPIMAGE="$(realpath -m -- "$APPIMAGE")"
   chmod +x "$APPIMAGE" 2>/dev/null || true
   TARGET_FOR_SHA="$APPIMAGE"
+elif [ -n "$APPDIR_ARG" ]; then
+  [ -d "$APPDIR_ARG" ] || {
+    echo "catalog-proxy: appdir not found: $APPDIR_ARG" >&2
+    exit 2
+  }
+  APPDIR_ARG="$(realpath -m -- "$APPDIR_ARG")"
+  TARGET_FOR_SHA=""
 else
   [ -e "$BINARY" ] || {
     echo "catalog-proxy: binary not found: $BINARY" >&2
@@ -262,7 +316,7 @@ else
   TARGET_FOR_SHA="$BINARY"
 fi
 
-need
+[ "$LINT_ONLY" = 1 ] || need
 
 if [ -z "$OUT_DIR" ]; then
   OUT_DIR="$REPO_ROOT/target/catalog-proxy/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -284,7 +338,8 @@ rm -rf "$HOME_DIR" "$CONFIG_DIR" "$DATA_DIR" "$CACHE_DIR" "$STATE_DIR" "$RUNTIME
 mkdir -p "$HOME_DIR" "$CONFIG_DIR" "$DATA_DIR" "$CACHE_DIR" "$STATE_DIR" "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
 
-# --- extract the AppImage (no FUSE needed), or launch the bare binary ------
+# --- extract the AppImage (no FUSE needed), adopt an existing AppDir, or --
+# launch the bare binary -----------------------------------------------------
 EXTRACT_DIR=""
 LAUNCH_TARGET=""
 if [ -n "$APPIMAGE" ]; then
@@ -304,8 +359,279 @@ if [ -n "$APPIMAGE" ]; then
   # what /proc/<pid>/maps will actually show (the kernel resolves symlinks).
   EXTRACT_DIR="$(readlink -f "$EXTRACT_DIR")"
   LAUNCH_TARGET="$EXTRACT_DIR/AppRun"
+  TARGET_FOR_SHA="$APPIMAGE"
+elif [ -n "$APPDIR_ARG" ]; then
+  EXTRACT_DIR="$APPDIR_ARG"
+  if [ ! -x "$EXTRACT_DIR/AppRun" ]; then
+    echo "catalog-proxy: $EXTRACT_DIR has no executable AppRun" >&2
+    exit 3
+  fi
+  LAUNCH_TARGET="$EXTRACT_DIR/AppRun"
 else
   LAUNCH_TARGET="$BINARY"
+fi
+LINT_DIR="$EXTRACT_DIR"
+
+# --- lint checks (Task 3/D-03/D-08) -- static AppDir checks, run BEFORE the
+# launch. --binary mode has no AppDir at all, so LINT_DIR is empty there and
+# every check below is skipped with a single INFO note.
+LINT_RESULTS=()
+LINT_FAIL_COUNT=0
+lint_result() {
+  local status="$1" msg="$2"
+  LINT_RESULTS+=("$status: $msg")
+  [ "$status" = "FAIL" ] && LINT_FAIL_COUNT=$((LINT_FAIL_COUNT + 1))
+  return 0
+}
+
+# ver_max A B -- prints whichever of two dotted-numeric version strings
+# sorts higher (GNU sort -V); prints the non-empty one if only one is set.
+ver_max() {
+  local a="$1" b="$2"
+  if [ -z "$a" ]; then printf '%s' "$b"; return; fi
+  if [ -z "$b" ]; then printf '%s' "$a"; return; fi
+  printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1
+}
+
+EXCLUDELIST_CACHE="$REPO_ROOT/build/tools/excludelist"
+fetch_excludelist() {
+  [ -f "$EXCLUDELIST_CACHE" ] && return 0
+  mkdir -p "$(dirname "$EXCLUDELIST_CACHE")"
+  local url="https://raw.githubusercontent.com/AppImage/AppImages/master/excludelist"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 10 -o "$EXCLUDELIST_CACHE.tmp" "$url" 2>/dev/null \
+      && mv "$EXCLUDELIST_CACHE.tmp" "$EXCLUDELIST_CACHE" && return 0
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$EXCLUDELIST_CACHE.tmp" "$url" 2>/dev/null \
+      && mv "$EXCLUDELIST_CACHE.tmp" "$EXCLUDELIST_CACHE" && return 0
+  fi
+  rm -f "$EXCLUDELIST_CACHE.tmp"
+  return 1
+}
+
+# Same hard-phrase list as tests/catalog_ocr_phrases.rs's HARD_PHRASES (kept
+# in sync by hand -- both guard the same catalog check-screenshot.sh list).
+OCR_HARD_PHRASES=(
+  "traceback" "exception" "segmentation fault" "fatal" "error while loading"
+  "glibc" "not installed" "cannot open display" "permission denied"
+  "no such file" "could not load" "could not find" "could not open"
+  "could not start" "could not initiali" "failed to load" "failed to start"
+  "failed to open" "failed to initiali" "failed to create" "cannot load"
+  "cannot find" "cannot open" "cannot execute" "cannot configure"
+  "unable to load" "unable to find" "unable to open" "unable to start"
+  "command not found" "core dumped"
+)
+
+run_lint() {
+  local dir="$1"
+  if [ -z "$dir" ]; then
+    lint_result INFO "no AppDir to lint (--binary mode)"
+    return 0
+  fi
+
+  # 1. Exactly one root *.desktop, desktop-file-validate, Icon=/Categories=.
+  local desktop_files desktop_count df
+  desktop_files="$(find "$dir" -maxdepth 1 -name '*.desktop' 2>/dev/null)"
+  desktop_count="$(printf '%s\n' "$desktop_files" | grep -c . || true)"
+  if [ "$desktop_count" -eq 1 ]; then
+    lint_result PASS "exactly one *.desktop at the AppDir root"
+    df="$(printf '%s' "$desktop_files" | head -n1)"
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+      if desktop-file-validate "$df" >"$OUT_DIR/desktop-file-validate.log" 2>&1; then
+        lint_result PASS "desktop-file-validate clean"
+      else
+        lint_result FAIL "desktop-file-validate reported errors -- see desktop-file-validate.log"
+      fi
+    else
+      lint_result SKIP "desktop-file-validate not found"
+    fi
+    local icon_count categories_count
+    icon_count="$(grep -c '^Icon=' "$df" || true)"
+    categories_count="$(grep -c '^Categories=' "$df" || true)"
+    if [ "$icon_count" -eq 1 ]; then
+      lint_result PASS "Icon= present exactly once"
+    else
+      lint_result FAIL "Icon= present $icon_count time(s) (expected 1)"
+    fi
+    if [ "$categories_count" -eq 1 ]; then
+      lint_result PASS "Categories= present exactly once"
+    else
+      lint_result FAIL "Categories= present $categories_count time(s) (expected 1)"
+    fi
+  else
+    lint_result FAIL "expected exactly one *.desktop at the AppDir root, found $desktop_count"
+  fi
+
+  # 2. AppRun present + executable.
+  if [ -x "$dir/AppRun" ]; then
+    lint_result PASS "AppRun present and executable"
+  else
+    lint_result FAIL "AppRun missing or not executable"
+  fi
+
+  # 3. .DirIcon present -- PASS for PNG, WARN for SVG-only.
+  if [ -e "$dir/.DirIcon" ]; then
+    local dicon_real
+    dicon_real="$(readlink -f "$dir/.DirIcon" 2>/dev/null || printf '%s' "$dir/.DirIcon")"
+    case "$dicon_real" in
+      *.png) lint_result PASS ".DirIcon resolves to a PNG" ;;
+      *.svg) lint_result WARN ".DirIcon resolves to an SVG only (PNG preferred by appdir-lint)" ;;
+      *) lint_result WARN ".DirIcon resolves to an unrecognized type: $dicon_real" ;;
+    esac
+  else
+    lint_result FAIL ".DirIcon missing"
+  fi
+
+  # 4. appstreamcli validate (per metainfo file) + validate-tree.
+  if command -v appstreamcli >/dev/null 2>&1; then
+    local xml_count=0 xml_fail=0 f
+    if [ -d "$dir/usr/share/metainfo" ]; then
+      while IFS= read -r -d '' f; do
+        xml_count=$((xml_count + 1))
+        if appstreamcli validate --no-net "$f" >"$OUT_DIR/appstreamcli-$(basename "$f").log" 2>&1; then
+          lint_result PASS "appstreamcli validate: $(basename "$f")"
+        else
+          xml_fail=$((xml_fail + 1))
+          lint_result FAIL "appstreamcli validate: $(basename "$f") -- see appstreamcli-$(basename "$f").log"
+        fi
+      done < <(find "$dir/usr/share/metainfo" -maxdepth 1 -name '*.xml' -print0 2>/dev/null)
+    fi
+    if [ "$xml_count" -eq 0 ]; then
+      lint_result WARN "no usr/share/metainfo/*.xml found to validate"
+    fi
+    if appstreamcli validate-tree --no-net "$dir" >"$OUT_DIR/appstreamcli-validate-tree.log" 2>&1; then
+      lint_result PASS "appstreamcli validate-tree clean"
+    elif [ "$xml_fail" -eq 0 ]; then
+      lint_result FAIL "appstreamcli validate-tree reported errors -- see appstreamcli-validate-tree.log"
+    else
+      lint_result INFO "appstreamcli validate-tree also reported errors (already counted above)"
+    fi
+  else
+    lint_result SKIP "appstreamcli not found"
+  fi
+
+  # 5. glibc ceiling across every bundled ELF (the catalog's own check-libc
+  # technique: objdump -T's *UND* GLIBC_ symbols). INFO unless --max-glibc.
+  if command -v objdump >/dev/null 2>&1; then
+    local elf_files=() ff glibc_max="" glibcxx_max=""
+    while IFS= read -r -d '' ff; do
+      if file "$ff" 2>/dev/null | grep -q 'ELF'; then
+        elf_files+=("$ff")
+      fi
+    done < <(find "$dir" -type f -print0 2>/dev/null)
+    for ff in "${elf_files[@]}"; do
+      local und v
+      und="$(objdump -T "$ff" 2>/dev/null | grep '\*UND\*' || true)"
+      v="$(printf '%s\n' "$und" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V -u | tail -n1 || true)"
+      glibc_max="$(ver_max "$glibc_max" "$v")"
+      v="$(printf '%s\n' "$und" | grep -oE 'GLIBCXX_[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/GLIBCXX_//' | sort -V -u | tail -n1 || true)"
+      glibcxx_max="$(ver_max "$glibcxx_max" "$v")"
+    done
+    if [ -n "$glibc_max" ]; then
+      lint_result INFO "glibc ceiling across ${#elf_files[@]} ELF file(s): GLIBC_$glibc_max"
+    else
+      lint_result INFO "glibc ceiling: no GLIBC_ symbol versions found across ${#elf_files[@]} ELF file(s)"
+    fi
+    if [ -n "$glibcxx_max" ]; then
+      lint_result INFO "GLIBCXX ceiling: GLIBCXX_$glibcxx_max"
+    fi
+    if [ -n "$MAX_GLIBC" ] && [ -n "$glibc_max" ]; then
+      if [ "$(ver_max "$glibc_max" "$MAX_GLIBC")" = "$MAX_GLIBC" ]; then
+        lint_result PASS "glibc ceiling GLIBC_$glibc_max <= --max-glibc $MAX_GLIBC"
+      else
+        lint_result FAIL "glibc ceiling GLIBC_$glibc_max exceeds --max-glibc $MAX_GLIBC"
+      fi
+    fi
+  else
+    lint_result SKIP "objdump not found -- glibc ceiling check skipped"
+  fi
+
+  # 6. Excludelist: WARN anywhere, FAIL only under usr/lib/ directly (the
+  # documented, allowed exemption is usr/lib/pipewire-fallback/, D-10).
+  if fetch_excludelist; then
+    local any_excl_hit=0 soname hits hitpath
+    while IFS= read -r soname; do
+      [ -n "$soname" ] || continue
+      hits="$(find "$dir" -type f -name "$soname" 2>/dev/null)"
+      [ -n "$hits" ] || continue
+      any_excl_hit=1
+      while IFS= read -r hitpath; do
+        [ -n "$hitpath" ] || continue
+        case "$hitpath" in
+          "$dir"/usr/lib/pipewire-fallback/*)
+            lint_result WARN "excludelist: $soname bundled at $hitpath (documented D-10 fallback exemption)"
+            ;;
+          "$dir"/usr/lib/*)
+            lint_result FAIL "excludelist: $soname bundled directly under usr/lib at $hitpath (D-01: respect the excludelist)"
+            ;;
+          *)
+            lint_result WARN "excludelist: $soname found at $hitpath"
+            ;;
+        esac
+      done <<EOF
+$hits
+EOF
+    done < <(grep -v '^#' "$EXCLUDELIST_CACHE" | grep -v '^[[:space:]]*$' | awk '{print $1}')
+    if [ "$any_excl_hit" -eq 0 ]; then
+      lint_result PASS "no excludelist sonames found anywhere in the AppDir"
+    fi
+  else
+    lint_result SKIP "excludelist fetch failed (offline?) -- no cached copy at $EXCLUDELIST_CACHE"
+  fi
+}
+
+run_ocr_check() {
+  local shot="$1"
+  if ! command -v tesseract >/dev/null 2>&1; then
+    lint_result SKIP "tesseract not found -- OCR check skipped (tests/catalog_ocr_phrases.rs guards the msgids instead)"
+    return 0
+  fi
+  local ocr_text phrase hit=0
+  ocr_text="$(tesseract "$shot" stdout 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  for phrase in "${OCR_HARD_PHRASES[@]}"; do
+    if printf '%s' "$ocr_text" | grep -qF "$phrase"; then
+      lint_result FAIL "OCR: screenshot contains catalog hard phrase '$phrase'"
+      hit=1
+    fi
+  done
+  if [ "$hit" -eq 0 ]; then
+    lint_result PASS "OCR: screenshot has no catalog hard phrase"
+  fi
+}
+
+run_lint "$LINT_DIR"
+
+if [ "$LINT_ONLY" = 1 ]; then
+  GIT_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  GIT_DIRTY="clean"
+  if [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)" ]; then
+    GIT_DIRTY="dirty"
+  fi
+  {
+    echo "# catalog-proxy report (--lint-only)"
+    echo
+    echo "- AppDir: $LINT_DIR"
+    echo "- Git HEAD: $GIT_HEAD ($GIT_DIRTY)"
+    echo "- Launch: skipped (--lint-only)"
+    echo "- Lint results:"
+    for r in "${LINT_RESULTS[@]}"; do
+      echo "    - $r"
+    done
+    if [ "$LINT_FAIL_COUNT" -eq 0 ]; then
+      echo "- Verdict: PASS"
+    else
+      echo "- Verdict: FAIL ($LINT_FAIL_COUNT lint failure(s))"
+    fi
+  } >"$OUT_DIR/report.md"
+  if [ "$LINT_FAIL_COUNT" -eq 0 ]; then
+    echo "catalog-proxy: PASS -- lint clean (--lint-only)"
+    echo "catalog-proxy: report written to $OUT_DIR/report.md"
+    exit 0
+  else
+    echo "catalog-proxy: FAIL -- $LINT_FAIL_COUNT lint failure(s) (--lint-only)"
+    echo "catalog-proxy: report written to $OUT_DIR/report.md"
+    exit 1
+  fi
 fi
 
 # --- resolve the bwrap lib-mask arguments (D-10 / Task 1) -------------------
@@ -556,6 +882,10 @@ if [ "$WIN_FOUND" = 1 ]; then
   else
     DISPLAY="$DISP" magick import -window root "$SHOT" 2>>"$OUT_DIR/app.log" || true
   fi
+  # OCR (Task 3/D-08): only possible now that a real screenshot exists.
+  if [ -f "$SHOT" ]; then
+    run_ocr_check "$SHOT"
+  fi
   if ! pid_running "$APP_SID"; then
     VERDICT="FAIL"
     DETAIL="a window appeared, but the app was no longer alive right after the screenshot"
@@ -574,6 +904,13 @@ else
   DETAIL="no window titled CleanMic appeared within ${TOTAL_SECS}s (the app was still running)"
 fi
 
+# The lint section (run before the launch, above) can independently FAIL the
+# overall run even when the launch itself PASSed.
+if [ "$LINT_FAIL_COUNT" -gt 0 ] && [ "$VERDICT" = "PASS" ]; then
+  VERDICT="FAIL"
+  DETAIL="the launch passed, but $LINT_FAIL_COUNT lint check(s) FAILed"
+fi
+
 GIT_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_DIRTY="clean"
 if [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)" ]; then
@@ -586,10 +923,14 @@ fi
   if [ -n "$APPIMAGE" ]; then
     echo "- AppImage: $APPIMAGE"
     echo "- Extracted to: $EXTRACT_DIR"
+  elif [ -n "$APPDIR_ARG" ]; then
+    echo "- AppDir: $APPDIR_ARG"
   else
     echo "- Binary: $BINARY"
   fi
-  echo "- SHA256: $(sha256sum "$TARGET_FOR_SHA" 2>/dev/null | cut -d' ' -f1)"
+  if [ -n "$TARGET_FOR_SHA" ]; then
+    echo "- SHA256: $(sha256sum "$TARGET_FOR_SHA" 2>/dev/null | cut -d' ' -f1)"
+  fi
   echo "- Lang: $LANG_ARG"
   echo "- Display: $DISP (private Xvfb, 1280x1024x24)"
   echo "- Sandbox: $SANDBOX_MODE"
@@ -598,6 +939,18 @@ fi
     echo "- Masked dirs (tmpfs): ${MASKED_DIRS[*]:-none}"
   fi
   echo "- Git HEAD: $GIT_HEAD ($GIT_DIRTY)"
+  echo
+  echo "## Lint"
+  echo
+  if [ "${#LINT_RESULTS[@]}" -gt 0 ]; then
+    for r in "${LINT_RESULTS[@]}"; do
+      echo "- $r"
+    done
+  fi
+  echo "- Lint verdict: $([ "$LINT_FAIL_COUNT" -eq 0 ] && echo PASS || echo "FAIL ($LINT_FAIL_COUNT failure(s))")"
+  echo
+  echo "## Launch"
+  echo
   echo "- Grace period: 10s, poll attempts used: ${WAIT}/20"
   echo "- Window found: $([ "$WIN_FOUND" = 1 ] && echo yes || echo no)"
   echo "- App died before a window appeared: $([ "$DIED" = 1 ] && echo yes || echo no)"
@@ -607,12 +960,13 @@ fi
       echo "    - $r"
     done
   fi
-  echo "- Verdict: $VERDICT"
   echo "- Detail: $DETAIL"
-  if [ "$VERDICT" = "PASS" ]; then
+  if [ "$WIN_FOUND" = 1 ]; then
     echo "- Screenshot: screenshot.png"
   fi
   echo "- App log: app.log"
+  echo
+  echo "- Verdict: $VERDICT"
 } >"$OUT_DIR/report.md"
 
 echo "catalog-proxy: $VERDICT -- $DETAIL"

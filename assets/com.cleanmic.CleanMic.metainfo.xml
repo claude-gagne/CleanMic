@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metainfo for CleanMic (D-03, 15.4-02). Powers the AppImageHub
+  catalog page and any future software-center listing. Validate locally
+  with appstreamcli validate before every release, since the catalog's
+  own CI silently skips this validation (15.4-RESEARCH.md Pitfall 4), so
+  this is the only real gate.
+
+  Content stays competitor-neutral (Phase 13 decision) and claims only
+  what the base AppImage actually ships: RNNoise and DeepFilterNet are
+  built in; Khip is optional and user-supplied; DPDFNet is not part of
+  the base build.
+-->
+<component type="desktop-application">
+  <id>com.cleanmic.CleanMic</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>CleanMic</name>
+  <name xml:lang="fr">CleanMic</name>
+
+  <summary>Noise-free virtual microphone</summary>
+  <summary xml:lang="fr">Microphone virtuel sans bruit</summary>
+
+  <description>
+    <p>
+      CleanMic gives every application on your Linux desktop one clean
+      virtual microphone, no matter which noise suppression engine is
+      running behind it. Select your physical mic, enable CleanMic, and
+      video-call apps like Teams, Meet, Discord, and Zoom all hear the
+      processed audio through the same virtual source.
+    </p>
+    <p>
+      Pick RNNoise for a lightweight classic denoiser, or DeepFilterNet
+      (the default) for a modern neural model that is noticeably cleaner
+      on fan, keyboard, and mouse noise. An experimental Khip engine is
+      also supported if you supply your own library. Switch engines, or
+      step through Light, Balanced, and Strong strength presets, without
+      leaving the app.
+    </p>
+    <p>
+      CleanMic is meant to be enabled once and forgotten about: it
+      survives suspend/resume and PipeWire restarts, keeps its own tray
+      icon and autostart entry, and runs fully offline with no accounts,
+      network access, or telemetry.
+    </p>
+    <p xml:lang="fr">
+      CleanMic offre à chaque application de votre bureau Linux un seul
+      microphone virtuel propre, peu importe le moteur de suppression de
+      bruit utilisé. Sélectionnez votre micro physique, activez CleanMic,
+      et les applications d'appel vidéo comme Teams, Meet, Discord et Zoom
+      entendent toutes l'audio traité par la même source virtuelle.
+    </p>
+    <p xml:lang="fr">
+      Choisissez RNNoise pour un débruiteur classique et léger, ou
+      DeepFilterNet (par défaut) pour un modèle neuronal moderne
+      nettement plus propre sur le bruit de ventilateur, de clavier et de
+      souris. Un moteur expérimental Khip est aussi pris en charge si vous
+      fournissez votre propre bibliothèque. Changez de moteur, ou passez
+      d'un réglage Léger, Équilibré ou Fort, sans quitter l'application.
+    </p>
+    <p xml:lang="fr">
+      CleanMic est conçu pour être activé une fois et oublié : il survit à
+      la mise en veille, à la reprise et aux redémarrages de PipeWire,
+      garde sa propre icône dans la barre d'état système et son entrée de
+      démarrage automatique, et fonctionne entièrement hors ligne, sans
+      compte, sans accès réseau et sans télémétrie.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.cleanmic.CleanMic.desktop</launchable>
+  <provides>
+    <binary>cleanmic</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/claude-gagne/CleanMic</url>
+  <url type="bugtracker">https://github.com/claude-gagne/CleanMic/issues</url>
+  <url type="donation">https://buymeacoffee.com/claudegagne</url>
+  <url type="vcs-browser">https://github.com/claude-gagne/CleanMic</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/claude-gagne/CleanMic/master/assets/screenshot.png</image>
+      <caption>CleanMic's main window: engine selector, strength preset, and input/output level meters</caption>
+      <caption xml:lang="fr">Fenêtre principale de CleanMic : sélecteur de moteur, réglage d'intensité et indicateurs de niveau</caption>
+    </screenshot>
+  </screenshots>
+
+  <developer id="com.cleanmic">
+    <name>Claude Gagné</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <translation type="gettext">cleanmic</translation>
+
+  <releases>
+    <release version="1.0.7" date="2026-06-18">
+      <description>
+        <p>Initial catalog-ready release: bundled DeepFilterNet and RNNoise, switchable strength presets, tray integration, and autostart.</p>
+      </description>
+    </release>
+  </releases>
+
+  <categories>
+    <category>Audio</category>
+    <category>AudioVideo</category>
+  </categories>
+</component>

@@ -296,6 +296,25 @@ cp "$PROJECT_ROOT/assets/icons/cleanmic-active.svg" \
 cp "$PROJECT_ROOT/assets/icons/cleanmic-disabled.svg" \
    "$APPDIR/usr/share/icons/hicolor/scalable/apps/cleanmic-disabled.svg"
 
+# PNG app icon (D-03): appdir-lint's own check-appstream prefers a PNG
+# .DirIcon over SVG-only (SVG-only is a WARNING, not fatal) -- installed to
+# the standard hicolor PNG location AND at the AppDir root next to the SVG
+# so appimagetool's own Icon=-driven .DirIcon lookup (Step 8) has a PNG to
+# find, alongside the existing SVG.
+mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+cp "$PROJECT_ROOT/assets/icons/com.cleanmic.CleanMic.png" \
+   "$APPDIR/usr/share/icons/hicolor/256x256/apps/com.cleanmic.CleanMic.png"
+cp "$PROJECT_ROOT/assets/icons/com.cleanmic.CleanMic.png" "$APPDIR/com.cleanmic.CleanMic.png"
+
+# ── Step 4b: AppStream metainfo (D-03) ──────────────────────────────────────
+info "Bundling AppStream metainfo..."
+METAINFO_SRC="$PROJECT_ROOT/assets/com.cleanmic.CleanMic.metainfo.xml"
+if [ ! -f "$METAINFO_SRC" ]; then
+    error "Required file not found: $METAINFO_SRC"
+fi
+mkdir -p "$APPDIR/usr/share/metainfo"
+cp "$METAINFO_SRC" "$APPDIR/usr/share/metainfo/com.cleanmic.CleanMic.metainfo.xml"
+
 # ── Step 5: Bundle locale files ──────────────────────────────────────────────
 info "Bundling locale files..."
 for podir in "$PROJECT_ROOT"/locale/*/LC_MESSAGES; do
