@@ -13,6 +13,8 @@
 #                   node; refuses while CleanMic or the E2E harness runs)
 #   ci-check      - Run fmt-check, clippy -D warnings, and tests (mirrors release CI)
 #   harness-test  - Offline checks for the silent E2E test harness (scripts/e2e-audio.sh)
+#   packaging-test - AppImage packaging regression tests (preflight distro
+#                   mapping + glibc-too-old, AppRun's D-10 fallback decision)
 #   e2e-audio     - Run the silent E2E audio test (SCENARIOS="...", E2E_ARGS="...")
 #   test-dfn-overload - Starved-CPU DeepFilterNet regression (needs vendor/, ~25 s of one CPU)
 #   nested-run    - Start a nested CleanMic session by hand (NESTED_ARGS="...")
@@ -26,7 +28,7 @@ DESTDIR ?=
 
 BINARY  := target/release/cleanmic
 
-.PHONY: build appimage kill vendors mo install uninstall fmt lint test test-live ci-check clean harness-test e2e-audio nested-run nested-stop test-dfn-overload
+.PHONY: build appimage kill vendors mo install uninstall fmt lint test test-live ci-check clean harness-test packaging-test e2e-audio nested-run nested-stop test-dfn-overload
 
 mo:
 	@mkdir -p locale/fr/LC_MESSAGES
@@ -112,6 +114,14 @@ harness-test:
 	fi
 	bash scripts/test-nested-run.sh
 	python3 -m pytest -q -p no:cacheprovider scripts/e2e
+
+# AppImage packaging regression tests (15.4-02): the pre-flight's per-distro
+# library-to-package mapping + glibc-too-old branch, and AppRun's D-10
+# fallback decision. Self-contained (no X server, no real AppImage, no
+# PipeWire) -- kept out of `test`/`ci-check`, like harness-test above.
+packaging-test:
+	bash scripts/test-appimage-preflight.sh
+	bash scripts/test-appimage-apprun.sh
 
 # Real, silent virtual-mic E2E audio test (see scripts/e2e/README.md).
 # SCENARIOS defaults to "baseline"; e.g. SCENARIOS="baseline swaps toggle
