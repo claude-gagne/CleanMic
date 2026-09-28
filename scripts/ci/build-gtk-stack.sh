@@ -96,7 +96,7 @@ error() { printf '\033[1;31m==> %s\033[0m\n' "$*" >&2; exit 1; }
 # ── meson (build tool, not a pkg-config'd library) ──────────────────────────
 MESON_VERSION="1.4.0"
 MESON_URL="https://github.com/mesonbuild/meson/releases/download/${MESON_VERSION}/meson-${MESON_VERSION}.tar.gz"
-MESON_SHA256="8fd6630c25c27f1489a8a0392b311a60481a3c161aa699b330e25935b750138"
+MESON_SHA256="8fd6630c25c27f1489a8a0392b311a60481a3c161aa699b330e25935b750138d"
 MESON_SRCDIR_NAME="meson-${MESON_VERSION}"
 
 # ── The five components this script builds, in dependency order ───────────
